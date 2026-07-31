@@ -10,9 +10,10 @@ load_dotenv()
 
 @pytest.fixture(autouse=True)
 def restore_node_registry() -> Generator[None, None, None]:
-    """Placeholder for node registry isolation (D7).
+    """Snapshot and restore the node type registry around each test (D7/AD-08)."""
+    from app.workflow.nodes import factory  # noqa: PLC0415 — import inside fixture per AD-08
 
-    Completed in spec-03: will snapshot and restore the node type
-    registry around each test to keep registrations isolated.
-    """
+    snapshot = dict(factory._NODE_REGISTRY)  # noqa: SLF001 — private access per AD-08 spec
     yield
+    factory._NODE_REGISTRY.clear()  # noqa: SLF001
+    factory._NODE_REGISTRY.update(snapshot)  # noqa: SLF001
