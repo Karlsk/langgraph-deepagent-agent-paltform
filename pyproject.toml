@@ -40,6 +40,9 @@ dependencies = [
     "uvloop>=0.22.1; platform_system != 'Windows'",
     "asgi-correlation-id>=4.3.4",
     "alembic>=1.18.4",
+    "PyYAML>=6.0",
+    "langchain-anthropic>=1.0,<1.1",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
@@ -62,12 +65,18 @@ dev = [
     "pre-commit>=4.5.1",
     "pyright>=1.1.390",
     "ruff>=0.11.4",
+    "pytest-cov",
 ]
-test = ["httpx>=0.28.1", "pytest>=8.3.5"]
+test = ["pytest>=8.3.5"]
 
 
 [tool.pytest.ini_options]
-markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "unit: unit tests",
+    "integration: integration tests",
+]
+addopts = "--strict-markers"
 python_files = ["test_*.py", "*_test.py", "tests.py"]
 
 [tool.black]
@@ -110,7 +119,7 @@ exclude = ["migrations", "*.ipynb", "venv"]
 
 [tool.ruff.lint]
 # Enable flake8-bugbear (`B`) rules and docstring (`D`) rules
-select = ["E", "F", "B", "ERA", "D"]
+select = ["E", "F", "B", "ERA", "D", "T20", "BLE", "S"]
 # Never enforce `E501` (line length violations).
 ignore = ["E501", "D203", "D213", "B904", "B008"]
 # Avoid trying to fix flake8-bugbear (`B`) violations.
@@ -122,6 +131,24 @@ convention = "google"
 # Ignore `E402` (import violations) in all `__init__.py` files
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402"]
+"app/workflow/cli.py" = ["T201"]
+"tests/**" = ["S101"]
+# Pre-existing violations of newly enabled rules (T20/BLE/S) in legacy code,
+# scoped per file; see spec-00 AD-07 closure list. New code must comply.
+"app/api/v1/auth.py" = ["S106"]
+"app/api/v1/chatbot.py" = ["BLE001"]
+"app/core/cache.py" = ["BLE001"]
+"app/core/config.py" = ["S108", "T201"]
+"app/core/langgraph/graph.py" = ["BLE001"]
+"app/core/logging.py" = ["BLE001"]
+"app/core/observability.py" = ["BLE001"]
+"app/main.py" = ["BLE001"]
+"app/services/database.py" = ["BLE001"]
+"app/services/llm/service.py" = ["BLE001"]
+"app/services/memory.py" = ["BLE001"]
+"app/services/session_naming.py" = ["BLE001"]
+"evals/evaluator.py" = ["BLE001"]
+"evals/main.py" = ["BLE001", "T201"]
 
 [tool.pyright]
 include = ["app", "evals"]

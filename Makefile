@@ -99,6 +99,21 @@ pre-commit-update:
 	uv run pre-commit autoupdate
 
 # ---------------------------------------------------------------------------
+# Testing
+# ---------------------------------------------------------------------------
+test:
+	uv run pytest
+
+test-unit:
+	uv run pytest -m unit
+
+test-integration:
+	uv run pytest -m integration
+
+test-cov:
+	uv run pytest --cov=app/workflow --cov-report=term-missing
+
+# ---------------------------------------------------------------------------
 # Docker — single service (API + DB)
 # ---------------------------------------------------------------------------
 docker-build:
@@ -187,6 +202,12 @@ help:
 	@echo "  pre-commit           Run all pre-commit hooks"
 	@echo "  pre-commit-update    Update pre-commit hook versions"
 	@echo ""
+	@echo "Testing:"
+	@echo "  test                 Run all tests"
+	@echo "  test-unit            Run unit tests"
+	@echo "  test-integration     Run integration tests"
+	@echo "  test-cov             Run tests with coverage report"
+	@echo ""
 	@echo "Docker (API + DB):"
 	@echo "  docker-build         Build Docker image"
 	@echo "  docker-up            Start API + DB containers"
@@ -208,6 +229,7 @@ help:
         migrate migration migrate-downgrade migrate-history \
         eval eval-quick eval-no-report \
         lint format typecheck check pre-commit pre-commit-update \
+        test test-unit test-integration test-cov \
         docker-build docker-up docker-down docker-logs docker-migrate \
         docker-migrate-downgrade docker-migrate-history \
         stack-up stack-down stack-logs \
