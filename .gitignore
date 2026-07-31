@@ -21,4 +21,5 @@ wheels/
 
 # Reports
 evals/reports/
-.qoder.coverage
+.qoder
+.coverage*
