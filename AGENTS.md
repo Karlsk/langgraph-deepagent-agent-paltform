@@ -40,8 +40,10 @@ app/
   schemas/         # Pydantic request/response schemas + graph state
   services/        # Business logic services
   utils/           # Shared utilities
+  workflow/        # Declarative workflow engine (YAML -> LangGraph), under construction
 evals/             # LLM evaluation framework (Langfuse-based)
 scripts/           # Environment setup, Docker build scripts
+docs/workflow-reimpl-plan/  # Workflow engine reimplementation plan + specs (contract-driven)
 ```
 
 ## Project Overview
@@ -214,6 +216,57 @@ Before modifying code:
 5. Include error handling with early returns
 6. Add type hints and Pydantic models
 7. Verify Langfuse tracing is enabled for LLM calls
+
+## Workflow Engine Reimplementation (`docs/workflow-reimpl-plan/`)
+
+The project includes a contract-driven plan to reimplement a declarative workflow engine
+(YAML DSL -> LangGraph compiled graph + process-level registry runtime) in `app/workflow/`.
+This scope covers only `BaseNode` (abstract), `LLMNode`, and `HTTPNode`.
+
+### Authority Hierarchy (on conflict, higher wins)
+
+```
+spec/CONTRACT.md  >  spec/spec-00..09  >  planning docs (00-03)  >  original code conventions
+```
+
+### Document Map
+
+| Document | Purpose |
+|---|---|
+| `docs/workflow-reimpl-plan/README.md` | Navigation, scope, K/C/H/R quick-reference tables |
+| `00-架构总览.md` | Architecture: 3 layers (DSL models -> graph compile -> registry runtime), K1..K10 |
+| `01-分阶段开发计划.md` | Phase 0..9 task lists, TDD steps, DoD per phase |
+| `02-开发规范.md` | Red lines R1..R10, code/test/logging/commit conventions |
+| `03-隐患修复方案.md` | Hazard archive H1..H7 and cleanup items C1..C9 (root cause -> fix -> verify) |
+| `spec/CONTRACT.md` | **Coding contract (highest authority)**: frozen interface signatures (§4), exception family (§5), behavior semantics S1-S16 (§6), exploration gate R-EXP (§7), red-line machine gates (§10), adaptation decisions AD-01..12 (§9, single source) |
+| `spec/README.md` | Spec overview: effort table, milestone chain M0-M8, spec DAG, AI delegation prompt template |
+| `spec/api-exploration-1x.md` | LangGraph/LangChain 1.x API exploration tasks (EXP-G/C/L/X); closing them gates coding work |
+| `spec/spec-00..09` | Per-phase executable task cards (TC), TDD points, DoD, acceptance commands |
+
+### Numbering System (never invent synonyms; always cite by number)
+
+- **K1..K10** keep-items (proven designs to preserve) · **C1..C9** cleanups · **H1..H7** hazards · **R1..R10** red lines · **Phase 0..9** stages
+- **AD-01..12** adaptation decisions — defined ONLY in `CONTRACT.md` §9; specs reference by number
+- **S1..S16** behavior semantics · **EXP-G/C/L/X** exploration items · **M0..M8** milestones
+
+### Hard Rules When Implementing Workflow Specs
+
+1. **Read first**: `CONTRACT.md` in full + the target `spec-0N` + the EXP records gating that spec. R-EXP: coding must not start before the gating EXP items are closed in `api-exploration-1x.md`.
+2. **Frozen signatures**: public interfaces must match CONTRACT §4 verbatim. On any contract conflict: stop and ask — never improvise a compromise.
+3. **Scope discipline (R1)**: implement only the TC cards of the current spec; no new node types, no hardcoded business field names (R2), no hardcoded secrets (R5).
+4. **Strict TDD (R7)**: RED -> GREEN -> REFACTOR; coverage >= 80%; zero real network / real LLM calls in tests.
+5. **Dependency direction**: `app/workflow/` modules depend only on themselves + third-party libs; they must NOT import `app.core.*` (entry/integration points in spec-08 are the sole exception, per AD-02 composition-root rules).
+6. **Per TC card**: run `uv run pytest -m unit`, `make lint`, `make typecheck`; commit with conventional commits.
+7. Tests live in `tests/unit/workflow/` and `tests/integration/workflow/` (AD-08).
+
+### Milestones
+
+```
+M0(scaffold+EXP) -> M1(models) -> M2(state) -> M3(node infra) -> M4(LLMNode ∥ HTTPNode)
+  -> M5(graph builder) -> M6(registry/runtime) -> M7(entry/CLI) -> M8(hardening)
+```
+
+EXP closure is the precondition for M1. Each milestone exits only when its spec's DoD is fully green.
 
 ## References
 

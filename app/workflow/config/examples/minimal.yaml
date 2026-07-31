@@ -1,0 +1,18 @@
+# 所需环境变量：OPENAI_API_KEY（运行该示例前设置，见 .env.example）
+workflow_id: demo_minimal
+description: "最小示例：LLM 单节点"
+entry_point: greet
+nodes:
+  - name: greet
+    type: llm
+    config:
+      llm_type: openai
+      model_name: gpt-4o-mini
+      system_prompt: "You are a concise assistant."
+edges:
+  - source: greet
+    target: END
+state_schema:
+  input:
+    type: str
+    description: 用户输入
