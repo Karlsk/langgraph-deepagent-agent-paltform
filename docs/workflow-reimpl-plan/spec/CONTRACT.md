@@ -208,6 +208,8 @@ class StateModelFactory:
         基类 ConfigDict(extra='allow')；未知 type → ValueError 并列出支持类型。"""
 ```
 
+**修订备注【EXP-G8 决策，2026-07-30】**（签名不变，语义补充）：依据 EXP-G8 实测（langgraph 1.0.2 的 channel 集合在构造期冻结，未声明键被静默丢弃，`extra="allow"` 对 channel 写入面无效；证据见 `api-exploration-1x.md` G8 行）+ 2026-07-30 决策（方案 1）：`create_state_model` 需支持构建期按 `definition.nodes` 预声明 `{node_name}_result: (Any, None)` 字段（LastValue channel）以承载 S4 双写；除此之外的任意 extra 键**不支持写入运行期 state**，YAML `state_schema` 必须显式声明；`extra="allow"` 仅保留为模型自身宽容校验。入参形态（节点名清单入参或由 GraphBuilder 组装）的具体设计留待 spec-02 实施时落地。
+
 ### 4.4 `app/workflow/nodes/base.py`
 
 ```python
@@ -466,6 +468,12 @@ def redact_processor(logger: Any, method_name: str, event_dict: dict[str, Any]) 
     对 event_dict 递归应用 redact()；由 setup_logging 挂入处理器链。"""
 ```
 
+**修订说明【AD-02 v2，2026-07-30】**（上方签名全部保持不变，仅语义与职责边界收窄）：
+
+- `setup_logging` 语义收窄为**最小幂等 bootstrap**，仅用于 **CLI 独立入口**（spec-08）与**裸测试环境**；FastAPI 集成场景下日志配置由 `app.core.logging` 全权负责，该函数因幂等检测而永不生效（等效于不存在）。幂等验收方式不变（重复调用不叠加 handler，handler 计数断言）。
+- **引擎模块只 `get_logger` 不配置日志**：`app/workflow/` 内除 `logging_conf.py` 自身外，任何模块不得调用/引入日志配置，只用 `structlog.get_logger(__name__)`；"不得 import `app.core.*`"红线不变。引擎日志在部署时自动继承宿主的 processor 链、格式与输出。
+- **`redact_processor` 由宿主组装点注册**：实现保留在本模块（安全能力随引擎携带），但挂入全局 processor 链的动作在 FastAPI 场景下属于宿主组装点（composition root：`app/main.py` 启动处或 `app.core.logging` 暴露的注入钩子）；仅 CLI 独立模式下由 `setup_logging` 自行挂入。
+
 ### 4.12 `app/workflow/cli.py`
 
 ```python
@@ -519,7 +527,7 @@ class HTTPNodeError(WorkflowEngineError):
 | S1 | reducer 三态 | `add` → `Annotated[list, operator.add]` 列表合并；`last` → `Annotated[T, _last]` 后写覆盖；未声明 → 普通字段（LangGraph LastValue 后写覆盖）。reducer **只**由 YAML 显式声明驱动（C2） |
 | S2 | history 自动注入 | `state_schema` 未显式声明 `history` 时注入 `(Annotated[list, operator.add], default_factory=list)`；显式声明优先 |
 | S3 | history 增量追加 | `map_output_to_state` 在 add channel 下只返回**增量** `[entry]`，禁返回 `history + [entry]` 全量（C4 修正：防历史翻倍）；entry 形如 `f"{node_name}: {str(node_output)[:100]}..."` |
-| S4 | 双写 | 默认 `{node_name}_result` 整包 + 逐字段平铺（K9 Dify 风格）；`dual_write=False` 只写整包 |
+| S4 | 双写 | 默认 `{node_name}_result` 整包 + 逐字段平铺（K9 Dify 风格）；`dual_write=False` 只写整包。【EXP-G8 决策，2026-07-30】`{node_name}_result` 键须在构建期由 StateModelFactory 预声明（见 §4.3 修订备注），否则被 langgraph 静默丢弃 |
 | S5 | 节点进出 | 入口 `convert_state_to_dict(state)`，出口 `map_output_to_state(name, output, state_dict)`（R3）；禁止 mutate 输入 state |
 | S6 | 条件路由 no-match | `raise`（默认）→ `ConditionNotMatchedError`（含 source 与全部条件）；`default` → 走 `default_edges[source]`，构建期未提供即 `ValueError`。**禁止静默落到最后一条边**（C3） |
 | S7 | 条件表达式 | `_parse_condition`：含 `==` → 等值比较（两侧 strip、expected 去引号）；否则纯路径真值判断；`_resolve_path` 点路径逐层解析，非 dict 中途 → None。**禁 eval** |
@@ -529,7 +537,7 @@ class HTTPNodeError(WorkflowEngineError):
 | S11 | 运行级日志收集 | 每次运行创建 `RunLogCollector(run_id)`，经 `_RUN_COLLECTOR` ContextVar 传播；`try/finally` 用 token 复位，**ContextVar 不得泄漏**；运行时**禁止**调用 `node.clear_execution_history()` 收集日志（H1/H3） |
 | S12 | execution_history 单槽位 | `definition.execution_history` 只保留**最近一次运行**的日志（防无界增长，文档化决策） |
 | S13 | delete 不变量 | `delete_workflow` 同时删 `_registry` / `_definitions` / `_nodes_map` / `_run_locks` 四处条目；重复注册 = `_meta_lock` 下原子替换（H7） |
-| S14 | extra 策略三分 | WorkflowDefinition=`ignore`；节点配置（LLMConfig/HTTPNodeConfig）=`forbid`；动态状态模型=`allow`（02 §3.3） |
+| S14 | extra 策略三分 | WorkflowDefinition=`ignore`；节点配置（LLMConfig/HTTPNodeConfig）=`forbid`；动态状态模型=`allow`（02 §3.3）。【EXP-G8 决策，2026-07-30】动态模型 `allow` 仅为模型自身宽容校验；运行期 state 仅支持声明键（含预声明的 `{node_name}_result`），未声明键被 langgraph 静默丢弃（见 `api-exploration-1x.md` G8 行） |
 | S15 | 日志形态 | structlog；事件名 lowercase_with_underscores；kwargs 传参禁 f-string；`logger.exception()` 留 traceback；ExecutionLog/日志只记摘要（消息条数、method/url、配置摘要），**不含密钥与完整 state**（H6）【AD-02】 |
 | S16 | YAML 安全 | 全引擎只允许 `yaml.safe_load`（D6） |
 
@@ -567,7 +575,7 @@ class HTTPNodeError(WorkflowEngineError):
 > 工程口径适配，不改变功能契约。各 spec 与 README 只引用编号。
 
 - **AD-01 包映射**：规划文档占位包名 `workflow_engine/` → 落地 `app/workflow/`；导入路径 `app.workflow.*`；测试落位 `tests/unit|integration/workflow/`（镜像）。模块逐一对位见第 2 章白名单。
-- **AD-02 日志 structlog 化**：引擎内一律 `structlog.get_logger(__name__)`；事件名 lowercase_with_underscores、kwargs 传参禁 f-string、`logger.exception()` 留 traceback。`setup_logging`/`redact` 契约保留；脱敏实现为 structlog processor（`redact_processor`），替代原文档 stdlib `RedactFilter`。引擎**不 import app.core.\***；CLI 场景自举配置；FastAPI 场景已被 `app.core.logging` 配置时幂等跳过。
+- **AD-02 日志 structlog 化**：引擎内一律 `structlog.get_logger(__name__)`；事件名 lowercase_with_underscores、kwargs 传参禁 f-string、`logger.exception()` 留 traceback。`setup_logging`/`redact` 契约保留；脱敏实现为 structlog processor（`redact_processor`），替代原文档 stdlib `RedactFilter`。引擎**不 import app.core.\***；CLI 场景自举配置；FastAPI 场景已被 `app.core.logging` 配置时幂等跳过。（细化与 v2 修订见 §4.11 修订说明【AD-02 v2，2026-07-30】：引擎模块只 `get_logger` 不配置日志；`setup_logging` 收窄为最小幂等 bootstrap（仅 CLI 独立入口与裸测试）；`redact_processor` 由宿主组装点注册，CLI 独立场景例外。）
 - **AD-03 重试 tenacity 化**：LLM 429/rate 与 HTTP `retry_on_status` 重试统一用 tenacity（`stop_after_attempt(max_retries+1)` + `wait_exponential(multiplier=retry_base_delay)` + retry 谓词），耗尽包装 `LLMNodeError`/`HTTPNodeError`。测试 monkeypatch `tenacity.nap.sleep`，断言重试次数与退避序列 `1,2,4`，不真睡。行为与原文档手写循环等价（S8）。
 - **AD-04 全部顶层导入**：覆盖原文档"函数内延迟导入 langchain"口径；langchain-anthropic 为正式依赖，`ImportError` 分支及其测试删除。
 - **AD-05 依赖并入现有 pyproject.toml**：新增直接依赖 `PyYAML>=6.0`（lock 已 6.0.2）、`langchain-anthropic`（配套区间由 EXP-L5 定）；`httpx` 从 test group 提升为主依赖；dev group 新增 `pytest-cov`；`[tool.pytest.ini_options]` 追加 `unit`/`integration` marker（保留既有 `slow`）。

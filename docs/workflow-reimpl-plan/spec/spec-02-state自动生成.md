@@ -34,6 +34,7 @@
   - 产出文件：`app/workflow/state.py`（目标 < 150 行；`create_state_model` 函数体 < 50 行，必要时抽私有辅助函数，R8）
   - 冻结规则（C2）：`reducer=="add"` → `(Annotated[list, operator.add], Field(default_factory=list, description=...))`；`reducer=="last"` → `(Annotated[py_type, _last], Field(default=default_val, description=...))`；未声明 → `(py_type, Field(default=default_val, description=...))`；**未知 type → `ValueError` 并列出支持类型**（fail fast，R9）；**禁止任何按字段名的 if 分支**
   - history 注入（K2）：未显式声明 `history` 时注入 `(Annotated[list, operator.add], Field(default_factory=list, description="Auto-injected execution history (reducer=add)"))`；显式声明优先
+  - 修订备注【EXP-G8 决策，2026-07-30】：依据 EXP-G8 实测（未声明键被 langgraph 静默丢弃，`extra="allow"` 对 channel 写入面无效）+ 方案 1 决策：`create_state_model` 需额外支持构建期按 `definition.nodes` 预声明 `{node_name}_result: (Any, None)` 字段（LastValue channel，承载 S4 双写）；除此之外的任意 extra 键不支持写入运行期 state，YAML `state_schema` 必须显式声明。入参形态（节点名清单入参或由 GraphBuilder 组装）在本 spec 实施时定稿；详见 CONTRACT §4.3 修订备注与 `api-exploration-1x.md` G8 行
   - TDD 节奏：先写 §7 单测前 4 项（RED）→ 实现（GREEN）→ 重构
 - [ ] **TC2 单测 8 例（0.25d）**
   - 内容：§7 单测全部用例（含守护测试 `test_no_hardcoded_field_names` 参数化：`circle_conclusions` / `planner_result` 等字段名行为与任意普通字段完全一致）
@@ -60,6 +61,8 @@
 | `test_no_hardcoded_field_names`（守护测试） | 对 `circle_conclusions` / `planner_result` 等字段名创建模型，行为与任意普通字段完全一致（无特判） | 参数化 |
 | `integration: test_add_channel_merges` | 生成模型 → `StateGraph(model)` → 两个节点各返回 `{"history": [x]}` → 终态 `history == [x, y]` | 真实 langgraph |
 | `integration: test_extra_key_flows_through` | 节点写未声明键 `foo` → 终态含 `foo` | 真实 langgraph |
+
+修订备注【EXP-G8 决策，2026-07-30】：`test_extra_key_flows_through` 原口径（终态含未声明键 `foo`）已被 EXP-G8 实测推翻，实施时改为断言：预声明的 `{node_name}_result` 键可写入并在终态保留，未声明键被静默丢弃（与 `tests/integration/workflow/test_exploration_graph.py` 的 test_g8_* 互印）；`test_extra_fields_allowed` 仅验模型自身宽容校验，口径不变。§8 DoD 中“`extra=allow` 生效”相应按本备注口径验收。
 
 ## 8. 验收标准 DoD
 

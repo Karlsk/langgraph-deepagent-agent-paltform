@@ -22,7 +22,11 @@
 
 ## 4. 适配决策（本 Phase 涉及的 AD 条目）
 
-- **AD-02**：脱敏实现为 **structlog processor**（`redact_processor`）而非原文档的 stdlib `RedactFilter`；`setup_logging` 幂等保持（FastAPI 集成时 `app.core.logging` 先行配置则幂等跳过）；行为等价性由 §7 测试锁定（caplog/capsys 断言）——**这是与原文档的显式偏差，以 CONTRACT §9 AD-02 为准**。
+- **AD-02**：脱敏实现为 **structlog processor**（`redact_processor`）而非原文档的 stdlib `RedactFilter`；`setup_logging` 幂等保持（FastAPI 集成时 `app.core.logging` 先行配置则幂等跳过）；行为等价性由 §7 测试锁定（caplog/capsys 断言）——**这是与原文档的显式偏差，以 CONTRACT §9 AD-02 及其 §4.11 修订说明为准**。
+- **AD-02（修订 v2，2026-07-30）**：脱敏能力仍以 structlog processor（`redact_processor`）实现于 `app/workflow/logging_conf.py`，但**注册位置**区分场景：
+  - FastAPI 集成场景——由**宿主组装点**（composition root：`app/main.py` 启动处，或 `app.core.logging` 暴露的注入钩子）将 `redact_processor` 注册进宿主的全局 processor 链，保证生产环境所有日志走同一条脱敏链；此时 `setup_logging` 幂等跳过。
+  - CLI 独立场景——由 `setup_logging` 内部自行挂入 `redact_processor`（该函数已收窄为"最小幂等 bootstrap"，仅服务 CLI 独立入口与裸测试）。
+  - 引擎内其余模块只 `structlog.get_logger(__name__)`，不配置日志、不 import `app.core.*`（红线不变）。详见 CONTRACT §9 AD-02（单点定义）与 §4.11 修订说明，以及 spec-00 §4 AD-02（修订 v2）。
 - **AD-10**：CLI 主交付（`uv run python -m app.workflow run --workflow ... --input ...`）；`api.py` 为可选任务（0.25d），若实施必须遵守仓库戒律：slowapi rate limit 装饰器、DI 注入 registry、同步 `execute_workflow` 经 `run_in_threadpool` 包装、structlog。
 - **AD-12**：示例 YAML 头部注释写明所需 env（`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 等）。
 
@@ -30,6 +34,7 @@
 
 - [ ] **TC1 logging_conf 脱敏补全（redact + processor + 幂等）（0.375d）**
   - 内容：常量 `SECRET_KEY_PATTERNS`；`redact(data, *, max_len=500)`（递归遍历 dict/list，键名命中模式——不区分大小写——的值替换为 `"***REDACTED***"`；超长字符串截断并标注 `...(truncated)`；不可 JSON 化对象走 `default=str`）；`redact_processor`（structlog processor：对 event_dict 的 `event` 与 kwargs 值做脱敏，命中密钥样式的 `key=value` / `"key": "..."` 片段替换为 `***`）；`setup_logging` 追加该 processor 且保持幂等
+  - 修订备注【AD-02 v2，2026-07-30】："`setup_logging` 追加该 processor"仅面向 **CLI 独立场景**；FastAPI 集成场景的注册点在宿主组装点（`app/main.py` / `app.core.logging` 注入钩子），本卡交付物不变（实现仍在 `logging_conf.py`）
   - 产出文件：`app/workflow/logging_conf.py`
   - TDD 节奏：先写 §7 前 4 项（RED）→ 实现（GREEN）
 - [ ] **TC2 cli.py + __main__.py + 响应信封（0.375d）**

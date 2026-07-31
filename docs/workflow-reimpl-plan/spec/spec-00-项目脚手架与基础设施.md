@@ -24,6 +24,11 @@
 
 - **AD-01**：包骨架落位 `app/workflow/`；测试落位 `tests/unit|integration/workflow/`。
 - **AD-02**：`logging_conf.py` 用 structlog 实现 `setup_logging`（幂等；已被 `app.core.logging` 配置过时跳过）；本阶段只落骨架，脱敏 processor 在 spec-08 补全。
+- **AD-02（修订 v2，2026-07-30）**：遵循"库不配置日志"准则，对上一条做如下收窄（上一条保留以便追溯，冲突处以本条为准）：
+  1. **引擎只取 logger、不配置日志**：`app/workflow/` 内部所有模块仅通过 `structlog.get_logger(__name__)` 获取 logger，不 import 任何日志配置模块（"引擎不得 import `app.core.*`"红线不变）。FastAPI 部署时日志配置权完全归属宿主入口（`app.core.logging`），引擎日志自动继承宿主统一的 processor 链、格式与输出。
+  2. **`setup_logging` 瘦身为最小幂等 bootstrap**：`setup_logging(level="INFO", *, json_output=False)` 签名不变，但仅服务两个场景——spec-08 的 CLI 独立入口、裸单测环境；FastAPI 集成场景下它因幂等检测（已被 `app.core.logging` 配置过则跳过）而永远不生效，等效于不存在。幂等验收方式不变（重复调用不叠加 handler，handler 计数断言）。
+  3. **脱敏 processor 的实现与注册分离**：`redact_processor`（H6 收尾）仍实现在 `app/workflow` 包内（安全能力随引擎携带），但注册到全局 processor 链的动作放在**宿主组装点**（composition root：`app/main.py` 启动处，或由 `app.core.logging` 暴露的注入钩子），保证生产环境所有日志走同一条脱敏链；CLI 独立模式下由 `logging_conf.setup_logging` 自行挂入。
+  4. 附带建议（**非本期强制**，仅记录）：`app.core.logging` 当前"import 时自动执行 `setup_logging()`"存在副作用，建议后续改为在 `app/main.py` 的 lifespan 中显式初始化。
 - **AD-04**：langchain-anthropic 作为正式依赖安装（顶层导入口径）。
 - **AD-05**：依赖并入现有 `pyproject.toml`：`dependencies` 新增 `PyYAML>=6.0`、`langchain-anthropic`（区间由 EXP-L5 定）、`httpx`（从 test group 提升）；dev group 新增 `pytest-cov`；`[tool.pytest.ini_options]` 追加 `unit`/`integration` marker（保留既有 `slow`，`--strict-markers`）。
 - **AD-06**：版本以 uv.lock 为准；EXP 探索按 `api-exploration-1x.md` 执行。
@@ -48,6 +53,7 @@
   - 内容：实现 `app/workflow/logging_conf.py` 的 `setup_logging(level="INFO", *, json_output=False)`（structlog 配置，幂等，重复调用不叠加 handler；已配置时跳过）；编写 `tests/unit/workflow/test_package_import.py`：`test_import_package`、`test_setup_logging_idempotent`（可选 `test_setup_logging_level`）
   - 产出文件：`app/workflow/logging_conf.py`、`tests/unit/workflow/test_package_import.py`
   - TDD 节奏：先写两个冒烟测试（RED）→ 实现（GREEN）→ 重构
+  - 修订备注【AD-02 v2，2026-07-30】：本卡的 `setup_logging` 定位为**最小幂等 bootstrap**（只在 CLI 独立入口与裸单测环境生效），实现范围据此从简；不在引擎内 import 任何配置模块，也不承担 FastAPI 场景的日志配置职责。签名、幂等语义与两个冒烟测试口径均不变
 - [ ] **TC4 EXP-G 图构建 API 探索（0.375d，R-EXP）**
   - 内容：闭环 `api-exploration-1x.md` 的 EXP-G1..G8（langgraph 1.0.2：pydantic state schema、reducer channel、add_node 形态、path_map、START/END、compile/invoke、异常传播、pydantic 2.11 边界）；允许 SRC/REPL/TEST 手段；characterization test 可留在 `tests/integration/workflow/` 作回归
   - 产出文件：`api-exploration-1x.md`（填写 G 组实测结果与结论）、可选 characterization test 文件
@@ -65,6 +71,7 @@
 
 - `app/workflow/__init__.py` 只定义 `__version__: str = "0.1.0"`，不导入任何重依赖（保持导入廉价）。
 - `setup_logging(level: str = "INFO", *, json_output: bool = False) -> None`：幂等；structlog 形态【AD-02】；脱敏 processor（`redact` / `redact_processor`）在 spec-08 补全并挂入本初始化流程。
+  - 修订备注【AD-02 v2，2026-07-30】：本条末句仅在 **CLI 独立模式**下成立；FastAPI 集成场景下 `redact_processor` 由宿主组装点注册进宿主的 processor 链，不经由 `setup_logging`（该函数在集成场景幂等跳过）。签名保持不变。
 
 ## 7. TDD 测试要点
 
@@ -75,6 +82,8 @@
 | `test_setup_logging_level`（可选） | `level="DEBUG"` 生效 | `caplog` | 同上 |
 
 另：EXP 的 characterization test（如有）标记 `@pytest.mark.integration`，落位 `tests/integration/workflow/`。
+
+修订备注【AD-02 v2，2026-07-30】：上表三项验收点不变——`setup_logging` 在裸测试环境下直接调用即可断言幂等（handler 计数）与 level 生效；因该函数已收窄为最小 bootstrap，本阶段不新增任何关于宿主日志配置或 processor 注册位置的测试（脱敏与注册位置的验收在 spec-08）。
 
 ## 8. 验收标准 DoD
 
