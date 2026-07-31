@@ -13,7 +13,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, override, runtime_checkable
 
 from langchain_core.runnables import Runnable, RunnableLambda
 
@@ -90,6 +90,7 @@ class BaseNode(ABC):
         """统一包装：RunnableLambda(func).with_config(tags=[self.name])."""
         return RunnableLambda(func).with_config(tags=[self.name])  # pyright: ignore[reportReturnType] — with_config returns RunnableBinding at runtime (AD-11)
 
+    @override
     def __str__(self) -> str:
         """Human-readable node identity."""
         return f"{type(self).__name__}(name={self.name}, type={self.node_type})"
