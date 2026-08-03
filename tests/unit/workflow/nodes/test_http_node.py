@@ -4,6 +4,7 @@ All tests run with zero real network: HTTP traffic is served by
 ``httpx.MockTransport`` or a monkeypatched ``httpx.request``.
 """
 
+import json
 from typing import Any
 
 import httpx
@@ -11,7 +12,7 @@ import pytest
 import tenacity
 from pydantic import ValidationError
 
-from app.workflow.models import NodeType
+from app.workflow.models import HTTPNodeError, NodeType
 from app.workflow.nodes.http_node import HTTPNode, HTTPNodeConfig
 
 STATE_MARK = "__full_state_marker__"
@@ -166,3 +167,194 @@ def test_init_accepts_config_instance() -> None:
     cfg = HTTPNodeConfig(url="https://api.example.com/v2")
     node = make_node(cfg)
     assert node._node_config is cfg  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# TC2: build_runnable pipeline, real branch, explicit mock branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_success_extracts_response_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """200 + response_path extracts the nested value and dual-writes output (S4/S5)."""
+    transport, counter = counting_transport(lambda request: httpx.Response(200, json={"data": {"result": "ok"}}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "response_path": "data.result"})
+    state = {"token": "abc"}
+    result = node.build_runnable().invoke(state)
+    assert counter["calls"] == 1
+    assert result["status_code"] == 200
+    assert result["url"] == "https://api.example.com/v1"
+    assert result["response"] == "ok"
+    assert result["http1_result"] == {
+        "status_code": 200,
+        "url": "https://api.example.com/v1",
+        "response": "ok",
+    }
+    # R3/S5: the input state must never be mutated
+    assert state == {"token": "abc"}
+
+
+@pytest.mark.unit
+def test_no_response_path_returns_whole_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """response_path=None returns the whole JSON body."""
+    transport, _ = counting_transport(lambda request: httpx.Response(200, json={"a": 1, "b": 2}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node()
+    result = node.build_runnable().invoke({})
+    assert result["response"] == {"a": 1, "b": 2}
+
+
+@pytest.mark.unit
+def test_response_path_missing_yields_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing response_path yields response=None without crashing (spec-05 §7)."""
+    transport, _ = counting_transport(lambda request: httpx.Response(200, json={"other": 1}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "response_path": "data.result"})
+    result = node.build_runnable().invoke({})
+    assert result["response"] is None
+    assert result["status_code"] == 200
+
+
+@pytest.mark.unit
+def test_url_rendered_from_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """URL placeholders render from state, including one-level nested keys."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={})
+
+    transport, _ = counting_transport(handler)
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/{user[tenant]}/run", "method": "GET"})
+    node.build_runnable().invoke({"user": {"tenant": "t1"}})
+    assert seen["url"] == "https://api.example.com/t1/run"
+
+
+@pytest.mark.unit
+def test_headers_and_body_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Headers/body placeholders render and the body is sent as JSON (spec-05 §7)."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("Authorization")
+        seen["json"] = request.read()
+        return httpx.Response(200, json={})
+
+    transport, _ = counting_transport(handler)
+    patch_httpx(monkeypatch, transport)
+    node = make_node(
+        {
+            "url": "https://api.example.com/v1",
+            "headers": {"Authorization": "Bearer {token}"},
+            "body_template": '{"who": "{name}"}',
+        }
+    )
+    node.build_runnable().invoke({"token": "t-123", "name": "alice"})
+    assert seen["auth"] == "Bearer t-123"
+    assert json.loads(seen["json"]) == {"who": "alice"}
+
+
+@pytest.mark.unit
+def test_invalid_body_json_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rendered body that is not valid JSON raises ValueError naming the node."""
+    transport, counter = counting_transport(lambda request: httpx.Response(200, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "body_template": "{oops}"})
+    with pytest.raises(ValueError, match="http1"):
+        node.build_runnable().invoke({})
+    assert counter["calls"] == 0  # parse fails before any request
+
+
+@pytest.mark.unit
+def test_mock_enabled_hit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mock_enabled + matching key returns mock data with status_code=200, zero network (S9)."""
+    transport, counter = counting_transport(lambda request: httpx.Response(200, json={"real": True}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node(
+        {
+            "url": "https://api.example.com/v1",
+            "mock_enabled": True,
+            "mock_responses": {"POST https://api.example.com/v1": '{"data": {"result": "mocked"}}'},
+            "response_path": "data.result",
+        }
+    )
+    result = node.build_runnable().invoke({})
+    assert counter["calls"] == 0
+    assert result["status_code"] == 200
+    assert result["response"] == "mocked"
+
+
+@pytest.mark.unit
+def test_mock_enabled_hit_fallback_url_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bare url key is used when no '{METHOD} {url}' entry exists (S9)."""
+    transport, counter = counting_transport(lambda request: httpx.Response(200, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node(
+        {
+            "url": "https://api.example.com/v1",
+            "mock_enabled": True,
+            "mock_responses": {"https://api.example.com/v1": '{"ok": true}'},
+        }
+    )
+    result = node.build_runnable().invoke({})
+    assert counter["calls"] == 0
+    assert result["response"] == {"ok": True}
+
+
+@pytest.mark.unit
+def test_mock_enabled_miss_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mock_enabled + miss raises HTTPNodeError and never falls back to a real call (S9, H2/H6)."""
+    transport, counter = counting_transport(lambda request: httpx.Response(200, json={"real": True}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node(
+        {
+            "url": "https://api.example.com/v1",
+            "mock_enabled": True,
+            "mock_responses": {"GET https://other.example.com": "{}"},
+        }
+    )
+    with pytest.raises(HTTPNodeError, match="mock"):
+        node.build_runnable().invoke({})
+    assert counter["calls"] == 0
+
+
+@pytest.mark.unit
+def test_mock_disabled_ignores_mock_responses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mock_enabled=False goes through the real branch even with mock_responses set (S9)."""
+    transport, counter = counting_transport(lambda request: httpx.Response(200, json={"real": True}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node(
+        {
+            "url": "https://api.example.com/v1",
+            "mock_enabled": False,
+            "mock_responses": {"POST https://api.example.com/v1": '{"mocked": true}'},
+        }
+    )
+    result = node.build_runnable().invoke({})
+    assert counter["calls"] == 1
+    assert result["response"] == {"real": True}
+
+
+@pytest.mark.unit
+def test_runnable_tags() -> None:
+    """build_runnable() output carries tags=[name] (K4)."""
+    node = make_node()
+    runnable = node.build_runnable()
+    assert node.name in runnable.config["tags"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.unit
+def test_success_execution_log_summary_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Successful run logs once with summary input_data (method + url only, S15/H6)."""
+    transport, _ = counting_transport(lambda request: httpx.Response(200, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "headers": {"Authorization": SECRET_VALUE}})
+    node.build_runnable().invoke({})
+    history = node.get_execution_history()
+    assert len(history) == 1
+    log = history[0]
+    assert log.input_data == {"method": "POST", "url": "https://api.example.com/v1"}
+    assert log.execution_time_ms >= 0
+    assert log.error is None
