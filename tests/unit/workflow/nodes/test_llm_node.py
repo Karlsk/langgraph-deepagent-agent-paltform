@@ -122,6 +122,25 @@ def test_anthropic_default_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.unit
+def test_base_url_resolution_priority(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit base_url wins over env; base_url_env overrides the llm_type default (AD-12)."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://default.example.com/v1")
+    node = make_node({"base_url": "https://explicit.example.com/v1"})
+    assert node._resolve_base_url() == "https://explicit.example.com/v1"  # noqa: SLF001
+
+    node = make_node({"base_url_env": "CUSTOM_BASE_URL"})
+    monkeypatch.setenv("CUSTOM_BASE_URL", "https://custom.example.com/v1")
+    assert node._resolve_base_url() == "https://custom.example.com/v1"  # noqa: SLF001
+
+    node = make_node()
+    assert node._resolve_base_url() == "https://default.example.com/v1"  # noqa: SLF001
+
+    # anthropic has no default base_url env (AD-12)
+    node = make_node({"llm_type": "anthropic"})
+    assert node._resolve_base_url() is None  # noqa: SLF001
+
+
+@pytest.mark.unit
 def test_validate_config_empty_model_name() -> None:
     """Empty model_name is invalid and raises ValueError (TC1)."""
     node = make_node({"model_name": ""})
