@@ -1,26 +1,18 @@
-"""Node factory and plugin registry (spec-03, CONTRACT §4.5; spec-04 scheme A routing).
+"""Node factory and plugin registry (spec-03, CONTRACT §4.5; spec-04/05 scheme A routing).
 
 Resolution order (user-finalized scheme A, spec-04 supplement): built-in
 branches first (specialized constructors, exactly two, R4 no elif), then the
 plugin registry (generic BaseNode interface), then ValueError for unknown
-types. Built-in classes are top-level imported (AD-04); the llm import sits
-at the bottom of this module to break the self-registration import cycle.
+types. Built-in classes are top-level imported (AD-04); the llm/http imports
+sit at the bottom of this module to break the self-registration import cycle.
 
 Dependency red-line 2: never import registry / graph_builder here.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from app.workflow.models import NodeDefinition, OperatorLog
 from app.workflow.nodes.base import BaseNode
-
-if TYPE_CHECKING:
-    from app.workflow.nodes.http_node import HTTPNode as _HTTPNode  # noqa: F401 # pyright: ignore[reportMissingImports] — delivered by spec-05
-
-# 方案 D 占位：spec-05 交付时替换为真实顶层 import（AD-04 接线点）
-HTTPNode: type[BaseNode] | None = None
 
 _NODE_REGISTRY: dict[str, type[BaseNode]] = {}
 
@@ -45,10 +37,7 @@ def create_node(definition: NodeDefinition, operator_log: OperatorLog | None = N
     if definition.type in ("llm", "LLM"):
         return _llm_node.LLMNode(name=definition.name, llm_config=definition.config, operator_log=op_log)
     if definition.type in ("http", "HTTP"):
-        if HTTPNode is None:
-            msg = "HTTP node type requires spec-05 implementation (HTTPNode not yet available)"
-            raise ValueError(msg)
-        return HTTPNode(name=definition.name, node_type=definition.type, config=definition.config, operator_log=op_log)  # type: ignore[unreachable]
+        return _http_node.HTTPNode(name=definition.name, config=definition.config, operator_log=op_log)
     # 2. 插件注册表（generic BaseNode interface）
     if definition.type in _NODE_REGISTRY:
         node_class = _NODE_REGISTRY[definition.type]
@@ -68,7 +57,8 @@ def create_node(definition: NodeDefinition, operator_log: OperatorLog | None = N
     raise ValueError(msg)
 
 
-# 顶层导入置于文件底部（AD-04）：llm_node 自注册需先拿到 register_node_type，
-# 打破 factory <-> llm_node 的循环导入；模块形态导入对任意导入顺序均安全
-# （属性访问推迟到 create_node 调用期，spec-04 TC4 接线点）。
+# 顶层导入置于文件底部（AD-04）：节点模块自注册需先拿到 register_node_type，
+# 打破 factory <-> 节点模块的循环导入；模块形态导入对任意导入顺序均安全
+# （属性访问推迟到 create_node 调用期，spec-04/05 接线点）。
+import app.workflow.nodes.http_node as _http_node  # noqa: E402
 import app.workflow.nodes.llm_node as _llm_node  # noqa: E402
