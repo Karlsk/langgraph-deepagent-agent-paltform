@@ -358,3 +358,124 @@ def test_success_execution_log_summary_only(monkeypatch: pytest.MonkeyPatch) -> 
     assert log.input_data == {"method": "POST", "url": "https://api.example.com/v1"}
     assert log.execution_time_ms >= 0
     assert log.error is None
+
+
+# ---------------------------------------------------------------------------
+# TC3: tenacity retry, failure paths, H6 leak protection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_retry_on_500_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two 500s then 200 succeeds; sleep called twice with backoff [1, 2] (AD-03/S8)."""
+    delays = patch_sleep(monkeypatch)
+    responses = iter(
+        [
+            httpx.Response(500, json={"err": 1}),
+            httpx.Response(500, json={"err": 2}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    transport, counter = counting_transport(lambda request: next(responses))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "max_retries": 2})
+    result = node.build_runnable().invoke({})
+    assert counter["calls"] == 3
+    assert result["response"] == {"ok": True}
+    assert delays == [1.0, 2.0]
+
+
+@pytest.mark.unit
+def test_no_retry_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """max_retries=0 (default): a 500 raises HTTPNodeError after exactly one request (S8)."""
+    delays = patch_sleep(monkeypatch)
+    transport, counter = counting_transport(lambda request: httpx.Response(500, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node()
+    with pytest.raises(HTTPNodeError, match="500"):
+        node.build_runnable().invoke({})
+    assert counter["calls"] == 1
+    assert delays == []
+
+
+@pytest.mark.unit
+def test_non_retryable_status_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 404 outside retry_on_status raises immediately without retry (S8)."""
+    delays = patch_sleep(monkeypatch)
+    transport, counter = counting_transport(lambda request: httpx.Response(404, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "max_retries": 3})
+    with pytest.raises(HTTPNodeError, match="404"):
+        node.build_runnable().invoke({})
+    assert counter["calls"] == 1
+    assert delays == []
+
+
+@pytest.mark.unit
+def test_retry_exhausted_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Always-500 with max_retries=2 exhausts: HTTPNodeError names attempts; 2 sleeps (AD-03)."""
+    delays = patch_sleep(monkeypatch)
+    transport, counter = counting_transport(lambda request: httpx.Response(500, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "max_retries": 2})
+    with pytest.raises(HTTPNodeError, match="3 attempts"):
+        node.build_runnable().invoke({})
+    assert counter["calls"] == 3
+    assert delays == [1.0, 2.0]
+
+
+@pytest.mark.unit
+def test_custom_retry_base_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """retry_base_delay scales the exponential backoff sequence (S8)."""
+    delays = patch_sleep(monkeypatch)
+    responses = iter([httpx.Response(503, json={}), httpx.Response(503, json={}), httpx.Response(200, json={})])
+    transport, _ = counting_transport(lambda request: next(responses))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "max_retries": 2, "retry_base_delay": 0.5})
+    node.build_runnable().invoke({})
+    assert delays == [0.5, 1.0]
+
+
+@pytest.mark.unit
+def test_transport_error_raises_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Transport-level errors are not retryable (predicate is status-code only, S8)."""
+    delays = patch_sleep(monkeypatch)
+
+    def failing_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    transport, counter = counting_transport(failing_handler)
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "max_retries": 2})
+    with pytest.raises(HTTPNodeError, match="http1"):
+        node.build_runnable().invoke({})
+    assert counter["calls"] == 1
+    assert delays == []
+
+
+@pytest.mark.unit
+def test_failure_records_execution_log_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failure paths record ExecutionLog.error before re-raising (H2)."""
+    transport, _ = counting_transport(lambda request: httpx.Response(404, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node()
+    with pytest.raises(HTTPNodeError):
+        node.build_runnable().invoke({})
+    history = node.get_execution_history()
+    assert len(history) == 1
+    assert history[0].error is not None
+    assert "404" in history[0].error
+
+
+@pytest.mark.unit
+def test_execution_log_no_secret_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Authorization header values never appear in logs or error messages (H6)."""
+    transport, _ = counting_transport(lambda request: httpx.Response(500, json={}))
+    patch_httpx(monkeypatch, transport)
+    node = make_node({"url": "https://api.example.com/v1", "headers": {"Authorization": SECRET_VALUE}})
+    with pytest.raises(HTTPNodeError) as exc_info:
+        node.build_runnable().invoke({STATE_MARK: "state-content"})
+    assert SECRET_VALUE not in str(exc_info.value)
+    serialized = node.get_execution_history()[0].model_dump_json()
+    assert SECRET_VALUE not in serialized
+    assert STATE_MARK not in serialized  # no full state leak either
