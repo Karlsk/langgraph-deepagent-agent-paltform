@@ -16,13 +16,15 @@ import time
 from typing import Any, Literal, override
 
 import structlog
+import tenacity
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ConfigDict, Field
+from tenacity import RetryError, Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
-from app.workflow.models import ConfigError, ExecutionLog, NodeType, OperatorLog
+from app.workflow.models import ConfigError, ExecutionLog, LLMNodeError, NodeType, OperatorLog
 from app.workflow.nodes.base import BaseNode
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
@@ -134,7 +136,26 @@ class LLMNode(BaseNode):
 
     def _invoke_with_retry(self, llm: Any, messages: list[Any]) -> Any:
         """Invoke with tenacity exponential backoff on 429/5xx (AD-03, S8)."""
-        return llm.invoke(messages)  # tenacity wiring delivered by TC3
+        cfg = self._llm_config
+        retrying = Retrying(
+            stop=stop_after_attempt(cfg.max_retries + 1),
+            wait=wait_exponential(multiplier=cfg.retry_base_delay),
+            retry=retry_if_exception(_is_retryable_llm_error),
+            reraise=True,
+            # Dynamic nap reference so tests can monkeypatch tenacity.nap.sleep (AD-03)
+            sleep=tenacity.nap.sleep,
+        )
+        try:
+            for attempt in retrying:
+                with attempt:
+                    result: Any = llm.invoke(messages)
+            return result
+        except RetryError:
+            raise  # unreachable with reraise=True, but satisfies the type checker
+        except Exception as exc:
+            logger.exception("llm_node_invoke_failed", node=self.name, attempts=cfg.max_retries + 1)
+            msg = f"LLMNode '{self.name}': LLM invocation failed after {cfg.max_retries + 1} attempts: {exc}"
+            raise LLMNodeError(msg) from exc
 
     @override
     def build_runnable(self) -> Runnable:

@@ -8,10 +8,11 @@ clients are either injected via ``_llm_instance`` or patched at the
 from typing import Any
 
 import pytest
+import tenacity
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, ValidationError
 
-from app.workflow.models import ConfigError, NodeType
+from app.workflow.models import ConfigError, LLMNodeError, NodeType
 from app.workflow.nodes.llm_node import LLMConfig, LLMNode
 
 DUMMY_KEY = "sk-dummy-test-key-spec04"
@@ -39,6 +40,22 @@ class FakeLLM:
 def make_node(config: dict[str, Any] | LLMConfig | None = None, **kwargs: Any) -> LLMNode:
     """Build an LLMNode with a safe default config."""
     return LLMNode(name=kwargs.pop("name", "llm1"), llm_config=config or {}, **kwargs)
+
+
+class FakeStatusError(Exception):
+    """Stand-in for SDK APIStatusError carrying a status_code attribute (EXP-L3)."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        """Store the status code the retry predicate inspects."""
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Monkeypatch tenacity.nap.sleep, returning the recorded delay sequence (AD-03)."""
+    delays: list[float] = []
+    monkeypatch.setattr(tenacity.nap, "sleep", lambda seconds: delays.append(seconds))
+    return delays
 
 
 # ---------------------------------------------------------------------------
@@ -306,3 +323,104 @@ def test_invoke_success_via_retry_pipeline() -> None:
     response = node._invoke_with_retry(fake, [HumanMessage(content="hello")])  # noqa: SLF001
     assert response.content == "hi"
     assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# TC3: tenacity retry semantics, failure paths, H6 leak protection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_retry_on_429_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two 429s then success: 3 invokes, tenacity.nap.sleep twice with backoff [1, 2] (AD-03)."""
+    delays = patch_sleep(monkeypatch)
+    fake = FakeLLM(
+        side_effect=[
+            FakeStatusError("Error code: 429 - rate limit", 429),
+            FakeStatusError("Error code: 429 - rate limit", 429),
+            AIMessage(content="ok"),
+        ]
+    )
+    node = make_node()
+    response = node._invoke_with_retry(fake, [HumanMessage(content="hello")])  # noqa: SLF001
+    assert response.content == "ok"
+    assert len(fake.calls) == 3
+    assert delays == [1.0, 2.0]
+
+
+@pytest.mark.unit
+def test_retry_on_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """5xx status codes hit the EXP-L3 predicate and are retried."""
+    delays = patch_sleep(monkeypatch)
+    fake = FakeLLM(side_effect=[FakeStatusError("Error code: 500", 500), AIMessage(content="ok")])
+    node = make_node()
+    response = node._invoke_with_retry(fake, [HumanMessage(content="hello")])  # noqa: SLF001
+    assert response.content == "ok"
+    assert len(fake.calls) == 2
+    assert delays == [1.0]
+
+
+@pytest.mark.unit
+def test_non_rate_limit_error_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-retryable error is invoked once, never slept, wrapped into LLMNodeError."""
+    delays = patch_sleep(monkeypatch)
+    fake = FakeLLM(side_effect=[FakeStatusError("Error code: 400 - bad request", 400)])
+    node = make_node()
+    with pytest.raises(LLMNodeError, match="bad request"):
+        node._invoke_with_retry(fake, [HumanMessage(content="hello")])  # noqa: SLF001
+    assert len(fake.calls) == 1
+    assert delays == []
+
+
+@pytest.mark.unit
+def test_retry_exhausted_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Always-429 with max_retries=2: 3 attempts, 2 waits [1, 2], LLMNodeError names attempts."""
+    delays = patch_sleep(monkeypatch)
+    fake = FakeLLM(side_effect=[FakeStatusError("Error code: 429", 429)] * 3)
+    node = make_node({"max_retries": 2})
+    with pytest.raises(LLMNodeError, match="3 attempts"):
+        node._invoke_with_retry(fake, [HumanMessage(content="hello")])  # noqa: SLF001
+    assert len(fake.calls) == 3
+    assert delays == [1.0, 2.0]
+
+
+@pytest.mark.unit
+def test_retry_respects_custom_base_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """retry_base_delay scales the exponential backoff sequence (S8)."""
+    delays = patch_sleep(monkeypatch)
+    fake = FakeLLM(side_effect=[FakeStatusError("429", 429)] * 3)
+    node = make_node({"max_retries": 2, "retry_base_delay": 0.5})
+    with pytest.raises(LLMNodeError):
+        node._invoke_with_retry(fake, [HumanMessage(content="hello")])  # noqa: SLF001
+    assert delays == [0.5, 1.0]
+
+
+@pytest.mark.unit
+def test_invoke_failure_records_error_log() -> None:
+    """Invoke failure inside the pipeline records ExecutionLog.error then re-raises (H2/R6)."""
+    fake = FakeLLM(side_effect=[FakeStatusError("Error code: 400", 400)])
+    node = make_node()
+    node._llm_instance = fake  # noqa: SLF001
+    with pytest.raises(LLMNodeError):
+        node.build_runnable().invoke({"messages": [HumanMessage(content="hello")]})
+    history = node.get_execution_history()
+    assert len(history) == 1
+    assert history[0].error is not None
+    assert "400" in history[0].error
+
+
+@pytest.mark.unit
+def test_execution_log_no_secret_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """H6 guard: serialized ExecutionLog carries neither the env key value nor the full state."""
+    secret_value = "sk-super-secret-value-leak-check"  # noqa: S105 — dummy sentinel, not a real credential
+    monkeypatch.setenv("OPENAI_API_KEY", secret_value)
+    state_payload = "confidential-state-payload-marker"
+    node = make_node()
+    node._llm_instance = FakeLLM()  # noqa: SLF001
+    node.build_runnable().invoke({"messages": [HumanMessage(content=state_payload)], "extra": state_payload})
+    history = node.get_execution_history()
+    assert history
+    for log in history:
+        serialized = log.model_dump_json()
+        assert secret_value not in serialized
+        assert state_payload not in serialized
