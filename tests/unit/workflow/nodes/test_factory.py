@@ -5,6 +5,7 @@ import pytest
 from app.workflow.models import NodeDefinition, OperatorLog
 from app.workflow.nodes import factory
 from app.workflow.nodes.factory import create_node, list_node_types, register_node_type
+from app.workflow.nodes.llm_node import LLMNode
 from tests.unit.workflow.nodes.test_base import FakeNode
 
 
@@ -44,12 +45,30 @@ def test_create_unknown_type_raises_value_error() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("builtin_type", ["llm", "LLM", "http", "HTTP"])
+@pytest.mark.parametrize("builtin_type", ["http", "HTTP"])
 def test_builtin_types_not_yet_wired(builtin_type: str) -> None:
-    """Built-in llm/http placeholders (scheme D) raise ValueError until spec-04/05 land (AD-04)."""
+    """Built-in http placeholders (scheme D) raise ValueError until spec-05 lands (AD-04)."""
     definition = NodeDefinition(name="n1", type=builtin_type, config={})
-    with pytest.raises(ValueError, match="spec-0[45]"):
+    with pytest.raises(ValueError, match="spec-05"):
         create_node(definition)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("llm_type", ["llm", "LLM"])
+def test_factory_creates_llm_node(llm_type: str) -> None:
+    """Built-in llm branch wires LLMNode with its frozen constructor (spec-04 TC4, scheme A)."""
+    definition = NodeDefinition(name="llm_a", type=llm_type, config={"model_name": "gpt-4o"})
+    node = create_node(definition)
+    assert isinstance(node, LLMNode)
+    assert node.name == "llm_a"
+    assert node._llm_config.model_name == "gpt-4o"  # noqa: SLF001 — asserting wiring per frozen contract
+    assert node.operator_log == OperatorLog(node_name="llm_a", input_schema={}, output_schema={})
+
+
+@pytest.mark.unit
+def test_llm_self_registered_for_visibility() -> None:
+    """llm_node self-registration keeps 'llm' visible in list_node_types() (CONTRACT §4.7)."""
+    assert "llm" in list_node_types()
 
 
 @pytest.mark.unit

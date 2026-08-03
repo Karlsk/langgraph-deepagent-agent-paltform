@@ -26,6 +26,7 @@ from tenacity import RetryError, Retrying, retry_if_exception, stop_after_attemp
 
 from app.workflow.models import ConfigError, ExecutionLog, LLMNodeError, NodeType, OperatorLog
 from app.workflow.nodes.base import BaseNode
+from app.workflow.nodes.factory import register_node_type
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 logger = structlog.get_logger(__name__)
@@ -145,10 +146,11 @@ class LLMNode(BaseNode):
             # Dynamic nap reference so tests can monkeypatch tenacity.nap.sleep (AD-03)
             sleep=tenacity.nap.sleep,
         )
+        result: Any = None
         try:
             for attempt in retrying:
                 with attempt:
-                    result: Any = llm.invoke(messages)
+                    result = llm.invoke(messages)
             return result
         except RetryError:
             raise  # unreachable with reraise=True, but satisfies the type checker
@@ -205,3 +207,7 @@ class LLMNode(BaseNode):
                 error=error,
             )
         )
+
+
+# 模块底部自注册（CONTRACT §4.7；factory 内置分支作双保险）
+register_node_type("llm", LLMNode)
