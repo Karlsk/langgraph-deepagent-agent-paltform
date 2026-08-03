@@ -12,7 +12,8 @@ about graphs); never import app.core.* (engine self-contained).
 from __future__ import annotations
 
 import os
-from typing import Any, Literal
+import time
+from typing import Any, Literal, override
 
 import structlog
 from langchain_anthropic import ChatAnthropic
@@ -82,6 +83,7 @@ class LLMNode(BaseNode):
         self.messages = messages
         self._llm_instance: Any = None
 
+    @override
     def validate_config(self) -> bool:
         """model_name must be non-empty; otherwise raise ValueError."""
         if not self._llm_config.model_name:
@@ -122,26 +124,55 @@ class LLMNode(BaseNode):
             if cfg.llm_type == "openai":
                 self._llm_instance = ChatOpenAI(base_url=self._resolve_base_url(), **common)
             else:
-                # EXP-L1 trap 1: always pass an explicit max_tokens to anthropic
-                self._llm_instance = ChatAnthropic(max_tokens=cfg.max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS, **common)
+                # EXP-L1 trap 1: always pass an explicit max_tokens to anthropic.
+                # 'max_tokens' is the canonical alias (populate_by_name) of max_tokens_to_sample (EXP-L1).
+                self._llm_instance = ChatAnthropic(
+                    max_tokens=cfg.max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,  # pyright: ignore[reportCallIssue] — alias kwarg per EXP-L1
+                    **common,
+                )
         return self._llm_instance
 
     def _invoke_with_retry(self, llm: Any, messages: list[Any]) -> Any:
         """Invoke with tenacity exponential backoff on 429/5xx (AD-03, S8)."""
-        raise NotImplementedError  # delivered by TC2/TC3
+        return llm.invoke(messages)  # tenacity wiring delivered by TC3
 
+    @override
     def build_runnable(self) -> Runnable:
-        """唯一执行单元（K4）：七步进出管线，见 TC2."""
-        raise NotImplementedError  # delivered by TC2
+        """唯一执行单元（K4）：七步进出管线（S5/R3）."""
 
-    def _log(
-        self,
-        state_dict: dict[str, Any],
-        message_count: int,
-        output: dict[str, Any],
-        execution_time_ms: float,
-        error: str | None,
-    ) -> None:
+        def func(state: dict[str, Any]) -> dict[str, Any]:
+            started = time.perf_counter()
+            # 1. R3 入口：state → dict（不 mutate 输入）
+            state_dict = convert_state_to_dict(state)
+            message_count = 0
+            output: dict[str, Any] = {}
+            try:
+                # 2. 取 messages：state 优先，其次实例 messages；皆空 → ValueError
+                messages = state_dict.get("messages") or self.messages
+                if not messages:
+                    msg = f"LLMNode '{self.name}': no messages provided (state and instance messages are both empty)"
+                    raise ValueError(msg)
+                message_count = len(messages)
+                # 3. system_prompt 非空 → 前置 SystemMessage
+                if self._llm_config.system_prompt:
+                    messages = [SystemMessage(content=self._llm_config.system_prompt), *messages]
+                # 4. 调用（tenacity 429/5xx 退避，S8）
+                response = self._invoke_with_retry(self._get_llm_instance(), messages)
+                # 5. 成功输出 {"response": <content>, "model": model_name}
+                output = {"response": response.content, "model": self._llm_config.model_name}
+                # 6. log_execution：input_data 仅摘要（消息条数 + 模型名），H6/S15
+                self._log(message_count, output, (time.perf_counter() - started) * 1000, error=None)
+            except Exception as exc:
+                # 异常分支：记录后重抛（H2/R6，禁止死 except）
+                self._log(message_count, output, (time.perf_counter() - started) * 1000, error=str(exc))
+                logger.exception("llm_node_execution_failed", node=self.name, error=str(exc))
+                raise
+            # 7. R3 出口：双写 + history 增量
+            return map_output_to_state(self.name, output, state_dict)
+
+        return self.wrap_runnable(func)
+
+    def _log(self, message_count: int, output: dict[str, Any], execution_time_ms: float, error: str | None) -> None:
         """Write an ExecutionLog whose input_data is a summary only (S15/H6)."""
         self.log_execution(
             ExecutionLog(
