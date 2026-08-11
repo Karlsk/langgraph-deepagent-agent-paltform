@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, override
 
 import pytest
@@ -21,7 +22,7 @@ from app.workflow.models import (
 )
 from app.workflow.nodes.base import BaseNode, RunLogCollectorLike, get_run_collector
 from app.workflow.nodes.factory import register_node_type
-from app.workflow.registry import RunLogCollector, RunResult, WorkflowRegistry
+from app.workflow.registry import RunLogCollector, RunResult, WorkflowRegistry, load_definitions_from_dir
 
 pytestmark = pytest.mark.unit
 
@@ -252,3 +253,39 @@ def test_execute_failure_reraises_and_resets_collector() -> None:
     with pytest.raises(RuntimeError, match="boom from fail node"):
         registry.execute_workflow("wf_fail", {})
     assert get_run_collector() is None
+
+
+# --- TC4: load_definitions_from_dir ----------------------------------------
+
+_YAML_TEMPLATE = """workflow_id: {workflow_id}
+entry_point: n
+nodes:
+  - name: n
+    type: echo
+state_schema: {{}}
+"""
+
+
+def test_load_definitions_from_dir(tmp_path: Path) -> None:
+    """Recursive scan of *.yaml/*.yml sorted by file name; other extensions ignored."""
+    (tmp_path / "b.yml").write_text(_YAML_TEMPLATE.format(workflow_id="wf_b"))
+    (tmp_path / "notes.txt").write_text("not a workflow")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "a.yaml").write_text(_YAML_TEMPLATE.format(workflow_id="wf_a"))
+    definitions = load_definitions_from_dir(tmp_path)
+    assert [definition.workflow_id for definition in definitions] == ["wf_a", "wf_b"]
+
+
+def test_load_definitions_bad_file_fails_fast(tmp_path: Path) -> None:
+    """A file failing validation raises ValueError carrying the file path (fail fast)."""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("workflow_id: wf_bad\nentry_point: n\n")  # missing nodes/state_schema
+    with pytest.raises(ValueError, match=str(bad)):
+        load_definitions_from_dir(tmp_path)
+
+
+def test_load_definitions_empty_dir(tmp_path: Path) -> None:
+    """Empty (or missing) directory yields an empty list."""
+    assert load_definitions_from_dir(tmp_path / "nowhere") == []
+    assert load_definitions_from_dir(tmp_path) == []

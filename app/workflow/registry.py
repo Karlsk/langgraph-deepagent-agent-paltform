@@ -19,9 +19,11 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 import structlog
+from pydantic import ValidationError
 
 from app.workflow.graph_builder import GraphBuilder
 from app.workflow.models import (
@@ -29,6 +31,7 @@ from app.workflow.models import (
     OperatorLog,
     WorkflowDefinition,
     WorkflowNotFoundError,
+    load_definition_from_yaml,
 )
 from app.workflow.nodes.base import _RUN_COLLECTOR, BaseNode, set_run_collector  # noqa: SLF001 — token reset per S11
 
@@ -238,3 +241,24 @@ class WorkflowRegistry:
             if workflow_id not in self._run_locks:
                 self._run_locks[workflow_id] = threading.RLock()
             return self._run_locks[workflow_id]
+
+
+def load_definitions_from_dir(directory: str | Path) -> list[WorkflowDefinition]:
+    """Recursively load workflow definitions from *.yaml/*.yml files.
+
+    Files are parsed in file-name order (full path breaks ties). Any single
+    file failure raises ValueError carrying the file path (fail fast); an
+    empty or missing directory logs a warning and returns an empty list.
+    """
+    root = Path(directory)
+    paths = sorted([*root.rglob("*.yaml"), *root.rglob("*.yml")], key=lambda path: (path.name, str(path)))
+    if not paths:
+        logger.warning("no_workflow_definitions_found", directory=str(root))
+        return []
+    definitions: list[WorkflowDefinition] = []
+    for path in paths:
+        try:
+            definitions.append(load_definition_from_yaml(path))
+        except ValidationError as exc:
+            raise ValueError(f"failed to load workflow definition from {path}: {exc}") from exc
+    return definitions
