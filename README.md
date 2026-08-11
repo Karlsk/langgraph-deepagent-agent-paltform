@@ -131,6 +131,7 @@ This works as a drop-in replacement anywhere `ChatOpenAI` is used in your LangGr
 - **JWT auth** with session management; rate limiting via slowapi
 - **Alembic** migrations; optional Valkey/Redis cache layer
 - **Structured logging** with request/session/user context on every line
+- **Workflow engine** — declarative YAML workflows compiled to LangGraph, runnable via CLI and HTTP API
 
 ## Quickstart
 
@@ -159,6 +160,7 @@ Open [http://localhost:8000/docs](http://localhost:8000/docs) to see the interac
 | [Observability](docs/observability.md) | Langfuse, structured logging, Prometheus, profiling |
 | [Evaluation](docs/evaluation.md) | Eval framework, custom metrics, reports |
 | [Docker](docs/docker.md) | Docker, Compose, full monitoring stack |
+| [Workflow Engine](#workflow-engine) | Declarative YAML workflows (CLI + HTTP), see also [architecture overview](docs/workflow-reimpl-plan/00-架构总览.md) |
 
 ## Project structure
 
@@ -188,6 +190,127 @@ Report security issues privately — see [SECURITY.md](SECURITY.md).
 ## License
 
 See [LICENSE](LICENSE).
+
+## Workflow Engine
+
+Declarative workflow engine: YAML DSL → compiled LangGraph 图，CLI 与 HTTP 双入口共用同一
+`ApiResponse` 信封。设计与完整规范见
+[docs/workflow-reimpl-plan/00-架构总览.md](docs/workflow-reimpl-plan/00-架构总览.md)（三层：
+DSL 模型 → 图编译 → 注册表运行时）。
+
+```
+YAML (config/*.yaml) → models 解析/校验 → GraphBuilder 编译 StateGraph
+    → WorkflowRegistry（per-workflow RLock + 运行级日志收集）
+    → CLI (python -m app.workflow) / FastAPI (POST /api/v1/workflows/{id}/execute)
+```
+
+### 快速开始
+
+```bash
+make install                              # uv sync + pre-commit
+cp .env.example .env                      # 填入 OPENAI_API_KEY（LLM 示例需要）
+
+# 示例位于 app/workflow/config/examples/：
+#   minimal.yaml          LLM 单节点（需 OPENAI_API_KEY）
+#   http_demo.yaml        HTTP 节点 mock 演示（无需任何 key）
+#   condition_branch.yaml LLM → 条件边 → HTTP 组合（需 OPENAI_API_KEY）
+
+# HTTP mock 示例（零外部依赖，验证安装成功）
+uv run python -m app.workflow run --workflow demo_http --input '{"input":"hi"}'
+
+# LLM 示例（S5：LLM 节点从 state.messages 取对话内容，dict 形态自动转换）
+uv run python -m app.workflow run --workflow demo_minimal \
+  --input '{"messages": [{"role": "user", "content": "hi"}]}'
+
+# 跑测试（零真实网络 / 零真实 LLM）
+uv run pytest -m unit -q
+uv run pytest -m integration -q
+```
+
+HTTP API（宿主启动时已注入注册表，示例目录为 `app/workflow/config/examples/`）：
+
+```bash
+make dev   # 或 make docker-up
+curl -X POST http://localhost:8000/api/v1/workflows/demo_http/execute \
+  -H 'Content-Type: application/json' -d '{"input": "hi"}'
+```
+
+### 目录结构
+
+```
+app/workflow/
+  models.py         # YAML DSL Pydantic 模型 + 异常族（WorkflowEngineError 基类）
+  state.py          # 动态 state 模型工厂（reducer/预声明 {node}_result）
+  nodes/            # BaseNode + LLMNode + HTTPNode + 插件注册工厂
+  graph_builder.py  # 校验 → 建图 → 条件路由 → 编译
+  registry.py       # 进程级注册表：per-workflow RLock + 运行级日志收集
+  cli.py            # CLI 入口与 ApiResponse 信封（stdout 信封 / stderr 日志）
+  api.py            # FastAPI 路由（app.state 注入注册表）
+  logging_conf.py   # structlog 配置 + 密钥脱敏处理器（H6）
+  config/examples/  # 三个可运行示例 YAML
+```
+
+### FAQ（工作流引擎）
+
+**reducer 语义是什么？**
+state 字段在 YAML `state_schema` 里显式声明 `reducer: add`（列表追加合并）或
+`reducer: last`（后写覆盖）；不声明则为普通 LastValue 字段。引擎不对任何字段名做
+特殊化处理（C2）；未声明的 `history` 会自动注入为 add 通道。
+
+**双写开关 / `{node}_result` 是什么？**
+每个节点输出会双写：平铺字段写回同名 state 键（需在 `state_schema` 声明，否则被
+langgraph 丢弃，S4），同时整包写入构建期预声明的 `{node}_result` 槽位（EXP-G8），
+条件边与后续节点一般从 `{node}_result` 读取上游输出。
+
+**条件表达式支持什么语法？**
+仅两种（绝不 eval，S7）：`path == '字面量'`（点路径取值与字面量相等比较）与
+`path`（真值判断）。所有条件均不命中时按 `no_match_policy` 处理：默认 `raise`
+抛 `ConditionNotMatchedError`；宿主可配置 `default` 并提供 `default_edges` 兜底分支。
+
+**错误信封长什么样？**
+CLI 与 HTTP 共用 `ApiResponse`：`{"success": bool, "data": ..., "error": str|null,
+"metadata": {...}}`。失败时 error 为脱敏后的摘要（密钥片段替换为 `***`，H6），
+CLI 失败退出码为 1；HTTP 未找到 workflow 返回 404，执行失败返回 500，均携带失败信封。
+
+**LLM 示例为什么传 messages 而不是 input？**
+LLM 节点契约（S5）从 `state.messages` 取对话内容；`{"role": ..., "content": ...}`
+dict 形态由 langchain 本地转换为消息对象，无需真实调用即可在 YAML 中声明
+`messages: {type: list}` 后从 CLI/HTTP 传入。
+
+### 扩展指南：自定义节点类型
+
+```python
+from typing import Any, override
+from langchain_core.runnables import Runnable
+
+from app.workflow.nodes.base import BaseNode
+from app.workflow.nodes.factory import register_node_type
+from app.workflow.utils import convert_state_to_dict, map_output_to_state
+
+
+class MyNode(BaseNode):
+    @override
+    def build_runnable(self) -> Runnable:
+        def func(state: Any) -> dict[str, Any]:
+            state_dict = convert_state_to_dict(state)          # R3 入口：不 mutate 输入
+            output = {"answer": 42}
+            return map_output_to_state(self.name, output, state_dict)  # R3 出口：双写
+
+        return self.wrap_runnable(func)                        # 自动日志/异常包装
+
+    @override
+    def validate_config(self) -> bool:
+        return True
+
+
+register_node_type("my_node", MyNode)   # 需在 registry 构建前注册
+```
+
+随后在 YAML 中使用 `type: my_node`。**缓存约束（H4）**：自定义节点与引擎模块一律
+禁止模块级无界缓存（模块级 dict / `functools.lru_cache`）；如需跨运行复用，
+由宿主组装点显式持有并经构造参数传入（参照 `app.state.workflow_registry` 注入模式）。
+**密钥约束（H6）**：节点不得在配置中接收明文密钥，一律经环境变量解析；
+日志只输出摘要，不输出完整 state。
 
 ## FAQ
 

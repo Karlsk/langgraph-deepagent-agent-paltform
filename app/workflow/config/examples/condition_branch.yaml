@@ -1,4 +1,16 @@
 # 所需环境变量：OPENAI_API_KEY（运行该示例前设置，见 .env.example）
+# 运行：uv run python -m app.workflow run --workflow condition_branch_demo \
+#        --input '{"input": "please review", "messages": [{"role": "user", "content": "please review"}]}'
+# 说明：check（LLM）节点只输出固定标记字 OK 或 NEED_REVIEW；条件边按
+# check_result.response 的相等比较分流（S7：条件表达式仅支持
+# 'path == 字面量' 或 path 真值判断，绝不 eval）。notify（HTTP）节点使用
+# mock_enabled 演示，mock 仅演示用途，生产请关闭 mock（S9/H2，见 README 扩展指南）。
+#
+# default_edges 说明（S6）：条件边默认 no_match_policy='raise'——所有 condition
+# 均不命中（如 LLM 输出了标记字以外的内容）时抛 ConditionNotMatchedError。
+# 若需兜底分支，在宿主构建 GraphBuilder 时传 no_match_policy='default'，并在
+# register/build 时提供 default_edges={"<source节点>": "<兜底目标或END>"}；
+# 缺 default_edges 条目会在构建期报错（构建期失败优于运行期失败）。
 workflow_id: condition_branch_demo
 description: "条件分支示例：LLM check 节点按结果分流到 HTTP 通知或 LLM 摘要"
 entry_point: check
@@ -8,7 +20,11 @@ nodes:
     config:
       llm_type: openai
       model_name: gpt-4o-mini
-      system_prompt: "判断输入是否需要人工复核，输出包含 status 字段的 JSON。"
+      temperature: 0.0
+      system_prompt: >-
+        判断输入是否需要人工复核：涉及金额、法律、医疗或投诉时需要。
+        只输出一个单词：需要复核输出 NEED_REVIEW，否则输出 OK。
+        不要输出任何其他文字、标点或解释。
   - name: notify
     type: http
     config:
@@ -16,19 +32,22 @@ nodes:
       method: POST
       body_template: '{"input": "{input}"}'
       response_path: "result"
+      mock_enabled: true
+      mock_responses:
+        "POST https://example.com/api/notify": '{"result": {"ticket": "DEMO-1"}}'
   - name: summarize
     type: llm
     config:
       llm_type: openai
       model_name: gpt-4o-mini
-      system_prompt: "You are a concise assistant. Summarize the input."
+      system_prompt: "You are a concise assistant. Summarize the input in one sentence."
 edges:
   - source: check
     target: notify
-    condition: "check_result.status == 'ok'"
+    condition: "check_result.response == 'OK'"
   - source: check
     target: summarize
-    condition: "check_result.status == 'fail'"
+    condition: "check_result.response == 'NEED_REVIEW'"
   - source: notify
     target: END
   - source: summarize
@@ -36,4 +55,7 @@ edges:
 state_schema:
   input:
     type: str
-    description: 用户输入
+    description: 用户输入（用于 notify 的 body_template 渲染）
+  messages:
+    type: list
+    description: 'langchain 消息列表，如 [{"role": "user", "content": "please review"}]'

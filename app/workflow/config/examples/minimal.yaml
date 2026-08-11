@@ -1,4 +1,8 @@
 # 所需环境变量：OPENAI_API_KEY（运行该示例前设置，见 .env.example）
+# 运行：uv run python -m app.workflow run --workflow demo_minimal \
+#        --input '{"messages": [{"role": "user", "content": "hi"}]}'
+# 说明：LLM 节点（S5）要求 state 中提供 messages；dict 形态 {role, content}
+# 由 langchain 本地转换，见 README 工作流引擎 FAQ。
 workflow_id: demo_minimal
 description: "最小示例：LLM 单节点"
 entry_point: greet
@@ -15,4 +19,7 @@ edges:
 state_schema:
   input:
     type: str
-    description: 用户输入
+    description: 用户输入（可选；LLM 节点从 messages 取对话内容）
+  messages:
+    type: list
+    description: 'langchain 消息列表，如 [{"role": "user", "content": "hi"}]'
