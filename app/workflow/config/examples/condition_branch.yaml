@@ -1,0 +1,39 @@
+# 所需环境变量：OPENAI_API_KEY（运行该示例前设置，见 .env.example）
+workflow_id: condition_branch_demo
+description: "条件分支示例：LLM check 节点按结果分流到 HTTP 通知或 LLM 摘要"
+entry_point: check
+nodes:
+  - name: check
+    type: llm
+    config:
+      llm_type: openai
+      model_name: gpt-4o-mini
+      system_prompt: "判断输入是否需要人工复核，输出包含 status 字段的 JSON。"
+  - name: notify
+    type: http
+    config:
+      url: "https://example.com/api/notify"
+      method: POST
+      body_template: '{"input": "{input}"}'
+      response_path: "result"
+  - name: summarize
+    type: llm
+    config:
+      llm_type: openai
+      model_name: gpt-4o-mini
+      system_prompt: "You are a concise assistant. Summarize the input."
+edges:
+  - source: check
+    target: notify
+    condition: "check_result.status == 'ok'"
+  - source: check
+    target: summarize
+    condition: "check_result.status == 'fail'"
+  - source: notify
+    target: END
+  - source: summarize
+    target: END
+state_schema:
+  input:
+    type: str
+    description: 用户输入
