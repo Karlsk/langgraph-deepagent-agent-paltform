@@ -1,11 +1,33 @@
 """Shared pytest fixtures for the test suite."""
 
 from collections.abc import Generator
+from typing import Any, override
 
 import pytest
 from dotenv import load_dotenv
+from langchain_core.runnables import Runnable
+
+from app.workflow.nodes.base import BaseNode
+from app.workflow.nodes.factory import register_node_type
+from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 load_dotenv()
+
+
+class EchoNode(BaseNode):
+    """Shared test-only node: merges config['output'] into state (zero network, zero LLM; AD-08)."""
+
+    @override
+    def build_runnable(self) -> Runnable:
+        def func(state: Any) -> dict[str, Any]:
+            state_dict = convert_state_to_dict(state)
+            return map_output_to_state(self.name, dict(self.config.get("output", {})), state_dict)
+
+        return self.wrap_runnable(func)
+
+    @override
+    def validate_config(self) -> bool:
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -17,3 +39,10 @@ def restore_node_registry() -> Generator[None, None, None]:
     yield
     factory._NODE_REGISTRY.clear()  # noqa: SLF001
     factory._NODE_REGISTRY.update(snapshot)  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
+def register_echo_node() -> Generator[None, None, None]:
+    """Register the shared EchoNode for every test; cleanup relies on restore_node_registry (D7)."""
+    register_node_type("echo", EchoNode)
+    yield

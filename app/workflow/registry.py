@@ -18,9 +18,16 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from app.workflow.models import ExecutionLog
+from app.workflow.graph_builder import GraphBuilder
+from app.workflow.models import (
+    ExecutionLog,
+    OperatorLog,
+    WorkflowDefinition,
+    WorkflowNotFoundError,
+)
+from app.workflow.nodes.base import BaseNode
 
 
 @dataclass(frozen=True)
@@ -63,3 +70,131 @@ class RunLogCollector:
         """Return a timestamp-sorted copy of all collected logs."""
         with self._lock:
             return sorted(self._logs, key=lambda log: log.timestamp)
+
+
+class WorkflowRegistry:
+    """Process-level registry of compiled workflows (CONTRACT §4.10).
+
+    Concurrency model (S10, ADR-004): a per-workflow RLock serializes
+    ``execute_workflow`` calls of the same workflow while different workflows
+    run in parallel; ``_meta_lock`` guards lazy lock-table creation and the
+    register/delete map mutations. Run-scoped log collection via the
+    ``_RUN_COLLECTOR`` ContextVar isolates logs per run/task as a second line
+    of defense (D3, H1).
+    """
+
+    def __init__(self, *, no_match_policy: Literal["raise", "default"] = "raise") -> None:
+        """Create an empty registry with the given condition-router no-match policy."""
+        self._registry: dict[str, Any] = {}
+        self._definitions: dict[str, WorkflowDefinition] = {}
+        self._nodes_map: dict[str, dict[str, BaseNode]] = {}
+        self._run_locks: dict[str, threading.RLock] = {}
+        self._meta_lock = threading.RLock()
+        self._builder = GraphBuilder(no_match_policy=no_match_policy)
+
+    # -- registration ---------------------------------------------------------
+
+    def register_workflow(
+        self,
+        definition: WorkflowDefinition,
+        *,
+        default_edges: dict[str, str] | None = None,
+    ) -> str:
+        """Compile and store a workflow; re-registration atomically replaces it (S13).
+
+        Missing operator_logs entries are filled with generic empty schemas
+        (no node-type special-casing, replacing the legacy domain branching).
+        """
+        self._ensure_operator_logs(definition)
+        result = self._builder.build_graph(definition, default_edges=default_edges)
+        workflow_id = definition.workflow_id
+        with self._meta_lock:
+            if workflow_id in self._registry:
+                self.delete_workflow(workflow_id)
+            self._registry[workflow_id] = result.compiled_graph
+            self._definitions[workflow_id] = definition
+            self._nodes_map[workflow_id] = result.nodes_map
+        return workflow_id
+
+    def delete_workflow(self, workflow_id: str) -> bool:
+        """Sole deletion entry (C6/H7): drop all four internal map entries atomically."""
+        with self._meta_lock:
+            if workflow_id not in self._registry:
+                return False
+            del self._registry[workflow_id]
+            self._definitions.pop(workflow_id, None)
+            self._nodes_map.pop(workflow_id, None)
+            self._run_locks.pop(workflow_id, None)
+        return True
+
+    # -- core access ----------------------------------------------------------
+
+    def get_workflow(self, workflow_id: str) -> Any:
+        """Return the compiled graph; raise WorkflowNotFoundError for unknown ids."""
+        workflow = self._registry.get(workflow_id)
+        if workflow is None:
+            raise WorkflowNotFoundError(f"workflow not found: {workflow_id}")
+        return workflow
+
+    def has_workflow(self, workflow_id: str) -> bool:
+        """Check whether a workflow id is registered."""
+        return workflow_id in self._registry
+
+    def list_workflows(self) -> list[str]:
+        """Return registered workflow ids in sorted order."""
+        return sorted(self._registry)
+
+    # -- queries --------------------------------------------------------------
+
+    def get_workflow_definition(self, workflow_id: str) -> WorkflowDefinition | None:
+        """Return the stored definition, or None for unknown ids."""
+        return self._definitions.get(workflow_id)
+
+    def get_operator_logs(self, workflow_id: str) -> dict[str, OperatorLog]:
+        """Return the definition's operator logs (empty dict for unknown ids)."""
+        definition = self._definitions.get(workflow_id)
+        return dict(definition.operator_logs) if definition is not None else {}
+
+    def get_operator_log_by_node(self, workflow_id: str, node_name: str) -> OperatorLog | None:
+        """Return one node's operator log, or None when absent."""
+        return self.get_operator_logs(workflow_id).get(node_name)
+
+    def get_execution_history(self, workflow_id: str) -> list[ExecutionLog]:
+        """Return a copy of the last-run execution history (empty for unknown ids)."""
+        definition = self._definitions.get(workflow_id)
+        return list(definition.execution_history) if definition is not None else []
+
+    def get_node_execution_history(self, workflow_id: str, node_name: str) -> list[ExecutionLog]:
+        """Return last-run history entries filtered by node name."""
+        return [log for log in self.get_execution_history(workflow_id) if log.node_name == node_name]
+
+    def get_node_by_name(self, workflow_id: str, node_name: str) -> BaseNode | None:
+        """Return the node instance for a registered workflow, or None when absent."""
+        return self._nodes_map.get(workflow_id, {}).get(node_name)
+
+    def get_registry_stats(self) -> dict[str, Any]:
+        """Return registry-level counters and ids."""
+        return {
+            "workflow_count": len(self._registry),
+            "workflow_ids": self.list_workflows(),
+            "node_count": sum(len(nodes) for nodes in self._nodes_map.values()),
+        }
+
+    # -- internals ------------------------------------------------------------
+
+    def _ensure_operator_logs(self, definition: WorkflowDefinition) -> None:
+        """Fill missing operator_logs with generic empty schemas (no type branching)."""
+        for node in definition.nodes:
+            if node.name not in definition.operator_logs:
+                definition.operator_logs[node.name] = OperatorLog(
+                    node_name=node.name,
+                    input_schema={},
+                    output_schema={},
+                )
+
+    def _get_run_lock(self, workflow_id: str) -> threading.RLock:
+        """Lazily create the per-workflow run lock under _meta_lock (S10)."""
+        with self._meta_lock:
+            if workflow_id not in self._run_locks:
+                self._run_locks[workflow_id] = threading.RLock()
+            return self._run_locks[workflow_id]

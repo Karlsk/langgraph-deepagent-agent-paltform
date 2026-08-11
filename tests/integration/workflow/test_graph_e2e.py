@@ -6,12 +6,10 @@ zero real LLM/HTTP calls.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, override
+from typing import Any
 
 import pytest
-from langchain_core.runnables import Runnable
 
 from app.workflow.graph_builder import BuildResult, GraphBuilder
 from app.workflow.models import (
@@ -21,36 +19,10 @@ from app.workflow.models import (
     WorkflowDefinition,
     load_definition_from_yaml,
 )
-from app.workflow.nodes.base import BaseNode
-from app.workflow.nodes.factory import register_node_type
-from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 pytestmark = pytest.mark.integration
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "app" / "workflow" / "config" / "examples"
-
-
-class EchoNode(BaseNode):
-    """Test-only node: merges config['output'] into state (zero network, zero LLM)."""
-
-    @override
-    def build_runnable(self) -> Runnable:
-        def func(state: Any) -> dict[str, Any]:
-            state_dict = convert_state_to_dict(state)
-            return map_output_to_state(self.name, dict(self.config.get("output", {})), state_dict)
-
-        return self.wrap_runnable(func)
-
-    @override
-    def validate_config(self) -> bool:
-        return True
-
-
-@pytest.fixture(autouse=True)
-def register_echo_node() -> Iterator[None]:
-    """Register EchoNode for the test; registry restore is handled by the global conftest fixture (D7)."""
-    register_node_type("echo", EchoNode)
-    yield
 
 
 def make_condition_branch_definition(check_output: dict[str, Any]) -> WorkflowDefinition:
