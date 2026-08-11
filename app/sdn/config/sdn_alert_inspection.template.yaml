@@ -1,0 +1,333 @@
+# =============================================================================
+# SDN 接口告警巡检工作流（核心流程，引擎零改动移植）
+#
+# 流程：get_token → extract_token → get_alerts → prepare_check
+#        → [pe_info → pick_vendor → command_exec → parse_result] 循环
+#        → prep → llm_summary → report → END
+# 循环由 YAML 条件回边表达（parse_result → prepare_check，has_next == 'true'）；
+# 零告警时 prepare_check 经 "current_device == ''" 条件边直接短路到 prep。
+#
+# 凭据约定（定稿决策 5）：
+#   - 本文件为入库模板，凭据为占位符；
+#   - 复制为 sdn_alert_inspection.yaml（已加 .gitignore，不入库）后填入真实值。
+# SSL：SDN 控制器自签证书；引擎 HTTPNode 无 verify 开关（不改引擎），
+#   由入口 app/sdn/__main__.py 在本进程内放宽 verify（仅此进程生效）。
+# recursion_limit：每条告警循环 5 步，入口已 set_recursion_limit(200)。
+#
+# 运行（零传参，凭据取 state_schema.default）：
+#   uv run python -m app.sdn run --workflow sdn_alert_inspection --input '{}'
+# 注意：DEBUG 级日志会输出 http 节点完整响应（含 token），验证请用默认 INFO 级。
+# =============================================================================
+workflow_id: sdn_alert_inspection
+description: 'SDN interface alert inspection: token -> alerts -> per-alert device check loop -> LLM report'
+entry_point: get_token
+
+state_schema:
+  # --- 凭据（模板占位；真实值写不入库的 sdn_alert_inspection.yaml）---
+  sdn_base_url:
+    type: str
+    default: 'https://sdn-controller.example.com'
+    description: 'SDN controller base URL (no trailing slash)'
+  sdn_username:
+    type: str
+    default: 'CHANGE_ME_USERNAME'
+    description: 'SDN controller login username'
+  sdn_password:
+    type: str
+    default: 'CHANGE_ME_PASSWORD'
+    description: 'SDN controller login password'
+  sdn_device_id:
+    type: str
+    default: 'CHANGE_ME_DEVICE_ID'
+    description: 'Client device id registered with the controller'
+  # --- 运行期字段 ---
+  access_token:
+    type: str
+    reducer: last
+  remaining_alerts:
+    type: list
+    reducer: last
+    description: 'Alert queue; None until seeded by prepare_check'
+  has_next:
+    type: str
+    reducer: last
+    description: "Loop marker: 'true' / 'false' (S7 equality condition)"
+  current_device:
+    type: str
+    reducer: last
+  current_interface:
+    type: str
+    reducer: last
+  current_down_time:
+    type: str
+    reducer: last
+  current_command:
+    type: str
+    reducer: last
+    description: 'Rendered JSON body for command_exec'
+  vendor_info:
+    type: dict
+    reducer: last
+  check_result:
+    type: list
+    reducer: add
+    description: 'Per-interface check summaries accumulated across loop rounds'
+  messages:
+    type: list
+    reducer: last
+  report:
+    type: str
+    reducer: last
+
+nodes:
+  # 1. 取 token（内置 HTTPNode，凭据从 state 模板渲染）
+  - name: get_token
+    type: http
+    config:
+      url: '{sdn_base_url}/oauth/token'
+      method: POST
+      headers:
+        Content-Type: application/json
+        Accept: application/json
+      body_template: '{"username": "{sdn_username}", "password": "{sdn_password}", "device_id": "{sdn_device_id}"}'
+
+  # 2. 解析 access_token（通用 python 节点）
+  - name: extract_token
+    type: python
+    config:
+      code: |
+        response = (state.get("get_token_result") or {}).get("response") or {}
+        return {"access_token": response.get("access_token", "")}
+
+  # 3. 查询告警列表（内置 HTTPNode，Bearer 从 state 渲染）
+  - name: get_alerts
+    type: http
+    config:
+      url: '{sdn_base_url}/monitor/v2/alert/page'
+      method: POST
+      headers:
+        Content-Type: application/json
+        Accept: 'application/json, text/plain, */*'
+        Authorization: 'Bearer {access_token}'
+      body_template: '{"interval": "1h", "namespace": "device", "category": "PE端口Down", "autoRecovery": 1, "pageNum": 1, "pageSize": 10}'
+
+  # 4. 循环准备：首轮播种告警队列，随后每轮弹出队首写 current_*
+  - name: prepare_check
+    type: python
+    config:
+      code: |
+        alerts = state.get("remaining_alerts")
+        if not alerts:
+            response = (state.get("get_alerts_result") or {}).get("response") or {}
+            alerts = list(response.get("data") or [])
+        current = {"current_device": "", "current_interface": "", "current_down_time": ""}
+        rest = alerts
+        if alerts:
+            first, rest = alerts[0], alerts[1:]
+            current = {
+                "current_device": first.get("source", ""),
+                "current_interface": first.get("component", ""),
+                "current_down_time": first.get("time", ""),
+            }
+        return {"remaining_alerts": rest, **current}
+
+  # 5. 查询设备厂商信息（内置 HTTPNode；response_path 不支持 list 下标，
+  #    整体响应交给 pick_vendor 解析 content[0]）
+  - name: pe_info
+    type: http
+    config:
+      url: '{sdn_base_url}/api/no/config/terra-pe:peInfos/page?pageNumber=1&pageSize=10'
+      method: POST
+      headers:
+        Content-Type: application/json
+        Authorization: 'Bearer {access_token}'
+      body_template: '{"name": "{current_device}"}'
+
+  # 6. 解析厂商 + 按 VENDOR_COMMAND_MAP 组装命令 JSON
+  - name: pick_vendor
+    type: python
+    config:
+      code: |
+        import json
+        VENDOR_COMMAND_MAP = {"H3C": "dis ip in br", "Huawei": "dis ip in br"}
+        DEFAULT_COMMAND = "dis ip in br"
+        response = (state.get("pe_info_result") or {}).get("response") or {}
+        content = response.get("content") or []
+        vendor = content[0].get("vendor-id", "") if content else ""
+        command = VENDOR_COMMAND_MAP.get(vendor, DEFAULT_COMMAND)
+        body = json.dumps(
+            {"device_name": state.get("current_device", ""), "command": command},
+            ensure_ascii=False,
+        )
+        return {"vendor_info": {"vendor_id": vendor}, "current_command": body}
+
+  # 7. 下发命令（内置 HTTPNode，body_template 整包渲染 current_command）
+  - name: command_exec
+    type: http
+    config:
+      url: '{sdn_base_url}/api/no/config/device-conf/command-result'
+      method: POST
+      headers:
+        Content-Type: application/json
+        Authorization: 'Bearer {access_token}'
+      body_template: '{current_command}'
+
+  # 8. 正则解析接口状态 + 设置循环标记（忠实移植源码 _IFACE_PATTERN 三件套）
+  - name: parse_result
+    type: python
+    config:
+      code: |
+        import re
+        IFACE_PATTERN = re.compile(
+            r"^(\S+)\s+(\*?down|up)\s+(down|up(?:\(s\))?)\s+(\S+)\s+(\S+)\s*(.*)$",
+            re.MULTILINE,
+        )
+
+        def extract_iface_number(name):
+            m = re.search(r"(\d+/\d+/\d+(?:\.\d+)?)$", name)
+            return m.group(1) if m else name
+
+        def find_iface_status(raw_output, interface_name):
+            target = extract_iface_number(interface_name)
+            for match in IFACE_PATTERN.finditer(raw_output):
+                iface = match.group(1)
+                if iface == interface_name or extract_iface_number(iface) == target:
+                    physical, protocol = match.group(2), match.group(3)
+                    ip_addr, description = match.group(4), match.group(6).strip()
+                    status = (
+                        f"Interface: {iface}, Physical: {physical}, "
+                        f"Protocol: {protocol}, IP: {ip_addr}"
+                    )
+                    if description and description != "--":
+                        status += f", Description: {description}"
+                    return status
+            return None
+
+        response = (state.get("command_exec_result") or {}).get("response") or {}
+        raw_output = response.get("result", "")
+        interface_name = state.get("current_interface", "")
+        check = []
+        status = find_iface_status(raw_output, interface_name)
+        if status:
+            vendor = (state.get("vendor_info") or {}).get("vendor_id", "")
+            check.append(
+                f"查看 {state.get('current_device', '')} 的 {interface_name} 接口的状态: {status}, "
+                f"设备厂商: {vendor or '未知'}, 告警down时间: {state.get('current_down_time', '')}"
+            )
+        has_next = "true" if state.get("remaining_alerts") else "false"
+        return {"check_result": check, "has_next": has_next}
+
+  # 9. 汇总检查结果为 LLM messages（空则源码兜底文案）
+  - name: prep
+    type: python
+    config:
+      code: |
+        results = state.get("check_result") or []
+        if results:
+            lines = ["## Interface Alert Inspection Results", ""]
+            for i, summary in enumerate(results, 1):
+                lines.append(f"{i}. {summary}")
+            context = "\n".join(lines)
+        else:
+            context = "No interface inspection results available."
+        return {"messages": [{"role": "user", "content": context}]}
+
+  # 10. LLM 汇总（内置 LLM 节点；key/base_url 走 env：OPENAI_API_KEY / OPENAI_BASE_URL）
+  - name: llm_summary
+    type: llm
+    config:
+      llm_type: openai
+      model_name: MiniMax-M3  # 可按需替换为 gpt-4o-mini 等
+      temperature: 0.3
+      system_prompt: |
+        You are an SDN network operations assistant generating part of an interface alert inspection report.
+        You will receive interface inspection summaries from network devices. Each summary includes: device name, device vendor (e.g. H3C, Huawei), interface name, current physical/protocol status, and the alert DOWN time.
+
+        Generate EXACTLY the following TWO markdown sections and nothing else:
+
+        ## 2. 详细检测结果
+        A markdown table with columns: 节点名称 | 设备厂商 | 检查项目 | 检测结果 | 备注
+        - 检查项目 is always '端口状态检测'
+        - 检测结果 uses '❌ 异常' for interfaces currently down, '✅ 正常' for interfaces that have recovered (up/up)
+        - 备注 contains the interface name and the alert DOWN time
+
+        ## 3. 处理建议
+        A numbered list of concrete recommended actions for each abnormal interface.
+        - Tailor suggestions to each device's vendor: use vendor-matching commands and features (e.g. for H3C/Huawei Comware use `display interface`, `dis ip interface brief`, `shutdown`/`undo shutdown`, optical transceiver and cable checks)
+        - Include escalation advice if the interface does not recover
+
+        Respond in Chinese. Output only the two markdown sections above, with no extra commentary.
+
+  # 11. 固定报告头 + 故障判定 + 拼 LLM 正文（忠实移植源码 _detect_fault / _build_report_header）
+  - name: report
+    type: python
+    config:
+      code: |
+        import random
+        import re
+        from datetime import datetime
+
+        INSPECTION_SUMMARY = (
+            "本次智能巡检覆盖全网核心链路及接入节点。系统对拓扑中的所有关键网元进行了连通性、性能及健康度扫描。"
+            "巡检结果显示，核心骨干网运行平稳，各项指标均在正常范围内。"
+            "如存在异常项，请参见下方详细检测结果，并结合处理建议及时处置。"
+        )
+
+        def detect_fault(check_result):
+            for summary in check_result:
+                m = re.search(r"Physical:\s*(\S+),\s*Protocol:\s*(\S+)", summary)
+                if m and ("down" in m.group(1).lower() or "down" in m.group(2).lower()):
+                    return True
+            return False
+
+        check_result = state.get("check_result") or []
+        has_fault = detect_fault(check_result)
+        report_id = f"RP-{random.randint(10000000, 99999999)}"
+        report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        overall = "⚠️ 异常检测 (Fault Detected)" if has_fault else "✅ 正常 (Normal)"
+        header = (
+            "# 网络智能巡检报告\n\n"
+            "| 项目 | 内容 |\n"
+            "|------|------|\n"
+            f"| 报告编号 | {report_id} |\n"
+            f"| 生成时间 | {report_time} |\n"
+            "| 巡检单位 | 智能运维中心 (AIOps Center) |\n"
+            f"| 整体状态 | {overall} |\n\n"
+            f"## 1. 巡检综述\n\n{INSPECTION_SUMMARY}\n"
+        )
+        llm_body = ((state.get("llm_summary_result") or {}).get("response") or "").strip()
+        return {"report": f"{header}\n{llm_body}\n"}
+
+edges:
+  - source: get_token
+    target: extract_token
+  - source: extract_token
+    target: get_alerts
+  - source: get_alerts
+    target: prepare_check
+  # 循环入口分流：有告警进设备检查；零告警短路到 prep（S7 等值/真值条件）
+  - source: prepare_check
+    target: pe_info
+    condition: 'current_device'
+  - source: prepare_check
+    target: prep
+    condition: "current_device == ''"
+  - source: pe_info
+    target: pick_vendor
+  - source: pick_vendor
+    target: command_exec
+  - source: command_exec
+    target: parse_result
+  # 循环回边：还有告警 → 回 prepare_check 弹下一条；否则出环
+  - source: parse_result
+    target: prepare_check
+    condition: "has_next == 'true'"
+  - source: parse_result
+    target: prep
+    condition: "has_next == 'false'"
+  - source: prep
+    target: llm_summary
+  - source: llm_summary
+    target: report
+  - source: report
+    target: END

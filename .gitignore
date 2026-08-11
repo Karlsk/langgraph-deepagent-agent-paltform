@@ -23,3 +23,6 @@ wheels/
 evals/reports/
 .qoder
 .coverage*
+
+# SDN real-credential workflow config (template committed instead)
+app/sdn/config/sdn_alert_inspection.yaml

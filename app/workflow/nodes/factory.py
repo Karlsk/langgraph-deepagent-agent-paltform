@@ -62,3 +62,4 @@ def create_node(definition: NodeDefinition, operator_log: OperatorLog | None = N
 # （属性访问推迟到 create_node 调用期，spec-04/05 接线点）。
 import app.workflow.nodes.http_node as _http_node  # noqa: E402
 import app.workflow.nodes.llm_node as _llm_node  # noqa: E402
+import app.workflow.nodes.python_node  # noqa: E402, F401 — 触发 "python" 插件类型自注册（K5）

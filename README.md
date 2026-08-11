@@ -241,7 +241,7 @@ curl -X POST http://localhost:8000/api/v1/workflows/demo_http/execute \
 app/workflow/
   models.py         # YAML DSL Pydantic 模型 + 异常族（WorkflowEngineError 基类）
   state.py          # 动态 state 模型工厂（reducer/预声明 {node}_result）
-  nodes/            # BaseNode + LLMNode + HTTPNode + 插件注册工厂
+  nodes/            # BaseNode + LLMNode + HTTPNode + PythonNode + 插件注册工厂
   graph_builder.py  # 校验 → 建图 → 条件路由 → 编译
   registry.py       # 进程级注册表：per-workflow RLock + 运行级日志收集
   cli.py            # CLI 入口与 ApiResponse 信封（stdout 信封 / stderr 日志）
@@ -311,6 +311,28 @@ register_node_type("my_node", MyNode)   # 需在 registry 构建前注册
 由宿主组装点显式持有并经构造参数传入（参照 `app.state.workflow_registry` 注入模式）。
 **密钥约束（H6）**：节点不得在配置中接收明文密钥，一律经环境变量解析；
 日志只输出摘要，不输出完整 state。
+
+### SDN 巡检示例（通用 python 节点实战）
+
+`app/sdn/` 演示用 YAML 编排移植外部项目的 SDN 接口告警巡检 Agent（引擎零改动）：
+token → 告警查询 → 逐条告警循环检查设备（YAML 条件回边）→ LLM 汇总报告。
+
+```bash
+cp app/sdn/config/sdn_alert_inspection.template.yaml app/sdn/config/sdn_alert_inspection.yaml
+# 在副本中填入 SDN 控制器凭据（副本已加 .gitignore，不入库）；LLM 凭据走 .env
+uv run python -m app.sdn run --workflow sdn_alert_inspection --input '{}'
+# stdout 输出 ApiResponse 信封，报告在 data.report
+```
+
+要点：
+
+- 业务逻辑全部写在 `type: python` 节点的 YAML 内联 `code`（或 `entry: 模块:函数`）里，
+  HTTP 调用用内置 HTTPNode；循环由条件回边表达（`has_next == 'true'`）。
+- **python 节点为进程内可信代码执行，非隔离沙箱**（langchain-sandbox 已弃维护，排除）；
+  代码必须 `return dict`，日志只记代码长度/entry 名，不落代码内容。
+- 入口 `app/sdn/__main__.py` 有两处进程级调整并有注释标注：自签证书放宽 httpx verify
+  （仅本入口进程）、`LANGGRAPH_DEFAULT_RECURSION_LIMIT=200`（循环步数超默认 25）。
+- DEBUG 级日志会输出 HTTP 完整响应（含 token），验证请用默认 INFO 级。
 
 ## FAQ
 

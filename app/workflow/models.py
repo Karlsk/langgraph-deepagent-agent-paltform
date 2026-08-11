@@ -42,6 +42,10 @@ class HTTPNodeError(WorkflowEngineError):
     """HTTP invocation failure, including retry exhaustion and explicit mock miss."""
 
 
+class PythonNodeError(WorkflowEngineError):
+    """Python code node failure: bad config, entry loading or non-dict output."""
+
+
 class NodeType(str, Enum):
     """Built-in node types for this phase (trimmed set, C8).
 
