@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import structlog
 import structlog.stdlib
+from langgraph.graph import StateGraph
 
 from app.workflow.graph_builder import GraphBuilder
 from app.workflow.models import (
@@ -17,6 +18,7 @@ from app.workflow.models import (
     StateFieldSchema,
     WorkflowDefinition,
 )
+from app.workflow.state import StateModelFactory
 
 from tests.conftest import EchoNode
 
@@ -96,6 +98,24 @@ def test_validate_no_dispatcher_exemption() -> None:
     )
     with pytest.raises(ValueError, match="nonexistent"):
         GraphBuilder()._validate_definition(definition)
+
+
+def test_add_edges_source_missing_from_built_nodes() -> None:
+    """Deep defense (spec-09 TC2): _add_edges rejects an edge source absent from built nodes.
+
+    _validate_definition already catches dangling endpoints, but the builder-level
+    guard stays reachable when model-layer checks are bypassed (model_construct, C5).
+    """
+    definition = make_definition(
+        nodes=[NodeDefinition(name="a", type="echo", config={})],
+        edges=[EdgeDefinition(source="ghost", target="a")],
+    )
+    builder = GraphBuilder()
+    state_model = StateModelFactory.create_state_model(definition.state_schema, ["a"])
+    graph = StateGraph(state_model)
+    nodes_map = {"a": object()}
+    with pytest.raises(ValueError, match="ghost"):
+        builder._add_edges(graph, definition, nodes_map, None)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

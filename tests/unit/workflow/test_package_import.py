@@ -1,12 +1,14 @@
 """Smoke tests for the app.workflow package skeleton (spec-00 TC3)."""
 
 import logging
+import runpy
+import sys
 
 import pytest
 import structlog
 
 import app.workflow
-from app.workflow import logging_conf
+from app.workflow import cli, logging_conf
 from app.workflow.logging_conf import setup_logging
 
 
@@ -35,3 +37,13 @@ def test_setup_logging_level() -> None:
     logging_conf._configured = False
     logging_conf.setup_logging(level="DEBUG")
     assert logging.getLogger().getEffectiveLevel() == logging.DEBUG
+
+
+@pytest.mark.unit
+def test_module_entrypoint_exits_with_cli_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Module entrypoint (python -m app.workflow) delegates to cli.main and propagates its exit code (spec-09 TC2)."""
+    monkeypatch.setattr(sys, "argv", ["app.workflow", "run", "--workflow", "demo_minimal"])
+    monkeypatch.setattr(cli, "main", lambda argv=None: 0)
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_module("app.workflow", run_name="__main__")
+    assert exc_info.value.code == 0

@@ -18,3 +18,6 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run pyright
       - run: uv run pytest -m unit
+      - run: uv run pytest -m integration
+      # Coverage gate (AD-08/AD-09, spec-09 TC2): full suite must keep app.workflow >= 80%
+      - run: uv run pytest --cov=app.workflow --cov-report=term-missing --cov-fail-under=80
