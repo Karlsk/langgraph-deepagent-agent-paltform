@@ -1,5 +1,6 @@
 """Shared pytest fixtures for the test suite."""
 
+import time
 from collections.abc import Generator
 from typing import Any, override
 
@@ -7,6 +8,7 @@ import pytest
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
+from app.workflow.models import ExecutionLog
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
@@ -20,8 +22,20 @@ class EchoNode(BaseNode):
     @override
     def build_runnable(self) -> Runnable:
         def func(state: Any) -> dict[str, Any]:
+            started = time.perf_counter()
             state_dict = convert_state_to_dict(state)
-            return map_output_to_state(self.name, dict(self.config.get("output", {})), state_dict)
+            output = dict(self.config.get("output", {}))
+            result = map_output_to_state(self.name, output, state_dict)
+            self.log_execution(
+                ExecutionLog(
+                    node_name=self.name,
+                    node_type=str(self.node_type),
+                    input_data={},
+                    output_data=output,
+                    execution_time_ms=(time.perf_counter() - started) * 1000.0,
+                )
+            )
+            return result
 
         return self.wrap_runnable(func)
 

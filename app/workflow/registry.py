@@ -16,9 +16,12 @@ app.core.* (AD-02).
 from __future__ import annotations
 
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
+
+import structlog
 
 from app.workflow.graph_builder import GraphBuilder
 from app.workflow.models import (
@@ -27,7 +30,9 @@ from app.workflow.models import (
     WorkflowDefinition,
     WorkflowNotFoundError,
 )
-from app.workflow.nodes.base import BaseNode
+from app.workflow.nodes.base import _RUN_COLLECTOR, BaseNode, set_run_collector  # noqa: SLF001 — token reset per S11
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -143,6 +148,41 @@ class WorkflowRegistry:
     def list_workflows(self) -> list[str]:
         """Return registered workflow ids in sorted order."""
         return sorted(self._registry)
+
+    def execute_workflow(self, workflow_id: str, input_data: dict[str, Any]) -> RunResult:
+        """Run one workflow under its per-workflow RLock and return the RunResult.
+
+        Log collection is run-scoped (S11): a fresh RunLogCollector is bound to
+        the ContextVar and reset in finally, so the ContextVar never leaks.
+        Node exceptions propagate to the caller unchanged (EXP-G7). The
+        definition's execution_history keeps only the latest run (S12, bounded).
+        """
+        workflow = self.get_workflow(workflow_id)
+        definition = self._definitions[workflow_id]
+        run_lock = self._get_run_lock(workflow_id)
+        with run_lock:
+            run_id = uuid.uuid4().hex
+            collector = RunLogCollector(run_id)
+            started_at = datetime.now()
+            token = set_run_collector(collector)
+            try:
+                output = workflow.invoke(input_data)
+            except Exception:
+                logger.exception("workflow_execution_failed", workflow_id=workflow_id, run_id=run_id)
+                raise
+            finally:
+                _RUN_COLLECTOR.reset(token)  # noqa: SLF001 — paired set/reset (S11)
+            finished_at = datetime.now()
+            logs = collector.collect()
+            definition.execution_history = logs
+            return RunResult(
+                workflow_id=workflow_id,
+                run_id=run_id,
+                output=output,
+                execution_logs=logs,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
 
     # -- queries --------------------------------------------------------------
 

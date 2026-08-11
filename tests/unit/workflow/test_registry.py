@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, override
 
 import pytest
+from langchain_core.runnables import Runnable
 
 from app.workflow.models import (
     EdgeDefinition,
@@ -17,7 +19,8 @@ from app.workflow.models import (
     WorkflowDefinition,
     WorkflowNotFoundError,
 )
-from app.workflow.nodes.base import RunLogCollectorLike
+from app.workflow.nodes.base import BaseNode, RunLogCollectorLike, get_run_collector
+from app.workflow.nodes.factory import register_node_type
 from app.workflow.registry import RunLogCollector, RunResult, WorkflowRegistry
 
 pytestmark = pytest.mark.unit
@@ -170,3 +173,82 @@ def test_register_preserves_existing_operator_logs() -> None:
     assert operator_logs["a"] is declared
     assert operator_logs["b"].input_schema == {}
     assert registry.get_operator_log_by_node("wf_test", "a") is declared
+
+
+# --- TC3: execute_workflow (H1 lock + H3 collector) --------------------------
+
+
+def test_execute_returns_run_result() -> None:
+    """Output correct, run_id is 32-hex, duration_ms >= 0, logs cover executed nodes."""
+    registry = WorkflowRegistry()
+    registry.register_workflow(make_echo_definition())
+    result = registry.execute_workflow("wf_test", {"input": "hello"})
+    assert isinstance(result, RunResult)
+    assert result.workflow_id == "wf_test"
+    assert len(result.run_id) == 32
+    uuid.UUID(result.run_id)  # valid hex
+    assert result.duration_ms >= 0
+    assert result.output["a_result"] == {"v": 1}
+    assert result.output["b_result"] == {"v": 2}
+    assert [log.node_name for log in result.execution_logs] == ["a", "b"]
+
+
+def test_execute_unknown_workflow_raises() -> None:
+    """Unknown workflow_id raises WorkflowNotFoundError (CONTRACT §5)."""
+    with pytest.raises(WorkflowNotFoundError):
+        WorkflowRegistry().execute_workflow("missing", {})
+
+
+def test_collector_reset_after_run() -> None:
+    """ContextVar must not leak: no collector active after execution (S11)."""
+    registry = WorkflowRegistry()
+    registry.register_workflow(make_echo_definition())
+    registry.execute_workflow("wf_test", {})
+    assert get_run_collector() is None
+
+
+def test_execution_history_keeps_last_run() -> None:
+    """definition.execution_history holds only the latest run's logs (S12)."""
+    registry = WorkflowRegistry()
+    registry.register_workflow(make_echo_definition(output={"v": 1}))
+    registry.execute_workflow("wf_test", {})
+    second = registry.execute_workflow("wf_test", {})
+    history = registry.get_execution_history("wf_test")
+    assert len(history) == 2
+    assert all(log.node_name in {"a", "b"} for log in history)
+    assert history[-1] is second.execution_logs[-1]
+    assert registry.get_node_execution_history("wf_test", "a") == [history[0]]
+
+
+class _FailNode(BaseNode):
+    """Test-only node that raises during execution (EXP-G7 propagation guard)."""
+
+    @override
+    def build_runnable(self) -> Runnable:
+        def func(state: Any) -> dict[str, Any]:
+            raise RuntimeError("boom from fail node")
+
+        return self.wrap_runnable(func)
+
+    @override
+    def validate_config(self) -> bool:
+        return True
+
+
+def test_execute_failure_reraises_and_resets_collector() -> None:
+    """Node exceptions propagate unchanged (EXP-G7) and the ContextVar is still reset."""
+    register_node_type("boom", _FailNode)
+    definition = WorkflowDefinition(
+        workflow_id="wf_fail",
+        entry_point="bad",
+        nodes=[NodeDefinition(name="bad", type="boom", config={})],
+        edges=[EdgeDefinition(source="bad", target="END")],
+        state_schema={},
+        operator_logs={},
+        execution_history=[],
+    )
+    registry = WorkflowRegistry()
+    registry.register_workflow(definition)
+    with pytest.raises(RuntimeError, match="boom from fail node"):
+        registry.execute_workflow("wf_fail", {})
+    assert get_run_collector() is None
