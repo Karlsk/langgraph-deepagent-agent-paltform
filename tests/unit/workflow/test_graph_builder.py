@@ -164,6 +164,13 @@ def test_mixed_conditional_and_normal_raises() -> None:
         GraphBuilder().build_graph(definition)
 
 
+def test_add_nodes_build_failure_reraises() -> None:
+    """A failing node build is logged with the node name and re-raised (spec-06 TC2)."""
+    definition = make_definition(entry_point="bad", nodes=[NodeDefinition(name="bad", type="no_such_type", config={})])
+    with pytest.raises(ValueError, match="no_such_type"):
+        GraphBuilder().build_graph(definition)
+
+
 # ---------------------------------------------------------------------------
 # TC3: condition router (C3 no-match policy, S6/S7)
 # ---------------------------------------------------------------------------
@@ -247,6 +254,13 @@ def test_router_default_missing_at_build() -> None:
         GraphBuilder(no_match_policy="default").build_graph(definition)
 
 
+def test_router_default_target_invalid_at_build() -> None:
+    """policy='default' with a dangling default target must fail at build time (S6)."""
+    definition = make_branch_definition({"status": "unknown"})
+    with pytest.raises(ValueError, match="ghost"):
+        GraphBuilder(no_match_policy="default").build_graph(definition, default_edges={"check": "ghost"})
+
+
 def test_router_no_print_no_full_state(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> None:
     """Router DEBUG log carries only condition and target; no state dump, empty stdout (C3/H6)."""
     structlog.configure(
@@ -275,3 +289,10 @@ def test_parse_condition_variants() -> None:
     assert GraphBuilder._parse_condition("a.b == 'x'") == ("a.b", "x")
     assert GraphBuilder._parse_condition('a.b=="y"') == ("a.b", "y")
     assert GraphBuilder._parse_condition("flag") == ("flag", None)
+
+
+def test_resolve_path_non_dict_midway() -> None:
+    """Dot-path hitting a non-dict mid-way resolves to None (S7)."""
+    assert GraphBuilder._resolve_path({"a": {"b": 1}}, "a.b") == 1
+    assert GraphBuilder._resolve_path({"a": "scalar"}, "a.b") is None
+    assert GraphBuilder._resolve_path({}, "a.b") is None
