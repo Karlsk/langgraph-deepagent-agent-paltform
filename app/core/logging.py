@@ -26,6 +26,7 @@ from app.core.config import (
     Environment,
     settings,
 )
+from app.workflow.logging_conf import redact_processor
 
 # Ensure log directory exists
 settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,6 +169,8 @@ def get_structlog_processors(include_file_info: bool = True) -> List[Any]:
         add_context_to_event_dict,
         # Add request_id from asgi-correlation-id to all log events
         add_request_id_to_event_dict,
+        # Secret redaction registered at the host composition root (AD-02 v2, spec-08)
+        redact_processor,
     ]
 
     # Add callsite parameters if file info is requested
