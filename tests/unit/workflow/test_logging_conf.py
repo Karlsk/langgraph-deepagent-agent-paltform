@@ -81,7 +81,7 @@ def test_redact_filter_on_log_record(capsys: pytest.CaptureFixture[str]) -> None
     logger = structlog.get_logger("test_redact")
     logger.info("login_attempt_received", api_key="sk-dummy-secret-123")
     logger.info("request failed with api_key=sk-dummy-secret-456")
-    captured = capsys.readouterr().out
+    captured = capsys.readouterr().err  # standalone convention: logs on stderr
     assert "sk-dummy-secret-123" not in captured
     assert "sk-dummy-secret-456" not in captured
     assert "***" in captured

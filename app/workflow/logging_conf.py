@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from typing import Any, cast
 
 import structlog
@@ -121,6 +122,7 @@ def setup_logging(level: str = "INFO", *, json_output: bool = False) -> None:
         _configured = True
         return
 
+    # Standalone CLI convention: logs go to stderr, stdout stays machine-readable.
     renderer = structlog.processors.JSONRenderer() if json_output else structlog.dev.ConsoleRenderer()
     # cast keeps the frozen redact_processor signature (§4.11) while satisfying Processor.
     processors = cast(
@@ -135,7 +137,10 @@ def setup_logging(level: str = "INFO", *, json_output: bool = False) -> None:
     )
     structlog.configure(
         processors=processors,
-        cache_logger_on_first_use=True,
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        # No first-use caching: keeps short-lived CLI processes honest and
+        # avoids loggers pinned to a stale stream (bare-test friendliness).
+        cache_logger_on_first_use=False,
     )
     logging.basicConfig(level=level)
     # basicConfig is a no-op when root already has handlers; bind level explicitly.
