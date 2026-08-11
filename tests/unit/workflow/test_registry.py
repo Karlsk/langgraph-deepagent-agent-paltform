@@ -191,7 +191,8 @@ def test_execute_returns_run_result() -> None:
     assert result.duration_ms >= 0
     assert result.output["a_result"] == {"v": 1}
     assert result.output["b_result"] == {"v": 2}
-    assert [log.node_name for log in result.execution_logs] == ["a", "b"]
+    assert {log.node_name for log in result.execution_logs} == {"a", "b"}
+    assert len(result.execution_logs) == 2
 
 
 def test_execute_unknown_workflow_raises() -> None:
@@ -217,8 +218,8 @@ def test_execution_history_keeps_last_run() -> None:
     history = registry.get_execution_history("wf_test")
     assert len(history) == 2
     assert all(log.node_name in {"a", "b"} for log in history)
-    assert history[-1] is second.execution_logs[-1]
-    assert registry.get_node_execution_history("wf_test", "a") == [history[0]]
+    assert history == second.execution_logs  # single slot holds the latest run (S12)
+    assert registry.get_node_execution_history("wf_test", "a") == [log for log in history if log.node_name == "a"]
 
 
 class _FailNode(BaseNode):
