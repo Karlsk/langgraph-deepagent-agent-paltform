@@ -2,24 +2,27 @@
 
 Entry/integration point of the workflow engine; this module is the sole
 spec-08 component allowed to import ``app.core.*`` (AD-02 composition root
-exception). It reuses the CLI's ``ApiResponse`` envelope and ``build_registry``
-assembly; the synchronous ``execute_workflow`` runs inside a threadpool worker.
+exception). It reuses the CLI's ``ApiResponse`` envelope; the synchronous
+``execute_workflow`` runs inside a threadpool worker.
+
+The registry is injected by the host composition root on
+``app.state.workflow_registry`` (spec-09 TC1, H4/G7): the engine module keeps
+no module-level cache or mutable globals.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.limiter import limiter
-from app.workflow.cli import DEFAULT_CONFIG_DIR, ApiResponse, build_registry
+from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact_processor
 from app.workflow.models import WorkflowNotFoundError
 from app.workflow.registry import WorkflowRegistry
@@ -28,17 +31,14 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
-_registry_directory: Path = DEFAULT_CONFIG_DIR
-_registry_cache: dict[str, WorkflowRegistry] = {}
 
-
-def get_registry() -> WorkflowRegistry:
-    """Provide a process-level registry built from the configured directory (DI)."""
-    key = str(_registry_directory)
-    if key not in _registry_cache:
-        logger.info("workflow_registry_built", directory=key)
-        _registry_cache[key] = build_registry(_registry_directory)
-    return _registry_cache[key]
+def get_registry(request: Request) -> WorkflowRegistry:
+    """Provide the host-injected registry from app.state (H4/G7: no module-level cache)."""
+    registry = getattr(request.app.state, "workflow_registry", None)
+    if registry is None:
+        msg = "app.state.workflow_registry is not set; the host must inject a WorkflowRegistry"
+        raise RuntimeError(msg)
+    return registry
 
 
 def _redacted_summary(message: str) -> str:
@@ -56,15 +56,13 @@ async def execute_workflow(
     request: Request,
     workflow_id: str,
     payload: dict[str, Any] | None = None,
-    registry: WorkflowRegistry = Depends(get_registry),
 ) -> JSONResponse:
     """Execute one registered workflow and return the unified envelope (AD-10).
 
     Args:
-        request: FastAPI request object required by the slowapi limiter.
+        request: FastAPI request object required by the slowapi limiter and registry lookup.
         workflow_id: Registered workflow to execute.
         payload: Optional JSON object passed as workflow input.
-        registry: Process-level registry provided via dependency injection.
 
     Returns:
         JSONResponse carrying the ApiResponse envelope (200/404/500).
@@ -72,6 +70,8 @@ async def execute_workflow(
     logger.info("api_workflow_execution_requested", workflow_id=workflow_id)
     input_data = payload or {}
     try:
+        # Resolved inside the try block so a missing injection lands in the envelope (R6).
+        registry = get_registry(request)
         result = await run_in_threadpool(registry.execute_workflow, workflow_id, input_data)
     except WorkflowNotFoundError as exc:
         logger.warning("api_workflow_not_found", workflow_id=workflow_id)

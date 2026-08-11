@@ -32,6 +32,7 @@ from app.core.middleware import (
 from app.core.observability import langfuse_init
 from app.services.database import database_service
 from app.services.memory import memory_service
+from app.workflow.cli import DEFAULT_CONFIG_DIR, build_registry
 
 # Load environment variables
 load_dotenv()
@@ -106,6 +107,10 @@ app.add_middleware(CorrelationIdMiddleware)
 # Set up rate limiter exception handler
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
+
+# Inject the workflow registry on app.state (spec-09 TC1, H4/G7: engine keeps no module-level cache)
+app.state.workflow_registry = build_registry(DEFAULT_CONFIG_DIR)
+logger.info("workflow_registry_built", directory=str(DEFAULT_CONFIG_DIR))
 
 
 # Add validation exception handler
