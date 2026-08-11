@@ -16,10 +16,11 @@ from typing import Any, Literal, NamedTuple
 import structlog
 from langgraph.graph import END, StateGraph
 
-from app.workflow.models import EdgeDefinition, WorkflowDefinition
+from app.workflow.models import ConditionNotMatchedError, EdgeDefinition, WorkflowDefinition
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import create_node
 from app.workflow.state import StateModelFactory
+from app.workflow.utils import convert_state_to_dict
 
 logger = structlog.get_logger(__name__)
 
@@ -159,5 +160,48 @@ class GraphBuilder:
         conditional_edges: list[EdgeDefinition],
         default_target: str | None,
     ) -> Callable[[Any], str]:
-        """C3/H6 router closure (implemented in spec-06 TC3)."""
-        raise NotImplementedError("condition router lands in spec-06 TC3")
+        """Closure over source/edge copy/default_target/no_match_policy (C3, S6).
+
+        Debug output records only the matched condition and target, never the
+        full state (H6); silent fall-through to the last edge is forbidden.
+        """
+        edges = list(conditional_edges)
+        parsed = [(edge, self._parse_condition(edge.condition or "")) for edge in edges]
+        policy = self.no_match_policy
+
+        def router(state: Any) -> str:
+            state_dict = convert_state_to_dict(state)
+            for edge, (path, expected) in parsed:
+                value = self._resolve_path(state_dict, path)
+                matched = value == expected if expected is not None else bool(value)
+                if matched:
+                    logger.debug(
+                        "condition_route_matched", source=source, condition=edge.condition, target=edge.target
+                    )
+                    return edge.target
+            if policy == "default" and default_target is not None:
+                logger.debug("condition_route_default", source=source, target=default_target)
+                return default_target
+            conditions = [edge.condition for edge in edges]
+            msg = f"No condition matched for source '{source}'; evaluated conditions: {conditions}"
+            raise ConditionNotMatchedError(msg)
+
+        return router
+
+    @staticmethod
+    def _parse_condition(condition: str) -> tuple[str, str | None]:
+        """S7: 'path == expected' -> equality (strip both sides, unquote); else truthiness; never eval."""
+        if "==" in condition:
+            path, _, expected = condition.partition("==")
+            return path.strip(), expected.strip().strip("'\"")
+        return condition.strip(), None
+
+    @staticmethod
+    def _resolve_path(state_dict: dict[str, Any], path: str) -> Any:
+        """Dot-path lookup; hitting a non-dict mid-way resolves to None (S7)."""
+        current: Any = state_dict
+        for part in path.split("."):
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current

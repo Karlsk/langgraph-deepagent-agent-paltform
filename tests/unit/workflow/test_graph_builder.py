@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from typing import Any, override
 
 import pytest
+import structlog
+import structlog.stdlib
 from langchain_core.runnables import Runnable
 
 from app.workflow.graph_builder import GraphBuilder
-from app.workflow.models import EdgeDefinition, NodeDefinition, WorkflowDefinition
+from app.workflow.models import (
+    ConditionNotMatchedError,
+    EdgeDefinition,
+    NodeDefinition,
+    StateFieldSchema,
+    WorkflowDefinition,
+)
 from app.workflow.nodes.base import BaseNode
-from app.workflow.nodes.factory import _NODE_REGISTRY, register_node_type
+from app.workflow.nodes.factory import register_node_type
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 pytestmark = pytest.mark.unit
@@ -34,13 +43,10 @@ class EchoNode(BaseNode):
 
 
 @pytest.fixture(autouse=True)
-def restore_node_registry() -> Iterator[None]:
-    """Snapshot/restore the plugin registry and register EchoNode (D7 isolation)."""
-    snapshot = dict(_NODE_REGISTRY)
+def register_echo_node() -> Iterator[None]:
+    """Register EchoNode for the test; registry restore is handled by the global conftest fixture (D7)."""
     register_node_type("echo", EchoNode)
     yield
-    _NODE_REGISTRY.clear()
-    _NODE_REGISTRY.update(snapshot)
 
 
 def make_definition(
@@ -49,6 +55,7 @@ def make_definition(
     entry_point: str = "a",
     nodes: list[NodeDefinition] | None = None,
     edges: list[EdgeDefinition] | None = None,
+    state_schema: dict[str, Any] | None = None,
 ) -> WorkflowDefinition:
     """Build a minimal WorkflowDefinition; model_construct bypasses model-layer checks for C5 deep-defense cases."""
     return WorkflowDefinition.model_construct(
@@ -56,7 +63,7 @@ def make_definition(
         entry_point=entry_point,
         nodes=nodes if nodes is not None else [NodeDefinition(name="a", type="echo", config={})],
         edges=edges if edges is not None else [],
-        state_schema={},
+        state_schema=state_schema if state_schema is not None else {},
         operator_logs={},
         execution_history=[],
     )
@@ -155,3 +162,116 @@ def test_mixed_conditional_and_normal_raises() -> None:
     )
     with pytest.raises(ValueError, match="'a'"):
         GraphBuilder().build_graph(definition)
+
+
+# ---------------------------------------------------------------------------
+# TC3: condition router (C3 no-match policy, S6/S7)
+# ---------------------------------------------------------------------------
+
+STATE_MARK = "full-state-dump-marker-spec06"
+
+
+def make_branch_definition(check_output: dict[str, Any]) -> WorkflowDefinition:
+    """Check node branching to ok_node/fail_node; shared fixture for router tests."""
+    return make_definition(
+        workflow_id="wf_branch",
+        entry_point="check",
+        nodes=[
+            NodeDefinition(name="check", type="echo", config={"output": check_output}),
+            NodeDefinition(name="ok_node", type="echo", config={"output": {"branch": "ok"}}),
+            NodeDefinition(name="fail_node", type="echo", config={"output": {"branch": "fail"}}),
+        ],
+        edges=[
+            EdgeDefinition(source="check", target="ok_node", condition="check_result.status == 'ok'"),
+            EdgeDefinition(source="check", target="fail_node", condition="check_result.status == 'fail'"),
+        ],
+    )
+
+
+def test_router_equality_branch() -> None:
+    """Equality condition routes to the matching branch; the other branch stays untouched."""
+    definition = make_branch_definition({"status": "ok"})
+    final = GraphBuilder().build_graph(definition).compiled_graph.invoke({})
+    assert final["ok_node_result"] == {"branch": "ok"}
+    # Unexecuted branch slots carry no channel value (EXP-G6 memo: output holds written fields only).
+    assert final.get("fail_node_result") is None
+    assert len(final["history"]) == 2
+
+
+def test_router_truthiness_branch() -> None:
+    """Pure-path condition is evaluated as truthiness (S7); the field needs a state channel."""
+    definition = make_definition(
+        workflow_id="wf_truth",
+        entry_point="check",
+        nodes=[
+            NodeDefinition(name="check", type="echo", config={"output": {"flag": True}}),
+            NodeDefinition(name="yes", type="echo", config={"output": {"branch": "yes"}}),
+            NodeDefinition(name="no", type="echo", config={"output": {"branch": "no"}}),
+        ],
+        edges=[
+            EdgeDefinition(source="check", target="yes", condition="flag"),
+            EdgeDefinition(source="check", target="no", condition="no_flag"),
+        ],
+        state_schema={"flag": StateFieldSchema(type="bool")},
+    )
+    final = GraphBuilder().build_graph(definition).compiled_graph.invoke({})
+    assert final["yes_result"] == {"branch": "yes"}
+    assert final.get("no_result") is None
+
+
+def test_router_no_match_raises() -> None:
+    """All conditions missed + policy='raise' -> ConditionNotMatchedError with source and conditions (S6, EXP-G7)."""
+    definition = make_branch_definition({"status": "unknown"})
+    compiled = GraphBuilder().build_graph(definition).compiled_graph
+    with pytest.raises(ConditionNotMatchedError) as exc_info:
+        compiled.invoke({})
+    message = str(exc_info.value)
+    assert "check" in message
+    assert "check_result.status == 'ok'" in message
+    assert "check_result.status == 'fail'" in message
+
+
+def test_router_no_match_default() -> None:
+    """policy='default' with default_edges routes unmatched runs to the fallback (S6)."""
+    definition = make_branch_definition({"status": "unknown"})
+    result = GraphBuilder(no_match_policy="default").build_graph(definition, default_edges={"check": "fail_node"})
+    final = result.compiled_graph.invoke({})
+    assert final["fail_node_result"] == {"branch": "fail"}
+    assert final.get("ok_node_result") is None
+
+
+def test_router_default_missing_at_build() -> None:
+    """policy='default' without a default_edges entry must fail at build time (S6)."""
+    definition = make_branch_definition({"status": "unknown"})
+    with pytest.raises(ValueError, match="default_edges"):
+        GraphBuilder(no_match_policy="default").build_graph(definition)
+
+
+def test_router_no_print_no_full_state(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> None:
+    """Router DEBUG log carries only condition and target; no state dump, empty stdout (C3/H6)."""
+    structlog.configure(
+        processors=[structlog.stdlib.add_log_level, structlog.processors.KeyValueRenderer()],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+    )
+    try:
+        definition = make_branch_definition({"status": "ok"})
+        compiled = GraphBuilder().build_graph(definition).compiled_graph
+        with caplog.at_level(logging.DEBUG, logger="app.workflow.graph_builder"):
+            compiled.invoke({"sensitive": STATE_MARK})
+    finally:
+        structlog.reset_defaults()
+    assert capsys.readouterr().out == ""
+    router_records = [record for record in caplog.records if record.name == "app.workflow.graph_builder"]
+    assert router_records, "expected a router DEBUG record"
+    for record in router_records:
+        rendered = record.getMessage()
+        assert STATE_MARK not in rendered
+        assert "sensitive" not in rendered
+
+
+def test_parse_condition_variants() -> None:
+    """Equality (both quote styles, arbitrary spacing) and pure-path forms (S7)."""
+    assert GraphBuilder._parse_condition("a.b == 'x'") == ("a.b", "x")
+    assert GraphBuilder._parse_condition('a.b=="y"') == ("a.b", "y")
+    assert GraphBuilder._parse_condition("flag") == ("flag", None)
