@@ -73,6 +73,7 @@ def test_redact_truncates_long() -> None:
     assert len(result["payload"]) < 1200
     assert redact("y" * 50, max_len=10) == "y" * 10 + "...(truncated)"
     assert redact("short") == "short"
+    assert redact(("a", {"api_key": "sk-x"})) == ["a", {"api_key": "***REDACTED***"}]
 
 
 def test_redact_filter_on_log_record(capsys: pytest.CaptureFixture[str]) -> None:
@@ -113,3 +114,12 @@ def test_setup_logging_still_idempotent() -> None:
     assert structlog.get_config()["processors"] == processors_first
     # redact_processor is part of the CLI standalone chain
     assert redact_processor in processors_first
+
+
+def test_setup_logging_skips_when_host_configured() -> None:
+    """AD-02: already configured by the host (FastAPI) -> idempotent skip."""
+    structlog.configure(processors=[structlog.processors.add_log_level])
+    setup_logging(level="INFO")
+    assert logging_conf._configured is True  # noqa: SLF001 — flag introspection
+    # Host chain untouched: no redact_processor appended by setup_logging
+    assert redact_processor not in structlog.get_config()["processors"]

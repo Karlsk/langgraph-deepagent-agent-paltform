@@ -136,6 +136,16 @@ def test_cli_unknown_workflow(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     assert "not_exist" in envelope["error"]
 
 
+def test_cli_input_not_object(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Valid JSON but not an object: exit 1 with a friendly envelope."""
+    _write_echo_dir(tmp_path)
+    exit_code = main(["run", "--dir", str(tmp_path), "--workflow", "echo_demo", "--input", "[1, 2]"])
+    assert exit_code == 1
+    envelope = _last_json_line(capsys.readouterr().out)
+    assert envelope["success"] is False
+    assert "JSON object" in envelope["error"]
+
+
 def test_cli_error_no_state_leak(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """H6: node exception embedding a dummy secret never leaks it via the envelope."""
     register_node_type("fail_leak", _FailNode)
