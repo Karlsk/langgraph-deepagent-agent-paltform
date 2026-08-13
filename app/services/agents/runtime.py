@@ -1,0 +1,764 @@
+"""AgentApp runtime objects: engine-agnostic execution layer over compiled graphs.
+
+``AgentAppRuntime`` is the unified interface the API layer talks to. The
+abstract base class fixes the cross-cutting semantics as template methods
+(mirroring ``app/core/langgraph/graph.py``):
+
+- config construction: ``thread_id=session_id``, Langfuse callback when
+  tracing is enabled, metadata with user_id/username/session_id/environment;
+- resume detection: a pending checkpoint (``aget_state().next`` non-empty)
+  turns the invocation into ``Command(resume=<last user message>)``;
+- interrupt extraction: ``state.tasks[0].interrupts[0].value`` with the
+  "Waiting for input." fallback, plus a ``GraphInterrupt`` safety net;
+- fire-and-forget long-term memory write-back after successful responses
+  (``memory_service.add`` over ``convert_to_openai_messages`` output).
+
+Concrete runtimes only implement the raw primitives ``_run`` / ``_stream`` /
+``_history`` / ``_clear`` (plus the ``_get_state`` hook the templates need).
+
+Streaming API decision (verified against installed langgraph 1.2.x):
+``astream_events(version="v3")`` exists and returns typed projections, but the
+protocol is experimental and its ``.messages`` projection excludes subagent
+tokens (root scope only), and there is no async interleave to merge it with
+``.subagents`` into one ordered stream. Therefore ``DeepAgentsAppRuntime``
+streams via ``astream(stream_mode="messages", subgraphs=True)`` and derives
+the chunk source from the message metadata (``lc_agent_name`` carries the
+subagent config name; empty namespace -> ``"coordinator"``).
+
+``assembly`` remains the only module importing ``deepagents`` — this module
+stays engine-agnostic and only consumes ``CompiledStateGraph`` objects.
+"""
+
+import asyncio
+import json
+import time
+from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass
+from typing import Any, Optional, cast, override
+
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    convert_to_openai_messages,
+)
+from langchain_core.runnables.config import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.errors import GraphInterrupt
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, StateSnapshot
+from sqlmodel import Session, col, select
+
+from app.core.config import settings
+from app.core.langgraph.pool import get_shared_connection_pool
+from app.core.logging import logger
+from app.core.metrics import llm_inference_duration_seconds, subagent_task_duration_seconds
+from app.core.observability import langfuse_callback_handler
+from app.models.agent_assets import (
+    DEFAULT_AGENT_APP_ID,
+    DEFAULT_LLM_CONFIG_NAME,
+    AgentApp,
+    LlmConfig,
+    SkillAsset,
+    SubAgentConfig,
+)
+from app.schemas import Message
+from app.services.agents import assembly
+from app.services.agents.bootstrap import ensure_default_agent_app
+from app.services.agents.mcp_manager import load_mcp_servers
+from app.services.memory import memory_service
+from app.utils import dump_messages, extract_text_content
+
+_DEFAULT_APP_NAME = "default"
+# Runtimes are shared across requests, so compilation uses a fixed pseudo-user
+# for the per-user skills directory (skill materialization is per-app here).
+#
+# Phase-1 deviation (documented, intentional): all assets are globally shared
+# and there is no per-user permission isolation yet, so skill materialization
+# uniformly lands under ``{SKILLS_ROOT}/users/system/`` for every request.
+# Phase-2 upgrade path: once per-user asset ownership exists, thread the real
+# requesting user id through ``get_runtime`` -> ``get_or_compile`` so each
+# user's skills materialize under ``users/<user_id>/`` and the compile cache
+# key gains a user dimension.
+_COMPILE_USER_ID = "system"
+_INTERRUPT_FALLBACK_TEXT = "Waiting for input."
+
+# Strong references to fire-and-forget memory write-back tasks (prevents GC
+# before completion); done callbacks remove entries and log failures.
+_pending_tasks: set[asyncio.Task[Any]] = set()
+
+# Checkpoint DDL must run at most once per process (multi-worker first-compile
+# races would otherwise create tables concurrently).
+_checkpointer_setup_done = False
+_checkpointer_setup_lock = asyncio.Lock()
+
+
+@dataclass
+class StreamChunk:
+    """One streamed content fragment with its origin.
+
+    Attributes:
+        content: Text fragment produced by the graph.
+        source: Origin tag — a subagent name, ``"coordinator"`` for the main
+            agent, or ``"system"`` for runtime-generated chunks (interrupts).
+    """
+
+    content: str
+    source: Optional[str] = None
+
+
+def _first_interrupt_value(state: StateSnapshot, default: Any = None) -> Any:
+    """Extract the first interrupt value from a snapshot without IndexError.
+
+    Args:
+        state: The checkpoint snapshot to inspect.
+        default: Value returned when no interrupt is present.
+
+    Returns:
+        The first interrupt value, or ``default`` when tasks/interrupts are empty.
+    """
+    if state.tasks:
+        interrupts = state.tasks[0].interrupts
+        if interrupts:
+            return interrupts[0].value
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Abstract base runtime (template methods for cross-cutting semantics)
+# ---------------------------------------------------------------------------
+
+
+class AgentAppRuntime(ABC):
+    """Unified execution interface for a published AgentApp.
+
+    Subclasses implement the raw primitives (``_run``, ``_stream``,
+    ``_history``, ``_clear`` and the ``_get_state`` hook); every public
+    method applies the shared cross-cutting semantics described in the module
+    docstring.
+    """
+
+    def _build_config(self, session_id: str, user_id: Optional[str], username: Optional[str]) -> RunnableConfig:
+        """Build the RunnableConfig used for every graph operation."""
+        callbacks: list[BaseCallbackHandler] = [langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []
+        return {
+            "configurable": {"thread_id": session_id},
+            "callbacks": callbacks,
+            "metadata": {
+                "user_id": user_id,
+                "username": username,
+                "session_id": session_id,
+                "environment": settings.ENVIRONMENT.value,
+                "debug": settings.DEBUG,
+            },
+        }
+
+    def _model_label(self) -> str:
+        """Model label for metrics: the resolved real model name.
+
+        The label must carry the upstream model identifier of the bound
+        LlmConfig row (resolved at construction time), never the config
+        reference name; degradation/missing paths fall back to the
+        configured default model.
+        """
+        resolved = getattr(self, "resolved_model_name", None)
+        return str(resolved) if resolved else settings.DEFAULT_LLM_MODEL
+
+    # -- primitives implemented by concrete runtimes -------------------------
+
+    @abstractmethod
+    async def _get_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Return the current checkpoint snapshot for the config's thread."""
+
+    @abstractmethod
+    async def _run(self, graph_input: Any, config: RunnableConfig) -> dict[str, Any]:
+        """Execute one full graph invocation and return the final state dict."""
+
+    @abstractmethod
+    def _stream(self, graph_input: Any, config: RunnableConfig) -> AsyncGenerator[StreamChunk, None]:
+        """Yield raw StreamChunks for one graph invocation."""
+
+    @abstractmethod
+    async def _history(self, config: RunnableConfig) -> list[BaseMessage]:
+        """Return the raw checkpoint messages of the config's thread."""
+
+    @abstractmethod
+    async def _clear(self, session_id: str) -> None:
+        """Delete every checkpoint of the given thread."""
+
+    # -- shared template internals -------------------------------------------
+
+    def _build_resume_value(self, messages: list[Message], interrupt_value: Any) -> Any:
+        """Build the resume payload for a paused thread.
+
+        Default semantics mirror ``graph.py``: the last user message text is
+        resumed verbatim. Engines expecting a structured payload override
+        this hook.
+
+        Args:
+            messages: Conversation messages (the last one is the user reply).
+            interrupt_value: The interrupt value the thread paused on.
+
+        Returns:
+            The value passed to ``Command(resume=...)``.
+        """
+        return messages[-1].content
+
+    async def _prepare_input(self, messages: list[Message], config: RunnableConfig) -> Any:
+        """Return the graph input: a resume Command or a fresh message batch."""
+        state = await self._get_state(config)
+        thread_id = cast(Optional[str], config.get("configurable", {}).get("thread_id"))
+        if state.next:
+            interrupt_value = _first_interrupt_value(state)
+            logger.info("resuming_interrupted_graph", session_id=thread_id, next_nodes=state.next)
+            return Command(resume=self._build_resume_value(messages, interrupt_value))
+        return {"messages": dump_messages(messages)}
+
+    async def _pending_interrupt_value(self, config: RunnableConfig) -> Optional[str]:
+        """Return the interrupt value when the thread is paused, else None."""
+        state = await self._get_state(config)
+        if not state.next:
+            return None
+        interrupt_value = _first_interrupt_value(state, default=_INTERRUPT_FALLBACK_TEXT)
+        logger.info(
+            "graph_interrupted",
+            session_id=config.get("configurable", {}).get("thread_id"),
+            interrupt_value=str(interrupt_value),
+        )
+        return str(interrupt_value)
+
+    def _fire_memory_add(self, messages: Sequence[BaseMessage], user_id: Optional[str], config: RunnableConfig) -> None:
+        """Fire-and-forget long-term memory write-back (successful runs only).
+
+        The task is anchored in the module-level ``_pending_tasks`` set so it
+        is not garbage-collected mid-flight; the done callback removes it and
+        logs any exception instead of dropping it silently.
+        """
+        openai_msgs = cast(list[dict], convert_to_openai_messages(list(messages)))
+        task = asyncio.create_task(memory_service.add(user_id, openai_msgs, cast(Optional[dict], config.get("metadata"))))
+        _pending_tasks.add(task)
+
+        def _on_done(done: asyncio.Task[Any]) -> None:
+            _pending_tasks.discard(done)
+            if done.cancelled():
+                return
+            exception = done.exception()
+            if exception is not None:
+                logger.error(
+                    "memory_writeback_failed",
+                    error=str(exception),
+                    error_type=type(exception).__name__,
+                )
+
+        task.add_done_callback(_on_done)
+
+    def _process_messages(self, messages: Sequence[BaseMessage]) -> list[Message]:
+        """Project raw messages to user/assistant chat Messages."""
+        openai_style_messages = convert_to_openai_messages(list(messages))
+        return [
+            Message(role=message["role"], content=str(message["content"]))
+            for message in openai_style_messages
+            if message["role"] in ("assistant", "user") and message["content"]
+        ]
+
+    # -- public unified interface ---------------------------------------------
+
+    async def ainvoke(
+        self,
+        messages: list[Message],
+        *,
+        session_id: str,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> list[Message]:
+        """Run one turn and return the assistant reply (or the interrupt text).
+
+        Args:
+            messages: Conversation messages; the last user message also serves
+                as the resume value when the thread is paused on an interrupt.
+            session_id: Chat session id used as the checkpoint thread_id.
+            user_id: Calling user id (memory partition + tracing metadata).
+            username: Display name of the calling user.
+
+        Returns:
+            The response messages; an interrupted run returns a single
+            assistant Message carrying the interrupt value.
+        """
+        config = self._build_config(session_id, user_id, username)
+        try:
+            graph_input = await self._prepare_input(messages, config)
+            started = time.perf_counter()
+            response = await self._run(graph_input, config)
+            llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
+
+            interrupt_value = await self._pending_interrupt_value(config)
+            if interrupt_value is not None:
+                return [Message(role="assistant", content=interrupt_value)]
+
+            response_messages = cast(list[BaseMessage], response["messages"])
+            self._fire_memory_add(response_messages, user_id, config)
+            return self._process_messages(response_messages)
+        except GraphInterrupt:
+            state = await self._get_state(config)
+            interrupt_value = _first_interrupt_value(state, default=_INTERRUPT_FALLBACK_TEXT)
+            logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
+            return [Message(role="assistant", content=str(interrupt_value))]
+        except Exception as e:
+            logger.exception("agent_app_invoke_failed", error=str(e), session_id=session_id)
+            raise
+
+    def astream(
+        self,
+        messages: list[Message],
+        *,
+        session_id: str,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream one turn as StreamChunks.
+
+        The runtime only produces chunks; done-terminator semantics are the
+        caller's responsibility. An interrupt hit during the run is emitted
+        as the final chunk with ``source="system"``.
+
+        Args:
+            messages: Conversation messages (last one doubles as resume value).
+            session_id: Chat session id used as the checkpoint thread_id.
+            user_id: Calling user id (memory partition + tracing metadata).
+            username: Display name of the calling user.
+
+        Yields:
+            StreamChunk objects in arrival order.
+        """
+        config = self._build_config(session_id, user_id, username)
+
+        async def _generate() -> AsyncGenerator[StreamChunk, None]:
+            started = time.perf_counter()
+            try:
+                graph_input = await self._prepare_input(messages, config)
+                async for chunk in self._stream(graph_input, config):
+                    yield chunk
+
+                llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
+                interrupt_value = await self._pending_interrupt_value(config)
+                if interrupt_value is not None:
+                    yield StreamChunk(content=interrupt_value, source="system")
+                    return
+
+                state = await self._get_state(config)
+                if state.values and "messages" in state.values:
+                    self._fire_memory_add(cast(list[BaseMessage], state.values["messages"]), user_id, config)
+            except GraphInterrupt:
+                llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
+                state = await self._get_state(config)
+                interrupt_value = _first_interrupt_value(state, default=_INTERRUPT_FALLBACK_TEXT)
+                logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
+                yield StreamChunk(content=str(interrupt_value), source="system")
+            except Exception as e:
+                logger.exception("agent_app_stream_failed", error=str(e), session_id=session_id)
+                raise
+
+        return _generate()
+
+    async def get_chat_history(self, session_id: str) -> list[Message]:
+        """Return the user/assistant history of one thread.
+
+        Args:
+            session_id: Chat session id (checkpoint thread_id).
+
+        Returns:
+            The projected chat messages (empty when the thread is unknown).
+        """
+        config: RunnableConfig = {"configurable": {"thread_id": session_id}}
+        return self._process_messages(await self._history(config))
+
+    async def clear_chat_history(self, session_id: str) -> None:
+        """Delete every checkpoint of one thread.
+
+        Args:
+            session_id: Chat session id (checkpoint thread_id).
+        """
+        await self._clear(session_id)
+        logger.info("agent_app_history_cleared", session_id=session_id)
+
+
+# ---------------------------------------------------------------------------
+# deepagents-backed runtime
+# ---------------------------------------------------------------------------
+
+
+class DeepAgentsAppRuntime(AgentAppRuntime):
+    """Runtime executing an AgentApp compiled by ``assembly`` into a graph."""
+
+    def __init__(
+        self,
+        *,
+        app_cfg: AgentApp,
+        graph: CompiledStateGraph,
+        checkpointer: BaseCheckpointSaver | None,
+        resolved_model_name: str | None = None,
+    ) -> None:
+        """Bind the compiled graph and its checkpointer to the app config.
+
+        Args:
+            app_cfg: The (possibly HIL-degraded copy of the) AgentApp row.
+            graph: Compiled graph from ``assembly.get_or_compile``.
+            checkpointer: Checkpointer attached to the graph (may be None).
+            resolved_model_name: Real upstream model name of the resolved
+                app-level LlmConfig row (metrics label source; None falls
+                back to ``settings.DEFAULT_LLM_MODEL``).
+        """
+        self.app_cfg = app_cfg
+        self._graph = graph
+        self._checkpointer = checkpointer
+        self.resolved_model_name = resolved_model_name
+
+    @override
+    def _build_resume_value(self, messages: list[Message], interrupt_value: Any) -> Any:
+        """Translate the user reply into the HIL response the middleware expects.
+
+        The langchain HumanInTheLoopMiddleware resumes with
+        ``{"decisions": [Decision, ...]}`` (one decision per interrupted
+        action). The user message is parsed as that JSON payload; anything
+        else (plain text, malformed JSON, "no") falls back to the SAFE
+        default: an equal number of reject decisions, so an unstructured
+        reply can never silently approve a pending action. The pending count
+        is inferred from the interrupt value's ``action_requests`` (single
+        reject when it cannot be inferred).
+
+        Args:
+            messages: Conversation messages (the last one is the user reply).
+            interrupt_value: The HITL request dict the thread paused on.
+
+        Returns:
+            A structured HITL response payload.
+        """
+        content = messages[-1].content
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("decisions"), list) and parsed["decisions"]:
+            return parsed
+
+        pending = len(interrupt_value.get("action_requests", [])) if isinstance(interrupt_value, dict) else 1
+        return {"decisions": [{"type": "reject"} for _ in range(max(pending, 1))]}
+
+    @override
+    async def _get_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Return the checkpoint snapshot of the bound graph."""
+        return await self._graph.aget_state(config)
+
+    @override
+    async def _run(self, graph_input: Any, config: RunnableConfig) -> dict[str, Any]:
+        """Invoke the bound graph once."""
+        return cast(dict[str, Any], await self._graph.ainvoke(graph_input, config=config))
+
+    @override
+    async def _stream(self, graph_input: Any, config: RunnableConfig) -> AsyncGenerator[StreamChunk, None]:
+        """Yield message-mode chunks tagged with their source agent.
+
+        Uses ``astream(stream_mode="messages", subgraphs=True)``: chunk shape
+        is ``(namespace, (message, metadata))``; ``metadata["lc_agent_name"]``
+        carries the subagent config name, empty namespace means coordinator.
+        While streaming, per-subagent first/last chunk timestamps are tracked
+        and observed on ``subagent_task_duration_seconds`` once the stream
+        ends (coordinator/system/empty sources are never timed).
+        """
+        timings: dict[str, tuple[float, float]] = {}
+        async for chunk in self._graph.astream(graph_input, config, stream_mode="messages", subgraphs=True):
+            namespace, payload = chunk
+            message, metadata = cast(tuple[BaseMessage, dict[str, Any]], payload)
+            if not isinstance(message, (AIMessage, AIMessageChunk)):
+                continue
+            text = extract_text_content(message.content)
+            if not text:
+                continue
+            source = str(metadata.get("lc_agent_name")) if namespace else "coordinator"
+            if source and source not in ("coordinator", "system"):
+                now = time.perf_counter()
+                first, _ = timings.get(source, (now, now))
+                timings[source] = (first, now)
+            yield StreamChunk(content=text, source=source)
+        for source, (first, last) in timings.items():
+            subagent_task_duration_seconds.labels(subagent=source).observe(last - first)
+
+    @override
+    async def _history(self, config: RunnableConfig) -> list[BaseMessage]:
+        """Read the raw messages stored in the thread checkpoint."""
+        state = await self._get_state(config)
+        if not state.values:
+            return []
+        return cast(list[BaseMessage], state.values.get("messages", []))
+
+    @override
+    async def _clear(self, session_id: str) -> None:
+        """Delete the thread via the checkpointer.
+
+        Raises:
+            RuntimeError: When no checkpointer is attached — the legacy
+                runtime contract surfaced this as a 500; silently
+                pretending success would lie about the deletion.
+        """
+        if self._checkpointer is None:
+            logger.warning("clear_history_skipped_no_checkpointer", session_id=session_id)
+            raise RuntimeError("cannot clear chat history: no checkpointer attached")
+        await self._checkpointer.adelete_thread(session_id)
+
+
+class WorkflowAppRuntime(AgentAppRuntime):
+    """Placeholder runtime reserved for the declarative workflow engine."""
+
+    def __init__(self, *, app_cfg: AgentApp, resolved_model_name: str | None = None) -> None:
+        """Bind the app config (no engine wiring yet).
+
+        Args:
+            app_cfg: The AgentApp row of engine="workflow".
+            resolved_model_name: Real upstream model name of the resolved
+                app-level LlmConfig row (metrics label source; may be None).
+        """
+        self.app_cfg = app_cfg
+        self.resolved_model_name = resolved_model_name
+
+    @override
+    async def _get_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Reserved — always raises."""
+        raise NotImplementedError("workflow engine runtime reserved")
+
+    @override
+    async def _run(self, graph_input: Any, config: RunnableConfig) -> dict[str, Any]:
+        """Reserved — always raises."""
+        raise NotImplementedError("workflow engine runtime reserved")
+
+    @override
+    def _stream(self, graph_input: Any, config: RunnableConfig) -> AsyncGenerator[StreamChunk, None]:
+        """Reserved — always raises."""
+        raise NotImplementedError("workflow engine runtime reserved")
+        yield  # pragma: no cover — makes the function an async generator
+
+    @override
+    async def _history(self, config: RunnableConfig) -> list[BaseMessage]:
+        """Reserved — always raises."""
+        raise NotImplementedError("workflow engine runtime reserved")
+
+    @override
+    async def _clear(self, session_id: str) -> None:
+        """Reserved — always raises."""
+        raise NotImplementedError("workflow engine runtime reserved")
+
+
+# ---------------------------------------------------------------------------
+# Runtime resolution, fingerprint cache and HIL degradation
+# ---------------------------------------------------------------------------
+
+# Process-level runtime cache keyed by (AgentApp.id, config fingerprint).
+_runtime_cache: dict[tuple[int, str], AgentAppRuntime] = {}
+
+
+def clear_runtime_cache() -> None:
+    """Drop every cached runtime (test isolation / shutdown hook)."""
+    _runtime_cache.clear()
+
+
+async def _resolve_agent_app(session: Session, agent_app_id: Optional[str]) -> AgentApp:
+    """Resolve a session-stored agent_app_id to the AgentApp row.
+
+    ``None`` or the ``"system-default"`` placeholder both load the system
+    default app (``name="default"``); any other value is parsed as the int
+    AgentApp primary key. When the default row is missing it is lazily
+    (re)created via ``ensure_default_agent_app`` so a failed startup
+    bootstrap cannot permanently break chat until restart.
+
+    Args:
+        session: SQLModel database session.
+        agent_app_id: Raw session value (str of AgentApp.id, placeholder, None).
+
+    Returns:
+        The AgentApp row (status NOT checked here).
+
+    Raises:
+        ValueError: When the id is unparseable or the row does not exist.
+    """
+    if agent_app_id is None or agent_app_id == DEFAULT_AGENT_APP_ID:
+        app_cfg = session.exec(select(AgentApp).where(col(AgentApp.name) == _DEFAULT_APP_NAME)).first()
+        if app_cfg is None:
+            logger.warning("default_agent_app_missing_lazy_bootstrap")
+            app_cfg = await ensure_default_agent_app(session)
+        return app_cfg
+
+    try:
+        app_pk = int(agent_app_id)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid agent_app_id: {agent_app_id!r}")
+    app_cfg = session.get(AgentApp, app_pk)
+    if app_cfg is None:
+        raise ValueError(f"agent app {app_pk} not found")
+    return app_cfg
+
+
+def _load_subagents(session: Session, names: Sequence[str]) -> list[SubAgentConfig]:
+    """Load the SubAgentConfig rows bound to an app, ordered by name."""
+    if not names:
+        return []
+    statement = select(SubAgentConfig).where(col(SubAgentConfig.name).in_(names)).order_by(col(SubAgentConfig.name))
+    return list(session.exec(statement).all())
+
+
+async def _load_skill_hashes(session: Session, names: Sequence[str]) -> dict[str, str]:
+    """Map bound skill names to their persisted content hashes."""
+    if not names:
+        return {}
+    assets = session.exec(select(SkillAsset).where(col(SkillAsset.name).in_(names))).all()
+    return {asset.name: asset.content_hash for asset in assets}
+
+
+async def _load_mcp_fingerprint(session: Session) -> str:
+    """Fingerprint the enabled MCP server set (same shape as mcp_manager's)."""
+    servers = load_mcp_servers(session)
+    return "|".join(sorted(f"{server.name}:{server.content_hash}" for server in servers))
+
+
+async def _load_llm_fingerprint(
+    session: Session, app_cfg: AgentApp, subagent_cfgs: Sequence[SubAgentConfig]
+) -> tuple[str, str]:
+    """Fingerprint the LlmConfig rows referenced by the app and its subagents.
+
+    Every NULL ``model`` reference resolves to the default config, so the
+    name set always contains it. All referenced rows are fetched with a
+    single IN query; a missing or disabled reference fails fast so a broken
+    LLM configuration never reaches the compile path.
+
+    Args:
+        session: SQLModel database session.
+        app_cfg: The AgentApp configuration row.
+        subagent_cfgs: Bound SubAgentConfig rows.
+
+    Returns:
+        A tuple of ``name:content_hash`` pairs of the referenced configs
+        (sorted and pipe-joined, same shape as ``_load_mcp_fingerprint``)
+        and the resolved real upstream model name of the app-level config
+        row (``app_cfg.model`` reference or the default config).
+
+    Raises:
+        ValueError: When any referenced config is missing or disabled.
+    """
+    names = {app_cfg.model or DEFAULT_LLM_CONFIG_NAME}
+    names.update(cfg.model or DEFAULT_LLM_CONFIG_NAME for cfg in subagent_cfgs)
+
+    statement = select(LlmConfig).where(col(LlmConfig.name).in_(names))
+    rows = session.exec(statement).all()
+    by_name = {row.name: row for row in rows}
+
+    broken = sorted(name for name in names if by_name.get(name) is None or not by_name[name].enabled)
+    if broken:
+        raise ValueError(
+            f"agent app {app_cfg.name!r} references missing or disabled llm config(s): {', '.join(broken)}"
+        )
+
+    fingerprint = "|".join(sorted(f"{row.name}:{row.content_hash}" for row in by_name.values()))
+    app_config_row = by_name[app_cfg.model or DEFAULT_LLM_CONFIG_NAME]
+    return fingerprint, app_config_row.model_name
+
+
+async def _build_checkpointer() -> BaseCheckpointSaver | None:
+    """Build an AsyncPostgresSaver over the shared pool, or None when unavailable.
+
+    The checkpoint DDL (``setup()``) runs at most once per process under an
+    asyncio lock, so concurrent first-compiles (multi-worker startup) never
+    race on table creation.
+    """
+    global _checkpointer_setup_done  # noqa: PLW0603 — process-level one-shot DDL flag
+    pool = await get_shared_connection_pool()
+    if pool is None:
+        return None
+    checkpointer = AsyncPostgresSaver(pool)
+    if not _checkpointer_setup_done:
+        async with _checkpointer_setup_lock:
+            if not _checkpointer_setup_done:
+                await checkpointer.setup()
+                _checkpointer_setup_done = True
+    return checkpointer
+
+
+async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentAppRuntime:
+    """Load, compile (cached) and return the runtime for an AgentApp.
+
+    Data-consistency contract: ``session.agent_app_id`` stores ``str(AgentApp.id)``;
+    legacy rows carry the ``"system-default"`` placeholder (or NULL) which both
+    resolve to the ``name="default"`` system app created by ``bootstrap``.
+
+    Args:
+        session: SQLModel database session.
+        agent_app_id: Raw session value (see ``_resolve_agent_app``).
+
+    Returns:
+        The cached or freshly built AgentAppRuntime.
+
+    Raises:
+        ValueError: When the app is missing, not published, its engine is
+            unknown (anything other than ``deepagents``/``workflow``), or a
+            referenced LlmConfig row is missing/disabled.
+    """
+    app_cfg = await _resolve_agent_app(session, agent_app_id)
+    if app_cfg.status != "published":
+        raise ValueError(f"agent app {app_cfg.name!r} is not published (status={app_cfg.status})")
+
+    subagent_cfgs = _load_subagents(session, app_cfg.subagent_names)
+    skill_hashes = await _load_skill_hashes(session, app_cfg.skill_names)
+    mcp_fingerprint = await _load_mcp_fingerprint(session)
+    llm_fingerprint, resolved_model_name = await _load_llm_fingerprint(session, app_cfg, subagent_cfgs)
+    fingerprint = assembly.compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, llm_fingerprint)
+
+    cached = _runtime_cache.get((app_cfg.id, fingerprint))
+    if cached is not None:
+        logger.debug("agent_app_runtime_cache_hit", app_name=app_cfg.name, app_id=app_cfg.id)
+        return cached
+
+    checkpointer = await _build_checkpointer()
+
+    degraded = False
+    if app_cfg.engine == "deepagents":
+        # HIL degradation (T10): without a checkpointer interrupts cannot be
+        # persisted/resumed, so compile a copy of the config without interrupt_on.
+        compile_cfg = app_cfg
+        if checkpointer is None and app_cfg.interrupt_on:
+            logger.warning("hil_disabled_no_checkpointer", app_name=app_cfg.name, app_id=app_cfg.id)
+            compile_cfg = app_cfg.model_copy(update={"interrupt_on": {}})
+            degraded = True
+        graph = await assembly.get_or_compile(
+            compile_cfg,
+            subagent_cfgs=subagent_cfgs,
+            skill_hashes=skill_hashes,
+            mcp_fingerprint=mcp_fingerprint,
+            llm_fingerprint=llm_fingerprint,
+            user_id=_COMPILE_USER_ID,
+            session=session,
+            checkpointer=checkpointer,
+        )
+        runtime_obj: AgentAppRuntime = DeepAgentsAppRuntime(
+            app_cfg=compile_cfg,
+            graph=graph,
+            checkpointer=checkpointer,
+            resolved_model_name=resolved_model_name,
+        )
+    elif app_cfg.engine == "workflow":
+        runtime_obj = WorkflowAppRuntime(app_cfg=app_cfg, resolved_model_name=resolved_model_name)
+    else:
+        raise ValueError(f"unknown engine {app_cfg.engine!r} for agent app {app_cfg.name!r}")
+
+    if degraded:
+        # A checkpointer-less degraded runtime must not pollute the cache: once
+        # the shared pool recovers the next request rebuilds the HIL runtime.
+        logger.debug("agent_app_runtime_not_cached_degraded", app_name=app_cfg.name, app_id=app_cfg.id)
+        return runtime_obj
+
+    # Evict stale fingerprints of this app before caching the fresh runtime
+    # (keeps the cache bounded without an LRU dependency).
+    for stale_key in [key for key in _runtime_cache if key[0] == app_cfg.id]:
+        del _runtime_cache[stale_key]
+    _runtime_cache[(app_cfg.id, fingerprint)] = runtime_obj
+    logger.info("agent_app_runtime_ready", app_name=app_cfg.name, app_id=app_cfg.id, engine=app_cfg.engine)
+    return runtime_obj

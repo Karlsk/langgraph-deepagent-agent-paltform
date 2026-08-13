@@ -106,6 +106,21 @@ class UserResponse(BaseResponse):
     token: Token = Field(..., description="Authentication token")
 
 
+class SessionCreate(BaseModel):
+    """Request model for session creation.
+
+    Attributes:
+        agent_app_id: Optional AgentApp primary key to bind the new session
+            to; omitted (None) leaves the session unbound so the runtime
+            falls back to the system default AgentApp.
+    """
+
+    agent_app_id: int | None = Field(
+        default=None,
+        description="Optional AgentApp id to bind the session to (must be published)",
+    )
+
+
 class SessionResponse(BaseResponse):
     """Response model for session creation.
 

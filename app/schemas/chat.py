@@ -4,6 +4,7 @@ import re
 from typing import (
     List,
     Literal,
+    Optional,
 )
 
 from pydantic import (
@@ -83,10 +84,14 @@ class StreamResponse(BaseResponse):
     Attributes:
         content: The content of the current chunk.
         done: Whether the stream is complete.
+        source: Origin tag of the chunk (subagent name, coordinator, system);
+            None for frames not tied to a runtime chunk. Optional for
+            backward compatibility with older clients.
     """
 
     content: str = Field(default="", description="The content of the current chunk")
     done: bool = Field(default=False, description="Whether the stream is complete")
+    source: Optional[str] = Field(default=None, description="Origin tag of the chunk (subagent name or system)")
 
 
 class SessionTitle(BaseModel):

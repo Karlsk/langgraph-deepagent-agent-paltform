@@ -25,9 +25,11 @@ from app.core.logging import (
     bind_context,
     logger,
 )
+from app.models.agent_assets import AgentApp
 from app.models.session import Session
 from app.models.user import User
 from app.schemas.auth import (
+    SessionCreate,
     SessionResponse,
     TokenResponse,
     UserCreate,
@@ -47,6 +49,36 @@ from app.utils.sanitization import (
 router = APIRouter()
 security = HTTPBearer()
 db_service = DatabaseService()
+
+
+def _validate_agent_app_binding(agent_app_id: int) -> str:
+    """Validate that the requested AgentApp exists and is published.
+
+    Args:
+        agent_app_id: The AgentApp primary key requested by the client.
+
+    Returns:
+        str: The value to persist on Session.agent_app_id (str(AgentApp.id)).
+
+    Raises:
+        HTTPException: 404 when the AgentApp does not exist, 422 when it is
+            not published (e.g. still draft).
+    """
+    db = db_service.get_session_maker()
+    try:
+        app_cfg = db.get(AgentApp, agent_app_id)
+    finally:
+        db.close()
+
+    if app_cfg is None:
+        logger.error("session_agent_app_not_found", agent_app_id=agent_app_id)
+        raise HTTPException(status_code=404, detail="Agent app not found")
+
+    if app_cfg.status != "published":
+        logger.error("session_agent_app_not_published", agent_app_id=agent_app_id, status=app_cfg.status)
+        raise HTTPException(status_code=422, detail="Agent app is not published")
+
+    return str(app_cfg.id)
 
 
 async def get_current_user(
@@ -244,21 +276,36 @@ async def login(
 
 
 @router.post("/session", response_model=SessionResponse)
-async def create_session(user: User = Depends(get_current_user)):
+async def create_session(
+    user: User = Depends(get_current_user), session_data: SessionCreate | None = None
+):
     """Create a new chat session for the authenticated user.
 
     Args:
         user: The authenticated user
+        session_data: Optional request body carrying the AgentApp id to bind
+            the session to; omitted bodies leave the binding empty so the
+            runtime falls back to the system default AgentApp.
 
     Returns:
         SessionResponse: The session ID, name, and access token
+
+    Raises:
+        HTTPException: If the requested AgentApp does not exist or is not
+            published.
     """
     try:
+        # Validate the optional AgentApp binding before persisting the session
+        agent_app_id: str | None = None
+        requested_agent_app_id = session_data.agent_app_id if session_data is not None else None
+        if requested_agent_app_id is not None:
+            agent_app_id = _validate_agent_app_binding(requested_agent_app_id)
+
         # Generate a unique session ID
         session_id = str(uuid.uuid4())
 
         # Create session in database, copying username for LLM personalization
-        session = await db_service.create_session(session_id, user.id, username=user.username)
+        session = await db_service.create_session(session_id, user.id, username=user.username, agent_app_id=agent_app_id)
 
         # Create access token for the session
         token = create_access_token(session_id)
@@ -268,6 +315,7 @@ async def create_session(user: User = Depends(get_current_user)):
             session_id=session_id,
             user_id=user.id,
             name=session.name,
+            agent_app_id=agent_app_id,
             expires_at=token.expires_at.isoformat(),
         )
 

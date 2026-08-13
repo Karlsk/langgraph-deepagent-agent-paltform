@@ -1,0 +1,333 @@
+"""Shared fixtures for AgentApp full-chain integration tests.
+
+Zero real network / zero real LLM / zero real MCP by construction:
+
+- the DB layer runs on an in-memory SQLite engine injected into every DB
+  seam (``database_service``, the auth module's private ``db_service``);
+- authentication flows through the real JWT path (offline token issuance);
+- LLM calls are served by scripted ``BaseChatModel`` substitutes (every
+  replayed AIMessage gets a fresh id so the deepagents messages reducer
+  never deduplicates);
+- MCP clients are a fake ``MultiServerMCPClient`` returning constructed
+  ``BaseTool`` instances;
+- the checkpointer is a shared in-memory ``MemorySaver``.
+"""
+
+import uuid
+from collections.abc import Generator
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import StructuredTool
+from langgraph.checkpoint.memory import MemorySaver
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel, create_engine
+
+from app.api.v1 import agent_apps as agent_apps_module
+from app.api.v1 import auth as auth_module
+from app.api.v1.api import api_router
+from app.core.config import settings
+from app.core.limiter import limiter
+from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, LlmConfig
+from app.models.user import User
+from app.services.agents import assembly
+from app.services.agents import mcp_manager
+from app.services.agents import runtime as runtime_module
+from app.services.agents import test_runner as test_runner_module
+from app.services.database import database_service
+from app.services.llm.llm_store import compute_llm_config_hash
+from app.services.memory import memory_service
+from app.utils.auth import create_access_token
+
+
+# ---------------------------------------------------------------------------
+# Scripted LLM substitute
+# ---------------------------------------------------------------------------
+
+
+class ScriptedChatModel(BaseChatModel):
+    """Deterministic chat model replaying canned AIMessages (zero network).
+
+    Every replayed message gets a fresh ``id`` (and fresh tool-call ids) so
+    the deepagents messages reducer treats each turn as a distinct message.
+    """
+
+    responses: list[AIMessage]
+    calls: list[list[BaseMessage]] = []
+    n: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "ScriptedChatModel":
+        """Tools are irrelevant for scripted replies; return self."""
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: Any = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Record the call and replay the next canned response."""
+        self.n += 1
+        self.calls.append(list(messages))
+        message = self.responses[(self.n - 1) % len(self.responses)].model_copy(deep=True)
+        message.id = str(uuid.uuid4())
+        for index, tool_call in enumerate(message.tool_calls):
+            tool_call["id"] = f"tc-{self.n}-{index}"
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+# ---------------------------------------------------------------------------
+# Fake MCP client
+# ---------------------------------------------------------------------------
+
+
+def make_mcp_tool(name: str, reply: str = "mcp-ok") -> StructuredTool:
+    """Construct a deterministic BaseTool standing in for an MCP tool."""
+    return StructuredTool.from_function(func=lambda: reply, name=name, description=f"fake mcp tool {name}")
+
+
+class FakeMcpClient:
+    """In-process stand-in for MultiServerMCPClient (zero real connections).
+
+    The per-server tool list is served from the class-level ``tools_by_server``
+    registry keyed by the single server name of the connection mapping.
+    """
+
+    tools_by_server: dict[str, list[Any]] = {}
+    fail_servers: set[str] = set()
+
+    def __init__(self, connections: dict[str, Any]) -> None:
+        """Store the connection mapping exactly like the real client."""
+        self.connections = connections
+
+    async def get_tools(self) -> list[Any]:
+        """Serve the registered fake tools of every connected server."""
+        tools: list[Any] = []
+        for server_name in self.connections:
+            if server_name in self.fail_servers:
+                raise ConnectionError(f"fake mcp connection failed for {server_name}")
+            tools.extend(self.tools_by_server.get(server_name, []))
+        return tools
+
+
+# ---------------------------------------------------------------------------
+# Environment / cache isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter() -> Generator[None, None, None]:
+    """Isolate slowapi counters between tests (shared in-memory storage)."""
+    limiter.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def clean_process_caches() -> Generator[None, None, None]:
+    """Isolate every process-level cache between tests."""
+    assembly.clear_compile_cache()
+    runtime_module.clear_runtime_cache()
+    yield
+    assembly.clear_compile_cache()
+    runtime_module.clear_runtime_cache()
+
+
+@pytest.fixture(autouse=True)
+def settings_isolation(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Point mutable settings at test-local values (zero network side effects)."""
+    monkeypatch.setattr(settings, "SESSION_NAMING_ENABLED", False)
+    monkeypatch.setattr(settings, "LANGFUSE_TRACING_ENABLED", False)
+    monkeypatch.setattr(settings, "SKILLS_ROOT", str(tmp_path / "skills"))
+    yield
+
+
+# ---------------------------------------------------------------------------
+# In-memory database wired into every DB seam
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def db_engine(monkeypatch: pytest.MonkeyPatch) -> Generator[Any, None, None]:
+    """In-memory SQLite engine shared by every database seam of the app.
+
+    Seeds the ``default`` LlmConfig row: custom apps with ``model=None``
+    resolve through the DB-backed seam without the bootstrap path running.
+    """
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    from sqlmodel import Session as DBSession  # noqa: PLC0415 — fixture-local seam
+
+    with DBSession(engine) as session:
+        default_llm = LlmConfig(
+            name=DEFAULT_LLM_CONFIG_NAME,
+            model_name=settings.DEFAULT_LLM_MODEL,
+            api_key="sk-test-default",
+            content_hash="",
+        )
+        default_llm.content_hash = compute_llm_config_hash(default_llm)
+        session.add(default_llm)
+        session.commit()
+    monkeypatch.setattr(database_service, "engine", engine)
+    monkeypatch.setattr(auth_module.db_service, "engine", engine)
+    yield engine
+    engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Authentication (real JWT flow, offline)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def user(db_engine: Any) -> User:
+    """Register one user directly in the in-memory database."""
+    user = User(
+        email="alice@example.com",
+        hashed_password=User.hash_password("Passw0rd!Strong"),
+        username="alice",
+    )
+    from sqlmodel import Session as DBSession  # noqa: PLC0415 — fixture-local seam
+
+    with DBSession(db_engine) as session:
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+    return user
+
+
+@pytest.fixture
+def user_headers(user: User) -> dict[str, str]:
+    """Bearer headers carrying a user token (auth dependency path)."""
+    token = create_access_token(str(user.id))
+    return {"Authorization": f"Bearer {token.access_token}"}
+
+
+# ---------------------------------------------------------------------------
+# Fake LLM + fake MCP + memory seams
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scripted_model(monkeypatch: pytest.MonkeyPatch) -> ScriptedChatModel:
+    """Serve every chat-model construction from a scripted model (tests append responses).
+
+    The DB-backed resolution seam (``load_llm_config``) stays real; only the
+    ChatOpenAI construction point is redirected to the scripted substitute.
+    """
+    model = ScriptedChatModel(responses=[AIMessage(content="default-reply")])
+    monkeypatch.setattr(assembly, "build_chat_model", lambda cfg: model)
+    monkeypatch.setattr(test_runner_module, "build_chat_model", lambda cfg: model)
+    return model
+
+
+@pytest.fixture(autouse=True)
+def fake_mcp(monkeypatch: pytest.MonkeyPatch) -> Generator[dict[str, list[Any]], None, None]:
+    """Route every MCP client construction through FakeMcpClient."""
+    tools_by_server: dict[str, list[Any]] = {}
+    FakeMcpClient.tools_by_server = tools_by_server
+    FakeMcpClient.fail_servers = set()
+    monkeypatch.setattr(mcp_manager, "MultiServerMCPClient", FakeMcpClient)
+    monkeypatch.setattr(agent_apps_module, "MultiServerMCPClient", FakeMcpClient)
+    yield tools_by_server
+    mcp_manager._clients.clear()  # noqa: SLF001 — process cache hygiene
+    mcp_manager._server_hashes.clear()  # noqa: SLF001
+    mcp_manager._tool_cache.clear()  # noqa: SLF001
+    mcp_manager._catalog_cache.clear()  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
+def quiet_memory(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Neutralize long-term memory IO (the service singleton is shared)."""
+    add = AsyncMock(return_value=None)
+    monkeypatch.setattr(memory_service, "search", AsyncMock(return_value=""))
+    monkeypatch.setattr(memory_service, "add", add)
+    return add
+
+
+@pytest.fixture
+def memory_checkpointer(monkeypatch: pytest.MonkeyPatch) -> MemorySaver:
+    """Attach a shared in-memory checkpointer to every runtime build."""
+    saver = MemorySaver()
+
+    async def fake_build_checkpointer() -> MemorySaver:
+        return saver
+
+    monkeypatch.setattr(runtime_module, "_build_checkpointer", fake_build_checkpointer)
+    return saver
+
+
+# ---------------------------------------------------------------------------
+# Full-stack TestClient
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def client(db_engine: Any) -> Generator[TestClient, None, None]:
+    """Full api_router under one TestClient with real dependency resolution."""
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
+    app.include_router(api_router, prefix=settings.API_V1_STR)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+
+async def collect_stream(runtime_obj: Any, *args: Any, **kwargs: Any) -> list[Any]:
+    """Drain an astream generator into a list."""
+    chunks: list[Any] = []
+    async for chunk in runtime_obj.astream(*args, **kwargs):
+        chunks.append(chunk)
+    return chunks
+
+
+def parse_sse_events(body: str) -> list[dict[str, Any]]:
+    """Parse SSE data frames emitted by /chatbot/chat/stream."""
+    import json  # noqa: PLC0415 — fixture-local utility
+
+    events: list[dict[str, Any]] = []
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line.removeprefix("data: ")))
+    return events
+
+
+async def create_chat_session(client: TestClient, headers: dict[str, str], agent_app_id: int | None) -> dict[str, Any]:
+    """POST /auth/session and return the session payload."""
+    payload: dict[str, Any] = {}
+    if agent_app_id is not None:
+        payload["agent_app_id"] = agent_app_id
+    response = client.post(f"{settings.API_V1_STR}/auth/session", json=payload, headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+__all__ = [
+    "FakeMcpClient",
+    "ScriptedChatModel",
+    "collect_stream",
+    "create_chat_session",
+    "make_mcp_tool",
+    "parse_sse_events",
+]

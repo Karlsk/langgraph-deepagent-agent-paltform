@@ -341,15 +341,15 @@ def test_l4_api_key_never_leaks_from_repr_str_or_dump() -> None:
 
 @pytest.mark.integration
 def test_l5_langchain_anthropic_pairs_with_frozen_langchain_core() -> None:
-    """EXP-L5: installed 1.0.x pairing is metadata-consistent with core 1.0.4."""
-    assert version("langchain-core") == "1.0.4"
+    """EXP-L5: installed 1.5.x pairing is metadata-consistent with core 1.5.4."""
+    assert version("langchain-core") == "1.5.4"
     lc_anthropic = version("langchain-anthropic")
-    assert lc_anthropic.startswith("1.0."), lc_anthropic  # >=1.0,<1.1 constraint
+    assert lc_anthropic.startswith("1.5."), lc_anthropic  # >=1.5.4 constraint
 
     reqs = requires("langchain-anthropic") or []
     core_req = next(r for r in reqs if r.startswith("langchain-core"))
-    # dist-info METADATA: langchain-core<2.0.0,>=1.0.4 — 1.0.4 satisfies it.
-    assert ">=1.0.4" in core_req and "<2.0.0" in core_req
+    # dist-info METADATA: langchain-core<2.0.0,>=1.5.4 — 1.5.4 satisfies it.
+    assert ">=1.5.4" in core_req and "<2.0.0" in core_req
     anthropic_req = next(r for r in reqs if r.startswith("anthropic"))
-    assert anthropic_req == "anthropic<1.0.0,>=0.69.0"
+    assert anthropic_req == "anthropic<1.0.0,>=0.120.0"
     assert version("anthropic").startswith("0.")

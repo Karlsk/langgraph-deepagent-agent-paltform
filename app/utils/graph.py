@@ -1,5 +1,7 @@
 """This file contains the graph utilities for the application."""
 
+from typing import cast
+
 import tiktoken
 from langchain_core.messages import BaseMessage
 from langchain_core.messages import trim_messages as _trim_messages
@@ -135,4 +137,4 @@ def prepare_messages(messages: list[Message], system_prompt: str) -> list[Messag
         else:
             raise
 
-    return [Message(role="system", content=system_prompt)] + trimmed_messages
+    return [Message(role="system", content=system_prompt)] + cast("list[Message]", trimmed_messages)

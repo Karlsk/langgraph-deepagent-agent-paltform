@@ -40,6 +40,50 @@ session_names_generated_total = Counter(
     ["status"],  # "success" | "error"
 )
 
+# Agent graph metrics
+agent_graph_compile_duration_seconds = Histogram(
+    "agent_graph_compile_duration_seconds",
+    "Time spent compiling the agent graph",
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+)
+
+agent_graph_cache_hits_total = Counter(
+    "agent_graph_cache_hits_total",
+    "Total agent graph cache lookups",
+    ["result"],  # "hit" | "miss"
+)
+
+subagent_task_duration_seconds = Histogram(
+    "subagent_task_duration_seconds",
+    "Time spent executing subagent tasks",
+    ["subagent"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
+)
+
+agent_test_runs_total = Counter(
+    "agent_test_runs_total",
+    "Total agent test runs executed",
+    ["status"],  # "success" | "error"
+)
+
+skill_sync_total = Counter(
+    "skill_sync_total",
+    "Total skill synchronization operations",
+    ["result"],  # "success" | "error"
+)
+
+mcp_tools_loaded_total = Counter(
+    "mcp_tools_loaded_total",
+    "Total MCP tools loaded per server",
+    ["server", "status"],  # status: "success" | "error"
+)
+
+mcp_client_rebuild_total = Counter(
+    "mcp_client_rebuild_total",
+    "Total MCP client rebuilds",
+    ["reason"],
+)
+
 
 def setup_metrics(app):
     """Set up Prometheus metrics middleware and endpoints.

@@ -166,6 +166,17 @@ class Settings:
         self.JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
         self.JWT_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_DAYS", "30"))
 
+        # Skills storage root (SKILL.md files for agent skills)
+        self.SKILLS_ROOT = os.getenv("SKILLS_ROOT", "./data/skills")
+
+        # MCP stdio command allowlist (phase-1 command-surface lockdown;
+        # comma-separated executable basenames accepted as stdio commands).
+        self.MCP_STDIO_ALLOWED_COMMANDS = [
+            part.strip().lower()
+            for part in os.getenv("MCP_STDIO_ALLOWED_COMMANDS", "python,node,uvx,npx").split(",")
+            if part.strip()
+        ]
+
         # Logging Configuration
         self.LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -206,6 +217,14 @@ class Settings:
             "root": ["10 per minute"],
             "health": ["20 per minute"],
             "workflows_execute": ["20 per minute"],
+            "subagent": ["60 per minute"],
+            "skill": ["60 per minute"],
+            "agent_app": ["60 per minute"],
+            "mcp_server": ["60 per minute"],
+            "llm_config": ["60 per minute"],
+            "tools_catalog": ["60 per minute"],
+            "subagent_test": ["5 per minute"],
+            "skill_generate": ["5 per minute"],
         }
 
         # Update rate limit endpoints from environment variables

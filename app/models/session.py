@@ -25,6 +25,7 @@ class Session(BaseModel, table=True):
         name: Name of the session (defaults to empty string)
         username: Display name copied from the user at session creation
         created_at: When the session was created
+        agent_app_id: Id of the agent app bound to this session (no FK constraint)
         messages: Relationship to session messages
         user: Relationship to the session owner
     """
@@ -33,4 +34,5 @@ class Session(BaseModel, table=True):
     user_id: int = Field(foreign_key="user.id")
     name: str = Field(default="")
     username: Optional[str] = Field(default=None)
+    agent_app_id: Optional[str] = Field(default=None, index=True)
     user: "User" = Relationship(back_populates="sessions")
