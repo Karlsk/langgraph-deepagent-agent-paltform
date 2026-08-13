@@ -5,7 +5,7 @@ On the first message of a new session this module:
      across concurrent requests and multiple uvicorn workers).
   2. Writes a placeholder name derived from the user's message so the session
      always has a sensible name even if the LLM call later fails.
-  3. Fires a background asyncio task that calls a fast nano model with
+  3. Fires a background asyncio task that calls the default model with
      structured output to generate a proper title and overwrites the placeholder.
 """
 
@@ -60,9 +60,7 @@ async def _persist_session_name(session_id: str, user_message: str) -> None:
                 SystemMessage(content=SESSION_TITLE_PROMPT),
                 HumanMessage(content=user_message[:500]),
             ],
-            model_name="gpt-5.4-nano",
             response_format=SessionTitle,
-            reasoning={"effort": "low"},
             max_tokens=32,
             temperature=0.3,
         )

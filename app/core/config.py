@@ -148,6 +148,9 @@ class Settings:
         # LangGraph Configuration
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
         self.DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gpt-5-mini")
+        # Ordered model fallback chain for LLMService; falls back to the
+        # default model when unset so the registry is never empty.
+        self.LLM_MODELS = parse_list_from_env("LLM_MODELS", []) or [self.DEFAULT_LLM_MODEL]
         self.SESSION_NAMING_ENABLED = os.getenv("SESSION_NAMING_ENABLED", "true").lower() == "true"
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))

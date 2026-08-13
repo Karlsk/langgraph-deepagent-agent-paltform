@@ -10,63 +10,46 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
-from app.core.config import (
-    Environment,
-    settings,
-)
+from app.core.config import settings
 from app.core.logging import logger
 
-_TOKEN_LIMIT: Dict[str, Any] = {"max_completion_tokens": settings.MAX_TOKENS}
 _API_KEY = SecretStr(settings.OPENAI_API_KEY)
+
+
+def _build_llms(model_names: List[str]) -> List[Dict[str, Any]]:
+    """Build pre-initialized registry entries for the given model names.
+
+    Args:
+        model_names: Ordered model ids (the exact names the provider accepts).
+
+    Returns:
+        List of ``{"name": ..., "llm": ...}`` entries in the given order.
+    """
+    return [
+        {
+            "name": name,
+            "llm": ChatOpenAI(
+                model=name,
+                api_key=_API_KEY,
+                max_completion_tokens=settings.MAX_TOKENS,
+            ),
+        }
+        for name in model_names
+    ]
 
 
 class LLMRegistry:
     """Registry of available LLM models with pre-initialized instances.
 
-    This class maintains a list of LLM configurations and provides
-    methods to retrieve them by name with optional argument overrides.
+    The model list is driven by ``settings.LLM_MODELS`` (env ``LLM_MODELS``,
+    falling back to ``DEFAULT_LLM_MODEL``), so the fallback chain always
+    matches the configured provider endpoint. Each entry's ``name`` is the
+    exact model id sent to the provider — no provider-specific parameters
+    are hardcoded, keeping the registry portable across OpenAI-compatible
+    gateways.
     """
 
-    LLMS: List[Dict[str, Any]] = [
-        {
-            "name": "gpt-5-mini",
-            "llm": ChatOpenAI(
-                model="gpt-5-mini",
-                api_key=_API_KEY,
-                model_kwargs=_TOKEN_LIMIT,
-                reasoning={"effort": "low"},
-            ),
-        },
-        {
-            "name": "gpt-5.4",
-            "llm": ChatOpenAI(
-                model="gpt-5",
-                api_key=_API_KEY,
-                model_kwargs=_TOKEN_LIMIT,
-                reasoning={"effort": "medium"},
-            ),
-        },
-        {
-            "name": "gpt-5.4-nano",
-            "llm": ChatOpenAI(
-                model="gpt-5.4-nano",
-                api_key=_API_KEY,
-                model_kwargs=_TOKEN_LIMIT,
-                reasoning={"effort": "low"},
-            ),
-        },
-        {
-            "name": "gpt-5",
-            "llm": ChatOpenAI(
-                model="gpt-5",
-                api_key=_API_KEY,
-                model_kwargs=_TOKEN_LIMIT,
-                top_p=0.95 if settings.ENVIRONMENT == Environment.PRODUCTION else 0.8,
-                presence_penalty=0.1 if settings.ENVIRONMENT == Environment.PRODUCTION else 0.0,
-                frequency_penalty=0.1 if settings.ENVIRONMENT == Environment.PRODUCTION else 0.0,
-            ),
-        },
-    ]
+    LLMS: List[Dict[str, Any]] = _build_llms(settings.LLM_MODELS)
 
     @classmethod
     def get(cls, model_name: str, **kwargs) -> BaseChatModel:
@@ -120,3 +103,6 @@ class LLMRegistry:
         if 0 <= index < len(cls.LLMS):
             return cls.LLMS[index]
         return cls.LLMS[0]
+
+
+logger.info("llm_registry_initialized", models=settings.LLM_MODELS)

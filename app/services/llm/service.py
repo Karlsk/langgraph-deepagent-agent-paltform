@@ -16,7 +16,8 @@ from typing import (
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import BaseMessage
 from openai import (
-    APIError,
+    APIConnectionError,
+    APIStatusError,
     APITimeoutError,
     OpenAIError,
     RateLimitError,
@@ -25,7 +26,7 @@ from pydantic import BaseModel
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -35,6 +36,27 @@ from app.core.logging import logger
 from app.services.llm.registry import LLMRegistry
 
 T = TypeVar("T", bound=BaseModel)
+
+# Transient provider failures worth retrying. 4xx client errors
+# (BadRequestError, AuthenticationError, ...) are deterministic for the same
+# request and must surface immediately instead of burning the retry budget.
+_RETRYABLE_EXCEPTIONS = (RateLimitError, APITimeoutError, APIConnectionError)
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Decide whether an LLM call failure warrants a retry.
+
+    Args:
+        exc: The exception raised by the LLM invocation.
+
+    Returns:
+        ``True`` for transient errors (rate limits, timeouts, connection
+        issues and 5xx provider errors); ``False`` for deterministic 4xx
+        client errors.
+    """
+    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
+        return True
+    return isinstance(exc, APIStatusError) and exc.status_code is not None and exc.status_code >= 500
 
 
 class LLMService:
@@ -171,12 +193,16 @@ class LLMService:
     @retry(
         stop=stop_after_attempt(settings.MAX_LLM_CALL_RETRIES),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
+        retry=retry_if_exception(_is_retryable_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
     async def _invoke_with_retry(self, llm: Any, messages: LanguageModelInput) -> Any:
         """Invoke an LLM runnable with automatic per-model retry logic.
+
+        Only transient failures (rate limits, timeouts, connection errors,
+        5xx) are retried; deterministic 4xx client errors are re-raised
+        after the first attempt.
 
         Args:
             llm: Any LangChain ``Runnable`` (plain model or structured-output chain).
@@ -186,26 +212,27 @@ class LLMService:
             The runnable's response (``BaseMessage`` or a ``BaseModel`` instance).
 
         Raises:
-            OpenAIError: Propagated after all retry attempts are exhausted.
+            OpenAIError: Propagated after all retry attempts are exhausted
+                (or immediately for non-retryable client errors).
         """
         try:
             response = await llm.ainvoke(messages)
             logger.debug("llm_call_successful")
             return response
-        except (RateLimitError, APITimeoutError, APIError) as e:
-            logger.warning(
-                "llm_call_failed_retrying",
-                error_type=type(e).__name__,
-                error=str(e),
-                exc_info=True,
-            )
-            raise
         except OpenAIError as e:
-            logger.error(
-                "llm_call_failed",
-                error_type=type(e).__name__,
-                error=str(e),
-            )
+            if _is_retryable_error(e):
+                logger.warning(
+                    "llm_call_failed_retrying",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    exc_info=True,
+                )
+            else:
+                logger.error(
+                    "llm_call_failed",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
             raise
 
     def _switch_to_next_model(self) -> bool:
