@@ -48,6 +48,8 @@ make docker-build ENV=production
 
 This runs `scripts/build-docker.sh` which builds and tags the image for the specified environment.
 
+The build uses the Aliyun apt mirror by default (`ARG DEBIAN_MIRROR_URL=https://mirrors.aliyun.com`); to use the official Debian source instead, pass `--build-arg DEBIAN_MIRROR_URL=http://deb.debian.org` to `docker build`.
+
 ## Running migrations inside Docker
 
 After `make docker-up`, run migrations against the containerised database:

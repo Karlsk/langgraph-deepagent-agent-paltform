@@ -15,7 +15,13 @@ ENV APP_ENV=${APP_ENV} \
     PIP_DEFAULT_TIMEOUT=100
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Switch apt sources to a mirror (default: Aliyun) to avoid 502 from deb.debian.org.
+# To fall back to the official source, build with:
+#   --build-arg DEBIAN_MIRROR_URL=http://deb.debian.org
+ARG DEBIAN_MIRROR_URL=https://mirrors.aliyun.com
+RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR_URL}/debian|g; s|http://deb.debian.org/debian-security|${DEBIAN_MIRROR_URL}/debian-security|g" \
+    /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     && pip install --upgrade pip \
