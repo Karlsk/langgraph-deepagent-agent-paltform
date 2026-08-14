@@ -49,7 +49,7 @@ const activeMenu = computed(() => route.path)
         </el-menu-item>
         <el-menu-item index="/llm">
           <el-icon><SetUp /></el-icon>
-          <span>模型服务</span>
+          <span>模型管理</span>
         </el-menu-item>
       </el-menu>
 

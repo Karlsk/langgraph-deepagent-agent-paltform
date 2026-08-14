@@ -32,7 +32,7 @@ const router = createRouter({
       path: '/llm',
       name: 'llm',
       component: () => import('@/views/provider/ProviderList.vue'),
-      meta: { title: '模型服务' },
+      meta: { title: '模型管理' },
     },
   ],
 })

@@ -1,12 +1,33 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+
+import { isBackendConnected } from './connection'
+
+const connected = ref<boolean | null>(null)
+
+onMounted(async () => {
+  connected.value = await isBackendConnected()
+})
+</script>
+
 <template>
-  <div class="page-view">
-    <header class="page-view__header">
-      <p class="page-view__eyebrow">LLM Providers</p>
-      <h1 class="page-view__title">模型服务</h1>
-      <p class="page-view__desc">管理 LLM Provider 接入、模型列表与配置。</p>
-    </header>
-    <el-card class="app-content-card page-view__body" shadow="never">
-      <el-empty description="待实现" />
-    </el-card>
+  <div>
+    <div>模型提供商管理</div>
+    <p v-if="connected === true" class="connection-status connection-status--connected">
+      后端已连接：Hify is running
+    </p>
+    <p v-else-if="connected === false" class="connection-status connection-status--disconnected">
+      后端未连接
+    </p>
   </div>
 </template>
+
+<style scoped>
+.connection-status--connected {
+  color: var(--el-color-success);
+}
+
+.connection-status--disconnected {
+  color: var(--el-color-danger);
+}
+</style>
