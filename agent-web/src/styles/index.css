@@ -1,18 +1,47 @@
 :root {
-  /* 品牌蓝白色系 —— 覆盖 Element Plus 主题色 */
-  --el-color-primary: #2f6bff;
-  --el-color-primary-light-3: #6692ff;
-  --el-color-primary-light-5: #94b1ff;
-  --el-color-primary-light-7: #c0d1ff;
-  --el-color-primary-light-8: #d7e1ff;
-  --el-color-primary-light-9: #edf2ff;
-  --el-color-primary-dark-2: #1f52d6;
+  --color-primary-50: #f1f0ff;
+  --color-primary-500: #635bff;
+  --color-primary-600: #5248e8;
+  --color-accent-500: #36d6b0;
+  --color-success-600: #168b69;
+  --color-warning-600: #b86808;
+  --color-danger-600: #c93d55;
+  --color-bg-canvas: #f8f8fc;
+  --color-bg-subtle: #f1f1f6;
+  --color-bg-surface: #ffffff;
+  --color-bg-sidebar: #171725;
+  --color-text-primary: #24242e;
+  --color-text-secondary: #666674;
+  --color-text-tertiary: #90909d;
+  --color-text-on-dark: #f4f4fa;
+  --color-text-on-dark-muted: #a9a9bc;
+  --color-border-default: #e4e4ec;
+  --color-border-strong: #d2d2df;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --shadow-sm: 0 1px 2px rgba(23, 23, 37, 0.05);
+  --shadow-md: 0 8px 24px rgba(23, 23, 37, 0.1);
+  --shadow-lg: 0 20px 48px rgba(23, 23, 37, 0.16);
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --duration-slow: 240ms;
+  --ease-standard: cubic-bezier(.2, .8, .2, 1);
 
-  /* 应用级布局变量 */
-  --app-bg: #f4f7fd;
-  --app-border: #e6ecf7;
-  --app-ink: #101c33;
-  --app-ink-muted: #5b6b85;
+  --el-color-primary: var(--color-primary-500);
+  --el-color-primary-dark-2: var(--color-primary-600);
+  --el-color-success: var(--color-success-600);
+  --el-color-warning: var(--color-warning-600);
+  --el-color-danger: var(--color-danger-600);
+  --el-border-color: var(--color-border-default);
+  --el-border-color-light: var(--color-border-default);
+  --el-bg-color: var(--color-bg-surface);
+  --el-fill-color-light: var(--color-bg-subtle);
+  --el-text-color-primary: var(--color-text-primary);
+  --el-text-color-regular: var(--color-text-secondary);
+  --el-text-color-secondary: var(--color-text-tertiary);
+
   --app-font-display: 'Sora', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
     'Microsoft YaHei', sans-serif;
 }
@@ -25,8 +54,8 @@ body,
 }
 
 body {
-  background: var(--app-bg);
-  color: var(--app-ink);
+  background: var(--color-bg-canvas);
+  color: var(--color-text-primary);
   font-family:
     'Noto Sans SC',
     'PingFang SC',
@@ -41,16 +70,16 @@ body {
 /* 卡片基础样式                                                       */
 /* ---------------------------------------------------------------- */
 .app-card {
-  border: 1px solid var(--app-border);
-  border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgba(16, 28, 51, 0.04);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-surface);
+  box-shadow: var(--shadow-sm);
 }
 
 .app-content-card.el-card {
-  border: 1px solid var(--app-border);
-  border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(16, 28, 51, 0.04);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
 }
 
 .app-content-card .el-card__body {
@@ -85,7 +114,7 @@ body {
 
 .page-view__title {
   margin: 0;
-  color: var(--app-ink);
+  color: var(--color-text-primary);
   font-family: var(--app-font-display);
   font-size: 24px;
   font-weight: 700;
@@ -94,10 +123,26 @@ body {
 
 .page-view__desc {
   margin: 0;
-  color: var(--app-ink-muted);
+  color: var(--color-text-secondary);
   font-size: 13px;
 }
 
 .page-view__body {
   min-height: 320px;
+}
+
+:where(button, a, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-primary-500);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
