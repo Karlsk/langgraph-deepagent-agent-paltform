@@ -10,11 +10,17 @@ from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.error_handlers import (
+    http_exception_handler,
+    rate_limit_exceeded_handler,
+    validation_exception_handler,
+)
 from app.api.v1 import auth as auth_module
 from app.api.v1 import chatbot as chatbot_module
 from app.api.v1.chatbot import router as chatbot_router
@@ -23,6 +29,8 @@ from app.core.limiter import limiter
 from app.models.session import Session as ChatSession
 from app.schemas.chat import ChatRequest, Message
 from app.services.agents.runtime import StreamChunk
+
+from tests.conftest import unwrap
 
 pytestmark = pytest.mark.unit
 
@@ -106,10 +114,18 @@ def fake_session() -> ChatSession:
 
 @pytest.fixture
 def client(fake_session: ChatSession) -> Generator[TestClient, None, None]:
-    """Minimal app wiring the chatbot router with limiter state + auth override."""
+    """Minimal app wiring the chatbot router with limiter state + auth override.
+
+    Registers the exact envelope handlers from ``app.api.error_handlers``
+    so error-path assertions validate the production {code, message, data}
+    shape.
+    """
     app = FastAPI()
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(HTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
     app.include_router(chatbot_router)
     app.dependency_overrides[auth_module.get_current_session] = lambda: fake_session
     yield TestClient(app)
@@ -154,7 +170,7 @@ def test_chat_invokes_runtime_with_session_context(client: TestClient, patch_run
     """The runtime receives the request messages plus session-derived context."""
     response = client.post("/chat", json=_chat_body())
     assert response.status_code == 200
-    assert response.json()["messages"][-1] == {"role": "assistant", "content": "ok"}
+    assert unwrap(response)["messages"][-1] == {"role": "assistant", "content": "ok"}
 
     assert patch_runtime.resolved_agent_app_id == "42"
     call = patch_runtime.invoke_calls[0]
@@ -165,11 +181,14 @@ def test_chat_invokes_runtime_with_session_context(client: TestClient, patch_run
 
 
 def test_chat_runtime_failure_returns_500(client: TestClient, patch_runtime: FakeRuntime) -> None:
-    """Runtime errors surface as a 500 with the original detail."""
+    """Runtime errors surface as a 500 envelope carrying the (redacted) detail."""
     patch_runtime.invoke_error = RuntimeError("boom")
     response = client.post("/chat", json=_chat_body())
     assert response.status_code == 500
-    assert response.json()["detail"] == "boom"
+    body = response.json()
+    assert body["code"] == 500
+    assert "boom" in body["message"]
+    assert body["data"] is None
 
 
 def test_chat_triggers_session_naming_when_enabled(
@@ -193,9 +212,7 @@ def test_chat_triggers_session_naming_when_enabled(
 # ---------------------------------------------------------------------------
 
 
-def test_chat_stream_frames_carry_source_and_done_terminator(
-    client: TestClient, patch_runtime: FakeRuntime
-) -> None:
+def test_chat_stream_frames_carry_source_and_done_terminator(client: TestClient, patch_runtime: FakeRuntime) -> None:
     """Each chunk becomes one frame with its source; the last frame is done."""
     patch_runtime.stream_chunks = [("hello ", "sub-a"), ("world", "coordinator")]
 
@@ -241,15 +258,18 @@ def test_get_messages_delegates_to_runtime_history(client: TestClient, patch_run
 
     response = client.get("/messages")
     assert response.status_code == 200
-    assert [message["content"] for message in response.json()["messages"]] == ["hi", "hello"]
+    assert [message["content"] for message in unwrap(response)["messages"]] == ["hi", "hello"]
     assert patch_runtime.history_calls == ["sess-1"]
 
 
 def test_clear_messages_delegates_to_runtime_clear(client: TestClient, patch_runtime: FakeRuntime) -> None:
-    """DELETE /messages clears the thread via the runtime."""
+    """DELETE /messages clears the thread via the runtime (envelope carries the notice)."""
     response = client.delete("/messages")
     assert response.status_code == 200
-    assert response.json() == {"message": "Chat history cleared successfully"}
+    body = response.json()
+    assert body["code"] == 200
+    assert body["message"] == "Chat history cleared successfully"
+    assert body["data"] is None
     assert patch_runtime.clear_calls == ["sess-1"]
 
 

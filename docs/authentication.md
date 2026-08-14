@@ -8,17 +8,23 @@ sequenceDiagram
     participant A as API
 
     C->>A: POST /auth/register<br/>{email, password, username?}
-    A-->>C: {user_id, email, username, token}
+    A-->>C: {code: 200, message, data: {user_id, email, username, token}}
 
     C->>A: POST /auth/login<br/>form: email + password
-    A-->>C: {access_token, expires_at}
+    A-->>C: {code, message, data: {access_token, expires_at}}
 
     C->>A: POST /auth/session<br/>Bearer: user token
-    A-->>C: {session_id, token}
+    A-->>C: {code, message, data: {session_id, token}}
 
     C->>A: POST /chatbot/chat<br/>Bearer: session token
-    A-->>C: {messages}
+    A-->>C: {code, message, data: {messages}}
 ```
+
+All responses use the unified envelope `{code, message, data}` — `code` is numerically
+identical to the HTTP status (asset creation endpoints return HTTP 201 with `code=201`,
+while `POST /auth/register` returns HTTP 200 with `code=200`;
+errors carry the status code with `data=null`, and 422 validation failures carry
+`message="Validation error"` with the error list in `data`).
 
 The API uses **two token scopes**:
 
@@ -60,7 +66,7 @@ curl -X POST /api/v1/auth/login \
   -F "grant_type=password"
 ```
 
-Returns `access_token` and `expires_at`.
+Returns the envelope `{code, message, data}`; `data` carries `access_token` and `expires_at`.
 
 ---
 
@@ -73,7 +79,7 @@ curl -X POST /api/v1/auth/session \
   -H "Authorization: Bearer <user token>"
 ```
 
-Returns `session_id` and a session-scoped `token`. Use this session token for all subsequent chat requests.
+Returns the envelope whose `data` carries `session_id` and a session-scoped `token`. Use this session token for all subsequent chat requests.
 
 ---
 

@@ -35,6 +35,7 @@ from app.schemas.auth import (
     UserCreate,
     UserResponse,
 )
+from app.schemas.base import ApiResponse
 from app.services.database import DatabaseService
 from app.utils.auth import (
     create_access_token,
@@ -185,9 +186,9 @@ async def get_current_session(
         )
 
 
-@router.post("/register", response_model=UserResponse)
+@router.post("/register", response_model=ApiResponse[UserResponse])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["register"][0])
-async def register_user(request: Request, user_data: UserCreate):
+async def register_user(request: Request, user_data: UserCreate) -> ApiResponse[UserResponse]:
     """Register a new user.
 
     Args:
@@ -195,7 +196,7 @@ async def register_user(request: Request, user_data: UserCreate):
         user_data: User registration data
 
     Returns:
-        UserResponse: The created user info
+        ApiResponse[UserResponse]: Envelope carrying the created user info
     """
     try:
         # Sanitize email
@@ -222,17 +223,17 @@ async def register_user(request: Request, user_data: UserCreate):
         # Create access token
         token = create_access_token(str(user.id))
 
-        return UserResponse(id=user.id, email=user.email, username=user.username, token=token)
+        return ApiResponse.success(UserResponse(id=user.id, email=user.email, username=user.username, token=token))
     except ValueError as ve:
         logger.exception("user_registration_validation_failed", error=str(ve))
         raise HTTPException(status_code=422, detail=str(ve))
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=ApiResponse[TokenResponse])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["login"][0])
 async def login(
     request: Request, email: str = Form(...), password: str = Form(...), grant_type: str = Form(default="password")
-):
+) -> ApiResponse[TokenResponse]:
     """Login a user.
 
     Args:
@@ -242,7 +243,7 @@ async def login(
         grant_type: Must be "password"
 
     Returns:
-        TokenResponse: Access token information
+        ApiResponse[TokenResponse]: Envelope carrying access token information
 
     Raises:
         HTTPException: If credentials are invalid
@@ -269,16 +270,18 @@ async def login(
             )
 
         token = create_access_token(str(user.id))
-        return TokenResponse(access_token=token.access_token, token_type="bearer", expires_at=token.expires_at)
+        return ApiResponse.success(
+            TokenResponse(access_token=token.access_token, token_type="bearer", expires_at=token.expires_at)
+        )
     except ValueError as ve:
         logger.exception("login_validation_failed", error=str(ve))
         raise HTTPException(status_code=422, detail=str(ve))
 
 
-@router.post("/session", response_model=SessionResponse)
+@router.post("/session", response_model=ApiResponse[SessionResponse])
 async def create_session(
     user: User = Depends(get_current_user), session_data: SessionCreate | None = None
-):
+) -> ApiResponse[SessionResponse]:
     """Create a new chat session for the authenticated user.
 
     Args:
@@ -288,7 +291,8 @@ async def create_session(
             runtime falls back to the system default AgentApp.
 
     Returns:
-        SessionResponse: The session ID, name, and access token
+        ApiResponse[SessionResponse]: Envelope carrying the session ID, name,
+            and access token
 
     Raises:
         HTTPException: If the requested AgentApp does not exist or is not
@@ -305,7 +309,9 @@ async def create_session(
         session_id = str(uuid.uuid4())
 
         # Create session in database, copying username for LLM personalization
-        session = await db_service.create_session(session_id, user.id, username=user.username, agent_app_id=agent_app_id)
+        session = await db_service.create_session(
+            session_id, user.id, username=user.username, agent_app_id=agent_app_id
+        )
 
         # Create access token for the session
         token = create_access_token(session_id)
@@ -319,16 +325,16 @@ async def create_session(
             expires_at=token.expires_at.isoformat(),
         )
 
-        return SessionResponse(session_id=session_id, name=session.name, token=token)
+        return ApiResponse.success(SessionResponse(session_id=session_id, name=session.name, token=token))
     except ValueError as ve:
         logger.exception("session_creation_validation_failed", error=str(ve), user_id=user.id)
         raise HTTPException(status_code=422, detail=str(ve))
 
 
-@router.patch("/session/{session_id}/name", response_model=SessionResponse)
+@router.patch("/session/{session_id}/name", response_model=ApiResponse[SessionResponse])
 async def update_session_name(
     session_id: str, name: str = Form(...), current_session: Session = Depends(get_current_session)
-):
+) -> ApiResponse[SessionResponse]:
     """Update a session's name.
 
     Args:
@@ -337,7 +343,7 @@ async def update_session_name(
         current_session: The current session from auth
 
     Returns:
-        SessionResponse: The updated session information
+        ApiResponse[SessionResponse]: Envelope carrying the updated session information
     """
     try:
         # Sanitize inputs
@@ -355,14 +361,16 @@ async def update_session_name(
         # Create a new token (not strictly necessary but maintains consistency)
         token = create_access_token(sanitized_session_id)
 
-        return SessionResponse(session_id=sanitized_session_id, name=session.name, token=token)
+        return ApiResponse.success(SessionResponse(session_id=sanitized_session_id, name=session.name, token=token))
     except ValueError as ve:
         logger.exception("session_update_validation_failed", error=str(ve), session_id=session_id)
         raise HTTPException(status_code=422, detail=str(ve))
 
 
-@router.delete("/session/{session_id}")
-async def delete_session(session_id: str, current_session: Session = Depends(get_current_session)):
+@router.delete("/session/{session_id}", response_model=ApiResponse[None])
+async def delete_session(
+    session_id: str, current_session: Session = Depends(get_current_session)
+) -> ApiResponse[None]:
     """Delete a session for the authenticated user.
 
     Args:
@@ -370,7 +378,7 @@ async def delete_session(session_id: str, current_session: Session = Depends(get
         current_session: The current session from auth
 
     Returns:
-        None
+        ApiResponse[None]: Envelope with a null data payload
     """
     try:
         # Sanitize inputs
@@ -385,31 +393,34 @@ async def delete_session(session_id: str, current_session: Session = Depends(get
         await db_service.delete_session(sanitized_session_id)
 
         logger.info("session_deleted", session_id=session_id, user_id=current_session.user_id)
+        return ApiResponse.success(None)
     except ValueError as ve:
         logger.exception("session_deletion_validation_failed", error=str(ve), session_id=session_id)
         raise HTTPException(status_code=422, detail=str(ve))
 
 
-@router.get("/sessions", response_model=List[SessionResponse])
-async def get_user_sessions(user: User = Depends(get_current_user)):
+@router.get("/sessions", response_model=ApiResponse[List[SessionResponse]])
+async def get_user_sessions(user: User = Depends(get_current_user)) -> ApiResponse[List[SessionResponse]]:
     """Get all session IDs for the authenticated user.
 
     Args:
         user: The authenticated user
 
     Returns:
-        List[SessionResponse]: List of session IDs
+        ApiResponse[List[SessionResponse]]: Envelope carrying the list of session IDs
     """
     try:
         sessions = await db_service.get_user_sessions(user.id)
-        return [
-            SessionResponse(
-                session_id=sanitize_string(session.id),
-                name=sanitize_string(session.name),
-                token=create_access_token(session.id),
-            )
-            for session in sessions
-        ]
+        return ApiResponse.success(
+            [
+                SessionResponse(
+                    session_id=sanitize_string(session.id),
+                    name=sanitize_string(session.name),
+                    token=create_access_token(session.id),
+                )
+                for session in sessions
+            ]
+        )
     except ValueError as ve:
         logger.exception("get_sessions_validation_failed", user_id=user.id, error=str(ve))
         raise HTTPException(status_code=422, detail=str(ve))

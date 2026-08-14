@@ -40,14 +40,14 @@ def client(tmp_path: Path) -> Generator[TestClient, None, None]:
 
 
 def test_api_execute_success(client: TestClient) -> None:
-    """POST execute returns the shared envelope with full metadata."""
+    """POST execute returns the host unified envelope {code,message,data} with metadata folded into data."""
     response = client.post("/workflows/echo_demo/execute", json={"input": "hi"})
     assert response.status_code == 200
     envelope = response.json()
-    assert envelope["success"] is True
-    assert envelope["error"] is None
+    assert envelope["code"] == 200
+    assert envelope["message"] == "success"
     assert envelope["data"]["response"] == "hello"
-    metadata = envelope["metadata"]
+    metadata = envelope["data"]["metadata"]
     assert metadata["workflow_id"] == "echo_demo"
     assert len(metadata["run_id"]) == 32
     assert metadata["duration_ms"] >= 0.0
@@ -55,12 +55,13 @@ def test_api_execute_success(client: TestClient) -> None:
 
 
 def test_api_unknown_workflow_returns_404(client: TestClient) -> None:
-    """Unknown workflow_id: 404 with failure envelope mentioning the id."""
+    """Unknown workflow_id: 404 host envelope with a redacted message mentioning the id."""
     response = client.post("/workflows/not_exist/execute", json={})
     assert response.status_code == 404
     envelope = response.json()
-    assert envelope["success"] is False
-    assert "not_exist" in envelope["error"]
+    assert envelope["code"] == 404
+    assert "not_exist" in envelope["message"]
+    assert envelope["data"] is None
 
 
 def test_api_failure_envelope_redacted(client: TestClient) -> None:
@@ -74,7 +75,7 @@ def test_api_failure_envelope_redacted(client: TestClient) -> None:
     assert response.status_code == 500
     assert "sk-live-leak-999" not in response.text
     envelope = response.json()
-    assert envelope["success"] is False
+    assert envelope["code"] == 500
     assert envelope["data"] is None
 
 
@@ -88,7 +89,16 @@ def test_api_missing_registry_injection_returns_500(tmp_path: Path) -> None:
     with TestClient(app) as test_client:
         response = test_client.post("/workflows/echo_demo/execute", json={})
     assert response.status_code == 500
-    assert "workflow_registry" in response.json()["error"]
+    assert "workflow_registry" in response.json()["message"]
+
+
+def test_api_projection_non_dict_output_wrapped_as_result() -> None:
+    """Egress mapping locks the non-dict branch: data = {"result": output, "metadata": {...}}."""
+    metadata = {"workflow_id": "demo", "run_id": "r", "duration_ms": 1.0, "node_count": 1}
+    response = workflow_api.ApiResponse(success=True, data=["plain", "list"], metadata=metadata)
+    content = workflow_api._host_envelope_content(response, 200)
+    assert content == {"code": 200, "message": "success", "data": {"result": ["plain", "list"], "metadata": metadata}}
+    assert workflow_api._project_to_host_envelope(response, 200).status_code == 200
 
 
 def test_host_processor_chain_contains_redact() -> None:

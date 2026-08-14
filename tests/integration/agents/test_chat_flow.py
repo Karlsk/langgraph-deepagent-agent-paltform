@@ -19,8 +19,9 @@ from sqlmodel import Session as DBSession
 
 from app.core.config import settings
 from app.services.agents.bootstrap import ensure_default_agent_app
+from tests.conftest import unwrap
 
-from .conftest import parse_sse_events
+from .conftest import assert_error_envelope, parse_sse_events
 
 pytestmark = pytest.mark.integration
 
@@ -33,7 +34,7 @@ def _publish_app(client: TestClient, headers: dict[str, str], name: str = "chat-
         f"{API}/agent-apps/apps", json={"name": name, "system_prompt": "You are chat."}, headers=headers
     )
     assert created.status_code == 201, created.text
-    app_id = created.json()["id"]
+    app_id = unwrap(created, expected_code=201)["id"]
     published = client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers)
     assert published.status_code == 200, published.text
     return app_id
@@ -46,14 +47,14 @@ def _session_headers(client: TestClient, user_headers: dict[str, str], agent_app
         payload["agent_app_id"] = agent_app_id
     response = client.post(f"{API}/auth/session", json=payload, headers=user_headers)
     assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {response.json()['token']['access_token']}"}
+    return {"Authorization": f"Bearer {unwrap(response)['token']['access_token']}"}
 
 
 def _management_headers(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
     """Exchange a user token for a chat-session token (management APIs need it)."""
     response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
     assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {response.json()['token']['access_token']}"}
+    return {"Authorization": f"Bearer {unwrap(response)['token']['access_token']}"}
 
 
 def test_chat_endpoints_round_trip_via_runtime(
@@ -73,7 +74,7 @@ def test_chat_endpoints_round_trip_via_runtime(
         f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=headers
     )
     assert response.status_code == 200, response.text
-    messages = response.json()["messages"]
+    messages = unwrap(response)["messages"]
     assert messages[-1]["role"] == "assistant"
     assert messages[-1]["content"] == "hello from runtime"
 
@@ -96,8 +97,9 @@ def test_chat_endpoints_round_trip_via_runtime(
     # -- GET /messages: history projection from the checkpoint --------------
     history = client.get(f"{API}/chatbot/messages", headers=headers)
     assert history.status_code == 200, history.text
-    roles = [message["role"] for message in history.json()["messages"]]
-    contents = [message["content"] for message in history.json()["messages"]]
+    history_messages = unwrap(history)["messages"]
+    roles = [message["role"] for message in history_messages]
+    contents = [message["content"] for message in history_messages]
     assert roles.count("user") >= 2
     assert "hello from runtime" in contents
 
@@ -106,25 +108,23 @@ def test_chat_endpoints_round_trip_via_runtime(
     assert cleared.status_code == 200, cleared.text
     empty = client.get(f"{API}/chatbot/messages", headers=headers)
     assert empty.status_code == 200
-    assert empty.json()["messages"] == []
+    assert unwrap(empty)["messages"] == []
 
 
-def test_session_binding_rejects_unpublished_app(
-    client: TestClient, user_headers: dict[str, str]
-) -> None:
+def test_session_binding_rejects_unpublished_app(client: TestClient, user_headers: dict[str, str]) -> None:
     """Binding a session to a draft AgentApp fails; missing ids fail with 404."""
     management = _management_headers(client, user_headers)
     created = client.post(
         f"{API}/agent-apps/apps", json={"name": "draft-app", "system_prompt": "Draft."}, headers=management
     )
     assert created.status_code == 201, created.text
-    draft_id = created.json()["id"]
+    draft_id = unwrap(created, expected_code=201)["id"]
 
     denied = client.post(f"{API}/auth/session", json={"agent_app_id": draft_id}, headers=user_headers)
-    assert denied.status_code == 422
+    assert_error_envelope(denied, code=422, message="Agent app is not published")
 
     missing = client.post(f"{API}/auth/session", json={"agent_app_id": 999999}, headers=user_headers)
-    assert missing.status_code == 404
+    assert_error_envelope(missing, code=404, message="Agent app not found")
 
 
 def test_register_login_session_round_trip(client: TestClient) -> None:
@@ -134,14 +134,14 @@ def test_register_login_session_round_trip(client: TestClient) -> None:
         json={"email": "bob@example.com", "password": "Passw0rd!Strong", "username": "bob"},
     )
     assert registered.status_code == 200, registered.text
-    assert registered.json()["email"] == "bob@example.com"
+    assert unwrap(registered)["email"] == "bob@example.com"
 
-    # Duplicate registration is rejected.
+    # Duplicate registration is rejected with an error envelope.
     duplicate = client.post(
         f"{API}/auth/register",
         json={"email": "bob@example.com", "password": "Passw0rd!Strong", "username": "bob"},
     )
-    assert duplicate.status_code == 400
+    assert_error_envelope(duplicate, code=400, message="Email already registered")
 
     # Login with the real credentials issues a user token.
     login = client.post(
@@ -149,18 +149,18 @@ def test_register_login_session_round_trip(client: TestClient) -> None:
         data={"email": "bob@example.com", "password": "Passw0rd!Strong", "grant_type": "password"},
     )
     assert login.status_code == 200, login.text
-    user_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    user_headers = {"Authorization": f"Bearer {unwrap(login)['access_token']}"}
 
     bad_login = client.post(
         f"{API}/auth/login",
         data={"email": "bob@example.com", "password": "WrongPassword1!", "grant_type": "password"},
     )
-    assert bad_login.status_code == 401
+    assert_error_envelope(bad_login, code=401, message="Incorrect email or password")
 
     # The token authenticates session creation.
     session = client.post(f"{API}/auth/session", json={}, headers=user_headers)
     assert session.status_code == 200, session.text
-    assert session.json()["session_id"]
+    assert unwrap(session)["session_id"]
 
 
 def test_default_agent_app_out_of_the_box(
@@ -182,7 +182,7 @@ def test_default_agent_app_out_of_the_box(
         f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hello default"}]}, headers=headers
     )
     assert response.status_code == 200, response.text
-    assert response.json()["messages"][-1]["content"] == "default app reply"
+    assert unwrap(response)["messages"][-1]["content"] == "default app reply"
 
 
 def test_chat_stream_observes_subagent_task_duration(
@@ -211,7 +211,7 @@ def test_chat_stream_observes_subagent_task_duration(
         headers=management,
     )
     assert created.status_code == 201, created.text
-    app_id = created.json()["id"]
+    app_id = unwrap(created, expected_code=201)["id"]
     assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=management).status_code == 200
     headers = _session_headers(client, user_headers, app_id)
 
@@ -234,7 +234,9 @@ def test_chat_stream_observes_subagent_task_duration(
 
     before = REGISTRY.get_sample_value("subagent_task_duration_seconds_count", {"subagent": "researcher"}) or 0.0
     stream_response = client.post(
-        f"{API}/chatbot/chat/stream", json={"messages": [{"role": "user", "content": "research this"}]}, headers=headers
+        f"{API}/chatbot/chat/stream",
+        json={"messages": [{"role": "user", "content": "research this"}]},
+        headers=headers,
     )
     assert stream_response.status_code == 200, stream_response.text
     events = parse_sse_events(stream_response.text)

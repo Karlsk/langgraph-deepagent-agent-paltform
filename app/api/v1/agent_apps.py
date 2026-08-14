@@ -63,6 +63,7 @@ from app.schemas.agent_apps import (
     SubAgentUpdate,
     ToolCatalogEntry,
 )
+from app.schemas.base import ApiResponse
 from app.services.agents import assembly, skills_store
 from app.services.agents.mcp_manager import (
     build_connection_config,
@@ -358,9 +359,7 @@ async def _probe_server_tool_names(server: McpServerConfig) -> list[str] | None:
     try:
         return await asyncio.wait_for(_load(), timeout=_MCP_PROBE_TIMEOUT_SECONDS)
     except TimeoutError:
-        logger.warning(
-            "mcp_server_tool_probe_timeout", server=server.name, timeout_seconds=_MCP_PROBE_TIMEOUT_SECONDS
-        )
+        logger.warning("mcp_server_tool_probe_timeout", server=server.name, timeout_seconds=_MCP_PROBE_TIMEOUT_SECONDS)
         return None
     except Exception:  # noqa: BLE001 — probe degradation must not block CRUD
         logger.exception("mcp_server_tool_probe_failed", server=server.name)
@@ -372,13 +371,13 @@ async def _probe_server_tool_names(server: McpServerConfig) -> list[str] | None:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/subagents", response_model=list[SubAgentRead])
+@router.get("/subagents", response_model=ApiResponse[list[SubAgentRead]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
 async def list_subagents(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[SubAgentConfig]:
+) -> ApiResponse[Any]:
     """List every stored sub-agent configuration.
 
     Args:
@@ -387,23 +386,23 @@ async def list_subagents(
         current_session: Authenticated chat session.
 
     Returns:
-        All sub-agent rows ordered by name.
+        Envelope carrying all sub-agent rows ordered by name.
     """
     try:
-        return list(db.exec(select(SubAgentConfig).order_by(col(SubAgentConfig.name))).all())
+        return ApiResponse.success(list(db.exec(select(SubAgentConfig).order_by(col(SubAgentConfig.name))).all()))
     except Exception as exc:
         logger.exception("subagent_list_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/subagents", response_model=SubAgentRead, status_code=201)
+@router.post("/subagents", response_model=ApiResponse[SubAgentRead], status_code=201)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
 async def create_subagent(
     request: Request,
     payload: SubAgentCreate,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SubAgentConfig:
+) -> ApiResponse[Any]:
     """Create a reusable sub-agent configuration.
 
     Args:
@@ -413,7 +412,7 @@ async def create_subagent(
         current_session: Authenticated chat session (audit only).
 
     Returns:
-        The persisted sub-agent row.
+        Envelope carrying the persisted sub-agent row.
 
     Raises:
         HTTPException: 422 when the name is already taken.
@@ -439,7 +438,7 @@ async def create_subagent(
         db.commit()
         db.refresh(subagent)
         logger.info("subagent_created", name=payload.name, created_by=subagent.created_by)
-        return subagent
+        return ApiResponse.success(subagent, code=201)
     except HTTPException:
         raise
     except Exception as exc:
@@ -447,14 +446,14 @@ async def create_subagent(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/subagents/{name}", response_model=SubAgentRead)
+@router.get("/subagents/{name}", response_model=ApiResponse[SubAgentRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
 async def get_subagent(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SubAgentConfig:
+) -> ApiResponse[Any]:
     """Fetch one sub-agent configuration by name.
 
     Args:
@@ -464,7 +463,7 @@ async def get_subagent(
         current_session: Authenticated chat session.
 
     Returns:
-        The matching sub-agent row.
+        Envelope carrying the matching sub-agent row.
 
     Raises:
         HTTPException: 404 when the sub-agent does not exist.
@@ -473,7 +472,7 @@ async def get_subagent(
         subagent = db.get(SubAgentConfig, name)
         if subagent is None:
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
-        return subagent
+        return ApiResponse.success(subagent)
     except HTTPException:
         raise
     except Exception as exc:
@@ -481,14 +480,14 @@ async def get_subagent(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.patch("/subagents/{name}", response_model=SubAgentRead)
+@router.patch("/subagents/{name}", response_model=ApiResponse[SubAgentRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
 async def update_subagent(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SubAgentConfig:
+) -> ApiResponse[Any]:
     """Partially update a sub-agent (name is immutable).
 
     Args:
@@ -498,7 +497,7 @@ async def update_subagent(
         current_session: Authenticated chat session.
 
     Returns:
-        The updated sub-agent row with refreshed hash and bumped version.
+        Envelope carrying the updated sub-agent row (refreshed hash, bumped version).
 
     Raises:
         HTTPException: 404 when missing, 422 on name change or empty payload.
@@ -522,7 +521,7 @@ async def update_subagent(
         db.commit()
         db.refresh(subagent)
         logger.info("subagent_updated", name=name, version=subagent.version)
-        return subagent
+        return ApiResponse.success(subagent)
     except HTTPException:
         raise
     except Exception as exc:
@@ -530,14 +529,14 @@ async def update_subagent(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.delete("/subagents/{name}")
+@router.delete("/subagents/{name}", response_model=ApiResponse[None])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
 async def delete_subagent(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> None:
+) -> ApiResponse[None]:
     """Delete a sub-agent configuration.
 
     Args:
@@ -545,6 +544,9 @@ async def delete_subagent(
         name: Sub-agent primary key.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
+
+    Returns:
+        Envelope with a null data payload.
 
     Raises:
         HTTPException: 404 when the sub-agent does not exist.
@@ -556,6 +558,7 @@ async def delete_subagent(
         db.delete(subagent)
         db.commit()
         logger.info("subagent_deleted", name=name)
+        return ApiResponse.success(None)
     except HTTPException:
         raise
     except Exception as exc:
@@ -563,7 +566,7 @@ async def delete_subagent(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/subagents/{name}/test", response_model=SubAgentTestResult)
+@router.post("/subagents/{name}/test", response_model=ApiResponse[SubAgentTestResult])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent_test"][0])
 async def test_subagent(
     request: Request,
@@ -571,7 +574,7 @@ async def test_subagent(
     payload: SubAgentTestRequest,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SubAgentTestResult:
+) -> ApiResponse[SubAgentTestResult]:
     """Run one isolated one-shot test of a sub-agent configuration.
 
     Args:
@@ -582,7 +585,7 @@ async def test_subagent(
         current_session: Authenticated chat session.
 
     Returns:
-        The test run result (final message, turns, duration, model).
+        Envelope carrying the test run result (final message, turns, duration, model).
 
     Raises:
         HTTPException: 404 when the sub-agent does not exist, 500 on run failure.
@@ -591,7 +594,7 @@ async def test_subagent(
         if db.get(SubAgentConfig, name) is None:
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
         logger.info("subagent_test_requested", name=name, user_id=current_session.user_id)
-        return await run_subagent_once(session=db, name=name, prompt=payload.prompt)
+        return ApiResponse.success(await run_subagent_once(session=db, name=name, prompt=payload.prompt))
     except HTTPException:
         raise
     except ValueError as exc:
@@ -606,13 +609,13 @@ async def test_subagent(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/skills", response_model=list[SkillRead])
+@router.get("/skills", response_model=ApiResponse[list[SkillRead]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def list_skills(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[dict[str, Any]]:
+) -> ApiResponse[Any]:
     """List metadata of every global skill.
 
     Args:
@@ -621,23 +624,24 @@ async def list_skills(
         current_session: Authenticated chat session.
 
     Returns:
-        Skill metadata rows (name/description/content_hash/version/created_by).
+        Envelope carrying skill metadata rows
+        (name/description/content_hash/version/created_by).
     """
     try:
-        return await skills_store.list_global(db)
+        return ApiResponse.success(await skills_store.list_global(db))
     except Exception as exc:
         logger.exception("skill_list_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/skills", response_model=SkillRead, status_code=201)
+@router.post("/skills", response_model=ApiResponse[SkillRead], status_code=201)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def create_skill(
     request: Request,
     payload: SkillCreate,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SkillAsset:
+) -> ApiResponse[Any]:
     """Create a global skill from direct input (atomic file write + DB row).
 
     Args:
@@ -647,19 +651,20 @@ async def create_skill(
         current_session: Authenticated chat session (audit only).
 
     Returns:
-        The persisted skill asset row.
+        Envelope carrying the persisted skill asset row.
 
     Raises:
         HTTPException: 422 when the name is invalid or already taken.
     """
     try:
-        return await skills_store.create_global(
+        created = await skills_store.create_global(
             db,
             name=payload.name,
             description=payload.description,
             body=payload.body,
             created_by=_creator(current_session),
         )
+        return ApiResponse.success(created, code=201)
     except ValueError as exc:
         logger.warning("skill_create_rejected", name=payload.name, error=str(exc))
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -668,13 +673,13 @@ async def create_skill(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/skills/generate", response_model=SkillGenerateResponse)
+@router.post("/skills/generate", response_model=ApiResponse[SkillGenerateResponse])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill_generate"][0])
 async def generate_skill(
     request: Request,
     payload: SkillGenerateRequest,
     current_session: ChatSession = Depends(get_current_session),
-) -> SkillGenerateResponse:
+) -> ApiResponse[SkillGenerateResponse]:
     """Generate a SKILL.md draft via the LLM (draft only, nothing persisted).
 
     Args:
@@ -683,7 +688,7 @@ async def generate_skill(
         current_session: Authenticated chat session.
 
     Returns:
-        The generated draft content.
+        Envelope carrying the generated draft content.
 
     Raises:
         HTTPException: 500 when the LLM fails after retries.
@@ -691,20 +696,20 @@ async def generate_skill(
     try:
         logger.info("skill_generate_requested", user_id=current_session.user_id)
         draft = await skills_store.generate_skill_draft(description=payload.description, hint=payload.hint)
-        return SkillGenerateResponse(draft=draft)
+        return ApiResponse.success(SkillGenerateResponse(draft=draft))
     except Exception as exc:
         logger.exception("skill_generate_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/skills/{name}", response_model=SkillRead)
+@router.get("/skills/{name}", response_model=ApiResponse[SkillRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def get_skill(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SkillAsset:
+) -> ApiResponse[Any]:
     """Fetch one skill asset's metadata by name.
 
     Args:
@@ -714,7 +719,7 @@ async def get_skill(
         current_session: Authenticated chat session.
 
     Returns:
-        The matching skill asset row.
+        Envelope carrying the matching skill asset row.
 
     Raises:
         HTTPException: 404 when the skill does not exist.
@@ -723,7 +728,7 @@ async def get_skill(
         asset = db.get(SkillAsset, name)
         if asset is None:
             raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
-        return asset
+        return ApiResponse.success(asset)
     except HTTPException:
         raise
     except Exception as exc:
@@ -731,13 +736,13 @@ async def get_skill(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/skills/{name}/content", response_model=SkillContentRead)
+@router.get("/skills/{name}/content", response_model=ApiResponse[SkillContentRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def get_skill_content(
     request: Request,
     name: str,
     current_session: ChatSession = Depends(get_current_session),
-) -> dict[str, str]:
+) -> ApiResponse[Any]:
     """Fetch the raw SKILL.md body of a global skill by name.
 
     Args:
@@ -746,7 +751,7 @@ async def get_skill_content(
         current_session: Authenticated chat session.
 
     Returns:
-        The skill name and its full SKILL.md content.
+        Envelope carrying the skill name and its full SKILL.md content.
 
     Raises:
         HTTPException: 404 when the skill does not exist.
@@ -758,17 +763,17 @@ async def get_skill_content(
     except Exception as exc:
         logger.exception("skill_content_read_failed", name=name)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"name": name, "content": content}
+    return ApiResponse.success({"name": name, "content": content})
 
 
-@router.patch("/skills/{name}", response_model=SkillRead)
+@router.patch("/skills/{name}", response_model=ApiResponse[SkillRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def update_skill(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> SkillAsset:
+) -> ApiResponse[Any]:
     """Partially update a skill (name is immutable).
 
     Args:
@@ -778,7 +783,8 @@ async def update_skill(
         current_session: Authenticated chat session.
 
     Returns:
-        The updated skill asset row with refreshed hash and bumped version.
+        Envelope carrying the updated skill asset row with refreshed hash
+        and bumped version.
 
     Raises:
         HTTPException: 404 when missing, 422 on name change or empty payload.
@@ -791,7 +797,8 @@ async def update_skill(
         if payload.description is None and payload.body is None:
             raise HTTPException(status_code=422, detail="nothing to update: provide description and/or body")
 
-        return await skills_store.update_global(db, name=name, description=payload.description, body=payload.body)
+        updated = await skills_store.update_global(db, name=name, description=payload.description, body=payload.body)
+        return ApiResponse.success(updated)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -802,14 +809,14 @@ async def update_skill(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.delete("/skills/{name}")
+@router.delete("/skills/{name}", response_model=ApiResponse[None])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def delete_skill(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> None:
+) -> ApiResponse[None]:
     """Delete a global skill (cascades to per-user copies).
 
     Args:
@@ -817,6 +824,9 @@ async def delete_skill(
         name: Skill primary key.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
+
+    Returns:
+        Envelope with null data on successful deletion.
 
     Raises:
         HTTPException: 404 when the skill does not exist.
@@ -826,6 +836,7 @@ async def delete_skill(
             raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
         await skills_store.delete_global(db, name=name)
         logger.info("skill_deleted", name=name)
+        return ApiResponse.success(None)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -840,13 +851,13 @@ async def delete_skill(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/apps", response_model=list[AgentAppRead])
+@router.get("/apps", response_model=ApiResponse[list[AgentAppRead]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def list_agent_apps(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[AgentApp]:
+) -> ApiResponse[Any]:
     """List every stored agent application.
 
     Args:
@@ -855,23 +866,23 @@ async def list_agent_apps(
         current_session: Authenticated chat session.
 
     Returns:
-        All agent app rows ordered by id.
+        Envelope carrying all agent app rows ordered by id.
     """
     try:
-        return list(db.exec(select(AgentApp).order_by(col(AgentApp.id))).all())
+        return ApiResponse.success(list(db.exec(select(AgentApp).order_by(col(AgentApp.id))).all()))
     except Exception as exc:
         logger.exception("agent_app_list_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/apps", response_model=AgentAppRead, status_code=201)
+@router.post("/apps", response_model=ApiResponse[AgentAppRead], status_code=201)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def create_agent_app(
     request: Request,
     payload: AgentAppCreate,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> AgentApp:
+) -> ApiResponse[Any]:
     """Create a draft agent application.
 
     Args:
@@ -881,7 +892,8 @@ async def create_agent_app(
         current_session: Authenticated chat session (audit only).
 
     Returns:
-        The persisted agent app row (status=draft, engine=deepagents).
+        Envelope carrying the persisted agent app row
+        (status=draft, engine=deepagents).
 
     Raises:
         HTTPException: 422 when the name is already taken.
@@ -906,7 +918,7 @@ async def create_agent_app(
         db.commit()
         db.refresh(app_cfg)
         logger.info("agent_app_created", app_id=app_cfg.id, name=payload.name)
-        return app_cfg
+        return ApiResponse.success(app_cfg, code=201)
     except HTTPException:
         raise
     except Exception as exc:
@@ -914,13 +926,13 @@ async def create_agent_app(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/apps/published", response_model=list[AgentAppRead])
+@router.get("/apps/published", response_model=ApiResponse[list[AgentAppRead]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def list_published_agent_apps(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[AgentApp]:
+) -> ApiResponse[Any]:
     """List published agent applications (assistant picker for chat).
 
     Registered before ``/apps/{app_id}`` so the literal path wins routing.
@@ -931,24 +943,24 @@ async def list_published_agent_apps(
         current_session: Authenticated chat session.
 
     Returns:
-        All agent app rows with status=published ordered by id.
+        Envelope carrying all agent app rows with status=published ordered by id.
     """
     try:
         statement = select(AgentApp).where(col(AgentApp.status) == "published").order_by(col(AgentApp.id))
-        return list(db.exec(statement).all())
+        return ApiResponse.success(list(db.exec(statement).all()))
     except Exception as exc:
         logger.exception("agent_app_published_list_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/apps/{app_id}", response_model=AgentAppRead)
+@router.get("/apps/{app_id}", response_model=ApiResponse[AgentAppRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def get_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> AgentApp:
+) -> ApiResponse[Any]:
     """Fetch one agent application by id.
 
     Args:
@@ -958,7 +970,7 @@ async def get_agent_app(
         current_session: Authenticated chat session.
 
     Returns:
-        The matching agent app row.
+        Envelope carrying the matching agent app row.
 
     Raises:
         HTTPException: 404 when the agent app does not exist.
@@ -967,7 +979,7 @@ async def get_agent_app(
         app_cfg = db.get(AgentApp, app_id)
         if app_cfg is None:
             raise HTTPException(status_code=404, detail=f"agent app '{app_id}' not found")
-        return app_cfg
+        return ApiResponse.success(app_cfg)
     except HTTPException:
         raise
     except Exception as exc:
@@ -975,14 +987,14 @@ async def get_agent_app(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.patch("/apps/{app_id}", response_model=AgentAppRead)
+@router.patch("/apps/{app_id}", response_model=ApiResponse[AgentAppRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def update_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> AgentApp:
+) -> ApiResponse[Any]:
     """Partially update an agent app (name is immutable; lists replace wholesale).
 
     Args:
@@ -992,7 +1004,7 @@ async def update_agent_app(
         current_session: Authenticated chat session.
 
     Returns:
-        The updated agent app row with bumped version.
+        Envelope carrying the updated agent app row with bumped version.
 
     Raises:
         HTTPException: 404 when missing, 422 on name change or empty payload.
@@ -1027,7 +1039,7 @@ async def update_agent_app(
         db.commit()
         db.refresh(app_cfg)
         logger.info("agent_app_updated", app_id=app_id, version=app_cfg.version)
-        return app_cfg
+        return ApiResponse.success(app_cfg)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1035,14 +1047,14 @@ async def update_agent_app(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.delete("/apps/{app_id}")
+@router.delete("/apps/{app_id}", response_model=ApiResponse[None])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def delete_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> None:
+) -> ApiResponse[None]:
     """Delete an agent application.
 
     Args:
@@ -1050,6 +1062,9 @@ async def delete_agent_app(
         app_id: Agent app primary key.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
+
+    Returns:
+        Envelope with null data on successful deletion.
 
     Raises:
         HTTPException: 404 when the agent app does not exist.
@@ -1067,6 +1082,7 @@ async def delete_agent_app(
         db.delete(app_cfg)
         db.commit()
         logger.info("agent_app_deleted", app_id=app_id)
+        return ApiResponse.success(None)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1074,14 +1090,14 @@ async def delete_agent_app(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/apps/{app_id}/publish", response_model=AgentAppRead)
+@router.post("/apps/{app_id}/publish", response_model=ApiResponse[AgentAppRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
 async def publish_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> AgentApp:
+) -> ApiResponse[Any]:
     """Publish an agent app after referential + tool-whitelist validation.
 
     Validation order: skill/subagent reference existence (422) ->
@@ -1096,7 +1112,7 @@ async def publish_agent_app(
         current_session: Authenticated chat session.
 
     Returns:
-        The published agent app row.
+        Envelope carrying the published agent app row.
 
     Raises:
         HTTPException: 404 when missing, 422 on dangling references or
@@ -1144,7 +1160,7 @@ async def publish_agent_app(
         db.commit()
         db.refresh(app_cfg)
         logger.info("agent_app_published", app_id=app_id, version=app_cfg.version)
-        return app_cfg
+        return ApiResponse.success(app_cfg)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1157,13 +1173,13 @@ async def publish_agent_app(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/mcp-servers", response_model=list[McpServerRead])
+@router.get("/mcp-servers", response_model=ApiResponse[list[McpServerRead]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
 async def list_mcp_servers(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[McpServerConfig]:
+) -> ApiResponse[Any]:
     """List every stored MCP server configuration.
 
     Args:
@@ -1172,23 +1188,23 @@ async def list_mcp_servers(
         current_session: Authenticated chat session.
 
     Returns:
-        All MCP server rows ordered by name.
+        Envelope carrying all MCP server rows ordered by name.
     """
     try:
-        return list(db.exec(select(McpServerConfig).order_by(col(McpServerConfig.name))).all())
+        return ApiResponse.success(list(db.exec(select(McpServerConfig).order_by(col(McpServerConfig.name))).all()))
     except Exception as exc:
         logger.exception("mcp_server_list_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/mcp-servers", response_model=McpServerRead, status_code=201)
+@router.post("/mcp-servers", response_model=ApiResponse[McpServerRead], status_code=201)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
 async def create_mcp_server(
     request: Request,
     payload: McpServerCreate,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> McpServerConfig:
+) -> ApiResponse[Any]:
     """Register an MCP server with fail-fast tool-name collision validation.
 
     Args:
@@ -1198,7 +1214,7 @@ async def create_mcp_server(
         current_session: Authenticated chat session (audit only).
 
     Returns:
-        The persisted MCP server row.
+        Envelope carrying the persisted MCP server row.
 
     Raises:
         HTTPException: 422 on name conflict, plaintext secrets or tool
@@ -1241,7 +1257,7 @@ async def create_mcp_server(
         db.refresh(server)
         await shutdown_mcp_clients()
         logger.info("mcp_server_created", name=payload.name)
-        return server
+        return ApiResponse.success(server, code=201)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1249,14 +1265,14 @@ async def create_mcp_server(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/mcp-servers/{name}", response_model=McpServerRead)
+@router.get("/mcp-servers/{name}", response_model=ApiResponse[McpServerRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
 async def get_mcp_server(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> McpServerConfig:
+) -> ApiResponse[Any]:
     """Fetch one MCP server configuration by name.
 
     Args:
@@ -1266,7 +1282,7 @@ async def get_mcp_server(
         current_session: Authenticated chat session.
 
     Returns:
-        The matching MCP server row.
+        Envelope carrying the matching MCP server row.
 
     Raises:
         HTTPException: 404 when the MCP server does not exist.
@@ -1275,7 +1291,7 @@ async def get_mcp_server(
         server = db.get(McpServerConfig, name)
         if server is None:
             raise HTTPException(status_code=404, detail=f"mcp server '{name}' not found")
-        return server
+        return ApiResponse.success(server)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1283,14 +1299,14 @@ async def get_mcp_server(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.patch("/mcp-servers/{name}", response_model=McpServerRead)
+@router.patch("/mcp-servers/{name}", response_model=ApiResponse[McpServerRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
 async def update_mcp_server(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> McpServerConfig:
+) -> ApiResponse[Any]:
     """Partially update an MCP server (name is immutable).
 
     An explicit transport switch rebuilds command/url from the payload alone;
@@ -1305,7 +1321,7 @@ async def update_mcp_server(
         current_session: Authenticated chat session.
 
     Returns:
-        The updated MCP server row with refreshed hash.
+        Envelope carrying the updated MCP server row with refreshed hash.
 
     Raises:
         HTTPException: 404 when missing, 422 on name change, invalid merged
@@ -1337,9 +1353,7 @@ async def update_mcp_server(
         merged_description = payload.description if payload.description is not None else server.description
 
         _validate_transport_pairing(merged_transport, merged_command, merged_url)
-        if merged_transport == "stdio" and (
-            payload.command is not None or payload.args is not None or switching
-        ):
+        if merged_transport == "stdio" and (payload.command is not None or payload.args is not None or switching):
             _validate_stdio_command(merged_command or "", merged_args, name)
         _ensure_placeholder_secrets(merged_env, section="env", server_name=name)
         _ensure_placeholder_secrets(merged_headers, section="headers", server_name=name)
@@ -1382,7 +1396,7 @@ async def update_mcp_server(
         db.refresh(server)
         await shutdown_mcp_clients()
         logger.info("mcp_server_updated", name=name, transport=merged_transport)
-        return server
+        return ApiResponse.success(server)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1390,14 +1404,14 @@ async def update_mcp_server(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.delete("/mcp-servers/{name}")
+@router.delete("/mcp-servers/{name}", response_model=ApiResponse[None])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
 async def delete_mcp_server(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> None:
+) -> ApiResponse[None]:
     """Delete an MCP server and invalidate the MCP client cache.
 
     Args:
@@ -1405,6 +1419,9 @@ async def delete_mcp_server(
         name: MCP server primary key.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
+
+    Returns:
+        Envelope with null data on successful deletion.
 
     Raises:
         HTTPException: 404 when the MCP server does not exist.
@@ -1417,6 +1434,7 @@ async def delete_mcp_server(
         db.commit()
         await shutdown_mcp_clients()
         logger.info("mcp_server_deleted", name=name)
+        return ApiResponse.success(None)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1429,13 +1447,13 @@ async def delete_mcp_server(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/llm-configs", response_model=list[LlmConfigRead])
+@router.get("/llm-configs", response_model=ApiResponse[list[LlmConfigRead]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["llm_config"][0])
 async def list_llm_configs(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[dict[str, Any]]:
+) -> ApiResponse[list[dict[str, Any]]]:
     """List every stored LLM configuration (api_key always masked).
 
     Args:
@@ -1444,24 +1462,24 @@ async def list_llm_configs(
         current_session: Authenticated chat session.
 
     Returns:
-        All LLM config rows (masked projections) ordered by name.
+        Envelope carrying all LLM config rows (masked projections) ordered by name.
     """
     try:
         rows = db.exec(select(LlmConfig).order_by(col(LlmConfig.name))).all()
-        return [_llm_config_read(row) for row in rows]
+        return ApiResponse.success([_llm_config_read(row) for row in rows])
     except Exception as exc:
         logger.exception("llm_config_list_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/llm-configs", response_model=LlmConfigRead, status_code=201)
+@router.post("/llm-configs", response_model=ApiResponse[LlmConfigRead], status_code=201)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["llm_config"][0])
 async def create_llm_config(
     request: Request,
     payload: LlmConfigCreate,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> dict[str, Any]:
+) -> ApiResponse[dict[str, Any]]:
     """Create an LLM configuration referenced by agent asset ``model`` fields.
 
     Args:
@@ -1471,7 +1489,7 @@ async def create_llm_config(
         current_session: Authenticated chat session (audit only).
 
     Returns:
-        The persisted LLM config row (masked projection).
+        Envelope carrying the persisted LLM config row (masked projection).
 
     Raises:
         HTTPException: 422 when the name is already taken (pre-check or a
@@ -1506,7 +1524,7 @@ async def create_llm_config(
             raise HTTPException(status_code=422, detail=f"llm config '{payload.name}' already exists") from exc
         db.refresh(config)
         logger.info("llm_config_created", name=payload.name, created_by=config.created_by)
-        return _llm_config_read(config)
+        return ApiResponse.success(_llm_config_read(config), code=201)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1514,14 +1532,14 @@ async def create_llm_config(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/llm-configs/{name}", response_model=LlmConfigRead)
+@router.get("/llm-configs/{name}", response_model=ApiResponse[LlmConfigRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["llm_config"][0])
 async def get_llm_config(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> dict[str, Any]:
+) -> ApiResponse[dict[str, Any]]:
     """Fetch one LLM configuration by name (api_key always masked).
 
     Args:
@@ -1531,7 +1549,7 @@ async def get_llm_config(
         current_session: Authenticated chat session.
 
     Returns:
-        The matching LLM config row (masked projection).
+        Envelope carrying the matching LLM config row (masked projection).
 
     Raises:
         HTTPException: 404 when the LLM config does not exist.
@@ -1540,7 +1558,7 @@ async def get_llm_config(
         config = db.get(LlmConfig, name)
         if config is None:
             raise HTTPException(status_code=404, detail=f"llm config '{name}' not found")
-        return _llm_config_read(config)
+        return ApiResponse.success(_llm_config_read(config))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1548,14 +1566,14 @@ async def get_llm_config(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.patch("/llm-configs/{name}", response_model=LlmConfigRead)
+@router.patch("/llm-configs/{name}", response_model=ApiResponse[LlmConfigRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["llm_config"][0])
 async def update_llm_config(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> dict[str, Any]:
+) -> ApiResponse[dict[str, Any]]:
     """Partially update an LLM config (name is immutable).
 
     Omitting ``api_key`` keeps the stored key unchanged. Content edits only
@@ -1568,7 +1586,8 @@ async def update_llm_config(
         current_session: Authenticated chat session.
 
     Returns:
-        The updated LLM config row (masked projection) with refreshed hash.
+        Envelope carrying the updated LLM config row (masked projection)
+        with refreshed hash.
 
     Raises:
         HTTPException: 404 when missing, 422 on name change, empty payload
@@ -1602,7 +1621,7 @@ async def update_llm_config(
         db.commit()
         db.refresh(config)
         logger.info("llm_config_updated", name=name)
-        return _llm_config_read(config)
+        return ApiResponse.success(_llm_config_read(config))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1610,14 +1629,14 @@ async def update_llm_config(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.delete("/llm-configs/{name}")
+@router.delete("/llm-configs/{name}", response_model=ApiResponse[None])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["llm_config"][0])
 async def delete_llm_config(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> None:
+) -> ApiResponse[None]:
     """Delete an LLM configuration.
 
     Guards: the bootstrap-seeded ``default`` config is undeletable, and any
@@ -1629,6 +1648,9 @@ async def delete_llm_config(
         name: LLM config primary key.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
+
+    Returns:
+        Envelope with null data on successful deletion.
 
     Raises:
         HTTPException: 404 when missing, 422 when protected or referenced.
@@ -1657,6 +1679,7 @@ async def delete_llm_config(
         db.delete(config)
         db.commit()
         logger.info("llm_config_deleted", name=name)
+        return ApiResponse.success(None)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1669,13 +1692,13 @@ async def delete_llm_config(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/tools/catalog", response_model=list[ToolCatalogEntry])
+@router.get("/tools/catalog", response_model=ApiResponse[list[ToolCatalogEntry]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["tools_catalog"][0])
 async def get_tool_catalog(
     request: Request,
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
-) -> list[dict[str, Any]]:
+) -> ApiResponse[list[dict[str, Any]]]:
     """Expose the merged tool catalog (builtin + MCP with server attribution).
 
     Args:
@@ -1684,11 +1707,12 @@ async def get_tool_catalog(
         current_session: Authenticated chat session.
 
     Returns:
-        Catalog entries with source labels for form checkbox rendering.
+        Envelope carrying catalog entries with source labels for form
+        checkbox rendering.
     """
     try:
         entries = await build_tool_catalog(db)
-        return [dict(entry) for entry in entries]
+        return ApiResponse.success([dict(entry) for entry in entries])
     except Exception as exc:
         logger.exception("tool_catalog_read_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -16,6 +16,30 @@ from app.workflow.utils import convert_state_to_dict, map_output_to_state
 load_dotenv()
 
 
+def unwrap(response: Any, *, expected_code: int | None = None) -> Any:
+    """Unwrap the ApiResponse envelope of an httpx/TestClient response.
+
+    Asserts the body is a well-formed envelope (``code``/``message``/``data``
+    all present) and returns its ``data`` payload, so tests keep reading the
+    endpoint's original projection. ``expected_code`` optionally pins the
+    envelope code (which mirrors the HTTP status by design).
+
+    Args:
+        response: A TestClient/httpx response whose body is an ApiResponse.
+        expected_code: When given, the envelope ``code`` must equal it.
+
+    Returns:
+        The envelope's ``data`` field (None for DELETE/void endpoints).
+    """
+    body = response.json()
+    assert isinstance(body, dict), f"envelope must be a JSON object, got: {body!r}"
+    for key in ("code", "message", "data"):
+        assert key in body, f"envelope missing '{key}' key: {body!r}"
+    if expected_code is not None:
+        assert body["code"] == expected_code, f"envelope code {body['code']} != {expected_code}"
+    return body["data"]
+
+
 class EchoNode(BaseNode):
     """Shared test-only node: merges config['output'] into state (zero network, zero LLM; AD-08)."""
 

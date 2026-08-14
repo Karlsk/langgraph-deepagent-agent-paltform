@@ -88,7 +88,7 @@ agent-web/
     ├── types/
     │   └── index.ts       # 集中存放的共享类型定义
     ├── utils/
-    │   └── request.ts     # 统一 axios 实例（baseURL /api/v1 + 拦截器）
+    │   └── request.ts     # 统一 axios 实例（baseURL /api/v1 + 信封解包拦截器 + get/post/put/del）
     └── views/             # 页面级组件，按业务域分目录，一域一文件
         ├── agent/AgentList.vue      # /agent  Agent 管理（占位）
         ├── chat/ChatView.vue        # /chat   对话（占位）
@@ -260,10 +260,20 @@ make web-dev
 - **组件命名**：页面组件以业务域命名（列表页 `XxxList.vue`，视图页 `XxxView.vue`），
   存放于 `src/views/<业务域>/`。
 - **类型**：共享类型集中在 `src/types/`；组件私有类型就近定义。所有函数签名带类型标注。
-- **HTTP 请求**：统一使用 `src/utils/request.ts` 导出的 axios 实例，**禁止**在组件内
-  `new` 独立 axios 实例或直接 `fetch`。该实例已配置 `baseURL: '/api/v1'`、超时 15s、
-  响应拦截统一 `ElMessage.error` 报错；token 注入与 401 处理留有 TODO 占位，
-  待认证体系接入后补齐。
+  `ApiResponse<T>`（后端统一响应信封 `{ code, message, data }`）即定义于此。
+- **HTTP 请求**：统一使用 `src/utils/request.ts` 导出的 axios 实例与泛型方法，**禁止**在组件内
+  `new` 独立 axios 实例或直接 `fetch`。该实例已配置 `baseURL: '/api/v1'`、超时 15s，
+  响应拦截器按后端统一响应信封 `{code, message, data}`（code 数值与 HTTP status 一致）解包：
+    信封判定要求**三字段齐全**（`code` 为 number、`message` 为 string 且 `data` 键存在，值可为
+    `null`），避免将形状碰撞的裸响应（如 `{code, message}` 无 `data` 键）误判解包出 `undefined`；
+  - **成功**：code 为 2xx（含创建类端点的 `code=201`）时自动解包返回 `data`，
+    判断逻辑为 `code >= 200 && code < 300`，不得写死仅 200；
+  - **非 2xx**：`ElMessage.error(message)` 提示后 reject；
+  - **错误分支**（HTTP 异常/网络错误）：兼容新信封形态（取 `message`）与旧 FastAPI
+    `{ detail }` 形态的回退过渡；
+  - **豁免端点**（`/health`、SSE 流等裸响应）：非信封响应原样透传；
+  - 另导出泛型方法 `get/post/put/del`，返回值即解包后的 `data`（DELETE 的 `data` 为
+    `null`，建议以 `void` 承接）。token 注入与 401 处理留有 TODO 占位，待认证体系接入后补齐。
 - **别名**：源码内引用一律用 `@/` 别名（vite alias 与 tsconfig `paths` 双重配置），
   不用相对路径跨层级。
 - **语言**：UI 文案使用中文；代码标识符使用英文。

@@ -23,6 +23,7 @@ from app.core.limiter import limiter
 from app.core.logging import logger
 from app.core.metrics import llm_stream_duration_seconds
 from app.models.session import Session
+from app.schemas.base import ApiResponse
 from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
@@ -52,13 +53,13 @@ def _resolve_stream_model(runtime_obj: object) -> str:
     return str(resolved) if resolved else settings.DEFAULT_LLM_MODEL
 
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post("/chat", response_model=ApiResponse[ChatResponse])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat"][0])
 async def chat(
     request: Request,
     chat_request: ChatRequest,
     session: Session = Depends(get_current_session),
-):
+) -> ApiResponse[ChatResponse]:
     """Process a chat request through the session's AgentApp runtime.
 
     Args:
@@ -67,7 +68,7 @@ async def chat(
         session: The current session from the auth token.
 
     Returns:
-        ChatResponse: The processed chat response.
+        ApiResponse[ChatResponse]: Envelope carrying the processed chat response.
 
     Raises:
         HTTPException: If there's an error processing the request.
@@ -91,7 +92,7 @@ async def chat(
 
         logger.info("chat_request_processed", session_id=session.id)
 
-        return ChatResponse(messages=result)
+        return ApiResponse.success(ChatResponse(messages=result))
     except Exception as e:
         logger.exception("chat_request_failed", session_id=session.id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -174,12 +175,12 @@ async def chat_stream(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/messages", response_model=ChatResponse)
+@router.get("/messages", response_model=ApiResponse[ChatResponse])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
 async def get_session_messages(
     request: Request,
     session: Session = Depends(get_current_session),
-):
+) -> ApiResponse[ChatResponse]:
     """Get all messages for a session.
 
     Args:
@@ -187,7 +188,7 @@ async def get_session_messages(
         session: The current session from the auth token.
 
     Returns:
-        ChatResponse: All messages in the session.
+        ApiResponse[ChatResponse]: Envelope carrying all messages in the session.
 
     Raises:
         HTTPException: If there's an error retrieving the messages.
@@ -196,18 +197,18 @@ async def get_session_messages(
         with DBSession(database_service.engine) as db_session:
             runtime_obj = await get_runtime(db_session, session.agent_app_id)
         messages = await runtime_obj.get_chat_history(session.id)
-        return ChatResponse(messages=messages)
+        return ApiResponse.success(ChatResponse(messages=messages))
     except Exception as e:
         logger.exception("get_messages_failed", session_id=session.id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/messages")
+@router.delete("/messages", response_model=ApiResponse[None])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
 async def clear_chat_history(
     request: Request,
     session: Session = Depends(get_current_session),
-):
+) -> ApiResponse[None]:
     """Clear all messages for a session.
 
     Args:
@@ -215,13 +216,13 @@ async def clear_chat_history(
         session: The current session from the auth token.
 
     Returns:
-        dict: A message indicating the chat history was cleared.
+        ApiResponse[None]: Envelope whose message reports the clear outcome.
     """
     try:
         with DBSession(database_service.engine) as db_session:
             runtime_obj = await get_runtime(db_session, session.agent_app_id)
         await runtime_obj.clear_chat_history(session.id)
-        return {"message": "Chat history cleared successfully"}
+        return ApiResponse.success(None, message="Chat history cleared successfully")
     except Exception as e:
         logger.exception("clear_chat_history_failed", session_id=session.id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))

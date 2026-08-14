@@ -25,6 +25,14 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
   - `POST /auth/session` 用用户 token 换取**会话 token**；
   - `/agent-apps/*` 与 `/chatbot/*` 全部端点都依赖 `get_current_session`，**必须使用会话 token**。
   第 2 节会给出切换 `$TOKEN` 的明确步骤。
+- **统一响应信封**：除豁免端点外，所有端点返回 `{code, message, data}` 信封——`code` 数值与
+  HTTP status 完全一致（资产创建端点 HTTP 201 且 `code=201`；`POST /auth/register`
+  为 HTTP 200 且 `code=200`；DELETE 成功 `data=null`）。
+  422 分两种形态：**请求体校验失败**为 `{code:422, message:"Validation error", data:[错误列表]}`；
+  **业务规则拒绝**（如重名、immutable name）为 `{code:422, message:"<错误文案>", data:null}`。
+  其余错误信封为 `{code:<状态码>, message:"<错误文案>", data:null}`。
+  **豁免端点（仍返回裸响应）**：`GET /`、`GET /health`、`GET /api/v1/health`、
+  `POST /chatbot/chat/stream`（SSE）。本文所有取值命令均按信封路径提取（如 `["data"]["token"]["access_token"]`）。
 - 标注 **⚠️ 需外部资源 / 会消耗 token** 的步骤需要真实 LLM API Key（或真实 MCP server 进程）。
 
 ---
@@ -331,13 +339,13 @@ curl -s -X POST "$BASE/auth/register" \
   -d "{\"email\": \"$EMAIL\", \"password\": \"$PASSWORD\", \"username\": \"manual-tester\"}"
 ```
 
-**预期**：返回 `UserResponse`：`id`（整数）、`email`、`username`、`token.access_token`、
-`token.token_type="bearer"`、`token.expires_at`。
+**预期**：HTTP 200 且 `code=200`，`data` 为 `UserResponse`：`data.id`（整数）、`data.email`、
+`data.username`、`data.token.access_token`、`data.token.token_type="bearer"`、`data.token.expires_at`。
 
 **失败排查**：
-- 422：密码不满足强度（>=8 位、大小写、数字、特殊字符各至少一个）或 email 格式非法；
-- 400 `Email already registered`：换一个 email 或先清库；
-- 429：`register` 默认限流 10 次/小时。
+- 422（信封 `message="Validation error"`，`data` 为错误列表）：密码不满足强度（>=8 位、大小写、数字、特殊字符各至少一个）或 email 格式非法；
+- 400，信封 `message` 为 `Email already registered`：换一个 email 或先清库；
+- 429，信封 `message="Rate limit exceeded"`：`register` 默认限流 10 次/小时。
 
 ### 2.2 登录取 token
 
@@ -350,14 +358,14 @@ curl -s -X POST "$BASE/auth/login" \
   -d "grant_type=password"
 ```
 
-**预期**：返回 `TokenResponse`：`access_token`、`token_type="bearer"`、`expires_at`。
+**预期**：信封 `data` 为 `TokenResponse`：`data.access_token`、`data.token_type="bearer"`、`data.expires_at`。
 
-**失败排查**：401 邮箱或密码错误；400 `grant_type` 不是 `password`。
+**失败排查**：401（信封 `message` 提示邮箱或密码错误）；400（`grant_type` 不是 `password`）。
 
 ```bash
 # 将登录 token 记为用户 token
 export USER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
-  -d "email=$EMAIL" -d "password=$PASSWORD" -d "grant_type=password" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+  -d "email=$EMAIL" -d "password=$PASSWORD" -d "grant_type=password" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["access_token"])')
 ```
 
 ### 2.3 创建会话并切换到会话 token
@@ -369,17 +377,17 @@ AgentApp（body 可省略），第 7 节再创建绑定会话。
 export SESSION_RESP=$(curl -s -X POST "$BASE/auth/session" \
   -H "Authorization: Bearer $USER_TOKEN")
 echo "$SESSION_RESP"
-export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"]["access_token"])')
+export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
 ```
 
-**预期**：返回 `session_id`、`name`、`token.access_token`。
+**预期**：信封 `data` 含 `data.session_id`、`data.name`、`data.token.access_token`。
 
 **约定**：**从此处起，全文 `$TOKEN` 一律指会话 token**，所有受保护请求都带
 `-H "Authorization: Bearer $TOKEN"`。
 
 **失败排查**：
-- 401：`$USER_TOKEN` 无效或过期；
-- 422 `Agent app is not published` / 404 `Agent app not found`：只有传了 `agent_app_id` 时才会出现
+- 401 信封：`$USER_TOKEN` 无效或过期；
+- 422 信封（`message` 为 `Agent app is not published`）/ 404 信封（`message` 为 `Agent app not found`）：只有传了 `agent_app_id` 时才会出现
   （分别对应目标应用未发布 / 不存在）。
 
 ---
@@ -402,10 +410,10 @@ curl -s -X POST "$BASE/agent-apps/skills" \
   }'
 ```
 
-**预期**：201，返回 `SkillRead`：`name`、`description`、`content_hash`（非空 sha256）、
-`version=1`、`created_by`（你的 username）。
+**预期**：HTTP 201 且 `code=201`，`data` 为 `SkillRead`：`data.name`、`data.description`、
+`data.content_hash`（非空 sha256）、`data.version=1`、`data.created_by`（你的 username）。
 
-**失败排查**：422 `name` 非法或重名；422 `body` 为空。
+**失败排查**：422（信封 `data` 为错误列表）：`name` 非法或重名；`body` 为空。
 
 ### 3.2 列表与详情
 
@@ -414,7 +422,8 @@ curl -s "$BASE/agent-apps/skills" -H "Authorization: Bearer $TOKEN"
 curl -s "$BASE/agent-apps/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：列表为元数据数组（不含正文）；详情同 `SkillRead`。不存在时 404 `skill '<name>' not found`。
+**预期**：列表信封 `data` 为元数据数组（不含正文）；详情信封 `data` 同 `SkillRead`。
+不存在时 404，信封 `message` 为 `skill '<name>' not found`。
 
 ### 3.3 读取正文
 
@@ -422,7 +431,7 @@ curl -s "$BASE/agent-apps/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 curl -s "$BASE/agent-apps/skills/csv-report/content" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：`{"name": "csv-report", "content": "<完整 SKILL.md 正文>"}`，与创建时 body 一致。
+**预期**：信封 `data` 为 `{"name": "csv-report", "content": "<完整 SKILL.md 正文>"}`，与创建时 body 一致。
 
 ### 3.4 PATCH 更新
 
@@ -433,8 +442,8 @@ curl -s -X PATCH "$BASE/agent-apps/skills/csv-report" \
   -d '{"description": "生成 CSV 数据周报（v2，含图表建议）"}'
 ```
 
-**预期**：返回更新后的 `SkillRead`，`version` 自增、`content_hash` 变化（若 body 有改动）。
-`description` 与 `body` 可单独或同时更新；两者都不传返回 422 `nothing to update`。
+**预期**：信封 `data` 为更新后的 `SkillRead`，`data.version` 自增、`data.content_hash` 变化（若 body 有改动）。
+`description` 与 `body` 可单独或同时更新；两者都不传返回 422，信封 `message` 为 `nothing to update`。
 
 **负向用例（name 不可变）**：
 
@@ -445,7 +454,7 @@ curl -s -X PATCH "$BASE/agent-apps/skills/csv-report" \
   -d '{"name": "renamed"}'
 ```
 
-**预期**：422 `name is immutable and cannot be changed`。
+**预期**：422 信封，`message` 为 `name is immutable and cannot be changed`。
 
 ### 3.5 LLM 草稿生成（⚠️ 需外部资源 / 会消耗 token）
 
@@ -456,10 +465,11 @@ curl -s -X POST "$BASE/agent-apps/skills/generate" \
   -d '{"description": "一个帮助撰写 Git 提交信息的技能", "hint": "遵循 Conventional Commits"}'
 ```
 
-**预期**：返回 `{"draft": "<生成的 SKILL.md 草稿>"}`；**该接口只产出草稿，不落库**。
+**预期**：信封 `data` 为 `{"draft": "<生成的 SKILL.md 草稿>"}`；**该接口只产出草稿，不落库**。
 确认后可把 `draft` 内容作为 `body` 走 3.1 创建。
 
-**失败排查**：500 说明 LLM 重试后仍失败，检查 `OPENAI_API_KEY`；429 默认限流 5 次/分钟。
+**失败排查**：500（信封 `message` 含脱敏摘要）说明 LLM 重试后仍失败，检查 `OPENAI_API_KEY`；
+429（信封 `message="Rate limit exceeded"`）默认限流 5 次/分钟。
 
 ### 3.6 删除（建议放到第 9 节收尾时再测）
 
@@ -522,13 +532,13 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
   }'
 ```
 
-**预期**：201，返回 `McpServerRead`（含 `content_hash`、`enabled=true`）。
+**预期**：HTTP 201 且 `code=201`，信封 `data` 为 `McpServerRead`（含 `data.content_hash`、`data.enabled=true`）。
 注册时会**探活**该 server 并做工具名冲突校验（探活超时上限 30 秒；探活失败降级为跳过冲突检查，不阻断创建）。
 
 **失败排查**：
-- 422 `command is required for stdio transport` / `url must not be set for stdio transport`：transport 与字段搭配错误；
-- 422 `stdio command 'xxx' is not in MCP_STDIO_ALLOWED_COMMANDS (...)`：命令不在白名单；
-- 422 `... is a forbidden shell interpreter`：使用了 shell 解释器（见 4.5 负向用例）。
+- 422 信封（`message` 为错误文案或 `Validation error`）：`command is required for stdio transport` / `url must not be set for stdio transport`（transport 与字段搭配错误）；
+- 422 信封 `message`：`stdio command 'xxx' is not in MCP_STDIO_ALLOWED_COMMANDS (...)`（命令不在白名单）；
+- 422 信封 `message`：`... is a forbidden shell interpreter`（使用了 shell 解释器，见 4.5 负向用例）。
 
 ### 4.3 查看工具目录，确认 builtin + mcp 与 source 标签
 
@@ -536,7 +546,7 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
 curl -s "$BASE/agent-apps/tools/catalog" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：数组中同时包含：
+**预期**：信封 `data` 数组中同时包含：
 - 内置工具：`{"name": "duckduckgo_search", "source": "builtin"}`、`{"name": "ask_human", "source": "builtin"}`；
 - MCP 工具：`{"name": "add", "source": "mcp", "server": "demo-stdio"}`、
   `{"name": "echo", "source": "mcp", "server": "demo-stdio"}`。
@@ -578,7 +588,7 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
   }'
 ```
 
-**预期**：422，detail 形如 `headers.Authorization must be a ${ENV_VAR} placeholder; plaintext secrets are forbidden`。
+**预期**：422 信封，`message` 形如 `headers.Authorization must be a ${ENV_VAR} placeholder; plaintext secrets are forbidden`。
 
 ### 4.5 负向用例：shell 命令被 422 拒绝
 
@@ -594,10 +604,10 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
   }'
 ```
 
-**预期**：422 `stdio command 'bash' is a forbidden shell interpreter`。
+**预期**：422 信封，`message` 为 `stdio command 'bash' is a forbidden shell interpreter`。
 
 同理可验证 `python -c` 内联模式：把 `command` 改为 `"python"`、`args` 改为 `["-c", "print(1)"]`，
-预期 422 `stdio args must not use inline execution modes (-c/-m)`。
+预期 422 信封，`message` 为 `stdio args must not use inline execution modes (-c/-m)`。
 
 ### 4.6 负向用例：重名工具被拒绝
 
@@ -615,8 +625,8 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
   }'
 ```
 
-**预期**：探活成功时返回 422，detail 指出工具名冲突（collision）。
-若探活失败/超时（返回 None），冲突检查会被跳过而创建成功——此时查日志确认
+**预期**：探活成功时返回 422 信封，`message` 指出工具名冲突（collision）。
+若探活失败/超时（返回 None），冲突检查会被跳过而创建成功（HTTP 201 信封）——此时查日志确认
 `mcp_server_tool_probe_timeout` / `mcp_server_tool_probe_failed`，属于设计上的降级行为。
 
 > 另可用 `GET/PATCH/DELETE $BASE/agent-apps/mcp-servers/demo-stdio` 验证单条读改删；
@@ -642,13 +652,14 @@ curl -s -X POST "$BASE/agent-apps/subagents" \
   }'
 ```
 
-**预期**：201，返回 `SubAgentRead`：`allowed_tools=null`、`model=null`、`max_turns=null`
-（留空即**继承父 AgentApp** 的工具/模型）、`version=1`、`content_hash` 非空。
+**预期**：HTTP 201 且 `code=201`，信封 `data` 为 `SubAgentRead`：`data.allowed_tools=null`、
+`data.model=null`、`data.max_turns=null`（留空即**继承父 AgentApp** 的工具/模型）、
+`data.version=1`、`data.content_hash` 非空。
 
 > `model` 字段的语义是 **LlmConfig 引用名**（见 5.5 节）；留空继承父应用引用，
 > NULL 最终解析到 `default` 配置。
 
-**失败排查**：422 重名（`subagent 'xxx' already exists`）或 `name` 不符合命名规则。
+**失败排查**：422 信封：重名（`message` 为 `subagent 'xxx' already exists`）或 `name` 不符合命名规则（`Validation error` + `data` 错误列表）。
 
 ### 5.2 列表 / 详情 / 更新
 
@@ -662,7 +673,8 @@ curl -s -X PATCH "$BASE/agent-apps/subagents/search-helper" \
   -d '{"max_turns": 3}'
 ```
 
-**预期**：PATCH 后 `max_turns=3`、`version` 自增、`content_hash` 更新；空 payload 返回 422 `nothing to update`。
+**预期**：PATCH 后信封 `data` 中 `max_turns=3`、`version` 自增、`content_hash` 更新；
+空 payload 返回 422 信封，`message` 为 `nothing to update`。
 
 ### 5.3 单轮测试运行（⚠️ 需外部资源 / 会消耗 token）
 
@@ -673,11 +685,11 @@ curl -s -X POST "$BASE/agent-apps/subagents/search-helper/test" \
   -d '{"prompt": "用一句话介绍你自己。"}'
 ```
 
-**预期**：返回 `SubAgentTestResult`：`final_message`（最终回复）、`turns`、`duration_seconds`、
-`model`。这是一次隔离的单发运行，不影响任何会话状态。
+**预期**：信封 `data` 为 `SubAgentTestResult`：`data.final_message`（最终回复）、`data.turns`、
+`data.duration_seconds`、`data.model`。这是一次隔离的单发运行，不影响任何会话状态。
 
-**失败排查**：404 subagent 不存在；500 多为 LLM 调用失败（查日志 `subagent_test_failed`）；
-429 默认限流 5 次/分钟。
+**失败排查**：404（信封 `message` 提示 subagent 不存在）；500 多为 LLM 调用失败（查日志 `subagent_test_failed`）；
+429（信封 `message="Rate limit exceeded"`）默认限流 5 次/分钟。
 
 ### 5.4 负向用例：PATCH name 被 422 拒绝
 
@@ -688,7 +700,7 @@ curl -s -X PATCH "$BASE/agent-apps/subagents/search-helper" \
   -d '{"name": "renamed-helper"}'
 ```
 
-**预期**：422 `name is immutable and cannot be changed`。
+**预期**：422 信封，`message` 为 `name is immutable and cannot be changed`。
 
 ### 5.5 LLM 配置管理（llm-configs CRUD）
 
@@ -712,10 +724,10 @@ curl -s -X POST "$BASE/agent-apps/llm-configs" \
   }'
 ```
 
-**预期**：201，返回 `LlmConfigRead`：含 `api_key_masked`（如 `****1234`）、`content_hash` 非空、
-`enabled=true`；**响应 JSON 中不存在 `api_key` 字段**。
+**预期**：HTTP 201 且 `code=201`，信封 `data` 为 `LlmConfigRead`：含 `data.api_key_masked`（如 `****1234`）、
+`data.content_hash` 非空、`data.enabled=true`；**响应 JSON 中不存在 `api_key` 字段**。
 
-**失败排查**：422 重名 / `name` 非法 / 缺 `model_name` 或 `api_key`。
+**失败排查**：422 信封：重名（`message` 为错误文案）/ `name` 非法或缺 `model_name`/`api_key`（`Validation error` + `data` 错误列表）。
 
 #### 5.5.2 列表与详情（恒掩码）
 
@@ -724,8 +736,8 @@ curl -s "$BASE/agent-apps/llm-configs" -H "Authorization: Bearer $TOKEN"
 curl -s "$BASE/agent-apps/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：列表/详情均含启动时 bootstrap 种子的 `default` 配置与刚创建的 `proxy`；
-每条记录只有 `api_key_masked`，无明文。不存在时 404。
+**预期**：列表/详情的信封 `data` 均含启动时 bootstrap 种子的 `default` 配置与刚创建的 `proxy`；
+每条记录只有 `api_key_masked`，无明文。不存在时 404 信封。
 
 #### 5.5.3 PATCH 更新（api_key 省略 = 保留原值）
 
@@ -737,8 +749,8 @@ curl -s -X PATCH "$BASE/agent-apps/llm-configs/proxy" \
   -d '{"temperature": 0.5}'
 ```
 
-**预期**：200，`temperature=0.5`、`content_hash` 刷新、`api_key_masked` 不变（原 key 保留）。
-空 payload 返回 422 `nothing to update`；携带 `name` 返回 422 `name is immutable`。
+**预期**：`code=200`，信封 `data` 中 `temperature=0.5`、`content_hash` 刷新、`api_key_masked` 不变（原 key 保留）。
+空 payload 返回 422 信封，`message` 为 `nothing to update`；携带 `name` 返回 422 信封，`message` 含 `name is immutable`。
 
 #### 5.5.4 DELETE 守卫
 
@@ -747,7 +759,7 @@ curl -s -X PATCH "$BASE/agent-apps/llm-configs/proxy" \
 curl -s -X DELETE "$BASE/agent-apps/llm-configs/default" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：422，detail 表明 default 配置受保护。
+**预期**：422 信封，`message` 表明 default 配置受保护。
 
 ```bash
 # 负向 2：被引用的配置禁删（先把某个 AgentApp 的 model 指向 proxy，
@@ -759,8 +771,8 @@ curl -s -X PATCH "$BASE/agent-apps/apps/$APP_ID" \
 curl -s -X DELETE "$BASE/agent-apps/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：DELETE 返回 422，detail 列出引用方（`agent_app:<name>` / `subagent:<name>`）。
-未被引用的配置可正常删除（200，随后 GET 返回 404）。
+**预期**：DELETE 返回 422 信封，`message` 列出引用方（`agent_app:<name>` / `subagent:<name>`）。
+未被引用的配置可正常删除（`code=200`，信封 `data=null`；随后 GET 返回 404 信封）。
 
 > **语义注记**：编辑 LlmConfig（PATCH）**不会**把已发布 AgentApp 回退 draft（对比 6.5），
 > 但会刷新 `content_hash` 使编译指纹漂移，下次预热/编译自动用新配置重建运行时。
@@ -786,14 +798,14 @@ curl -s -X POST "$BASE/agent-apps/apps" \
   }'
 ```
 
-**预期**：201，返回 `AgentAppRead`：记下 `id`（后续记为 `$APP_ID`），`status="draft"`、
-`engine="deepagents"`、`version=1`、`published_hash=null`。
+**预期**：HTTP 201 且 `code=201`，信封 `data` 为 `AgentAppRead`：记下 `data.id`（后续记为 `$APP_ID`），
+`data.status="draft"`、`data.engine="deepagents"`、`data.version=1`、`data.published_hash=null`。
 
 > 可额外传 `"model": "proxy"`（LlmConfig 引用名，见 5.5 节）指定专用模型配置；
 > 不传则用 `default` 配置。
 
 ```bash
-export APP_ID=<上一步返回的 id>
+export APP_ID=<上一步信封 data 中返回的 id>
 ```
 
 **说明**：创建阶段**不**校验工具白名单与引用存在性，这些都在 publish 时把关。
@@ -811,20 +823,20 @@ export BAD_APP_ID=$(curl -s -X POST "$BASE/agent-apps/apps" \
     "name": "bad-tools-app",
     "system_prompt": "test",
     "allowed_tools": ["no_such_tool"]
-  }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+  }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])')
 
 curl -s -X POST "$BASE/agent-apps/apps/$BAD_APP_ID/publish" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：422，detail 含 `allowed_tools not in tool catalog: agent_app:bad-tools-app -> no_such_tool`
+**预期**：422 信封，`message` 含 `allowed_tools not in tool catalog: agent_app:bad-tools-app -> no_such_tool`
 （应用与子代理的白名单都会对照实时工具目录校验，违规项按 `agent_app:<app名> -> <工具名>` /
 `subagent:<子代理名> -> <工具名>` 逐条列出）。
 
 同类可验证的发布失败：`skill_names` 引用不存在的 skill、`subagent_names` 引用不存在的 subagent，
-分别返回 422 `referenced skill 'xxx' does not exist` / `referenced subagent 'xxx' does not exist`。
+分别返回 422 信封，`message` 为 `referenced skill 'xxx' does not exist` / `referenced subagent 'xxx' does not exist`。
 应用或子代理的 `model` 引用不存在/被禁用的 LlmConfig（如把 `model` PATCH 成 `ghost-config`）
-也返回 422，detail 列出缺失/禁用的配置名。
+也返回 422 信封，`message` 列出缺失/禁用的配置名。
 
 （可用 `DELETE $BASE/agent-apps/apps/$BAD_APP_ID` 清理该脏数据应用。）
 
@@ -835,7 +847,7 @@ curl -s -X POST "$BASE/agent-apps/apps/$APP_ID/publish" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：返回的 `AgentAppRead` 中 `status="published"`、`published_hash` 变为非空指纹串、
+**预期**：信封 `data`（`AgentAppRead`）中 `status="published"`、`published_hash` 变为非空指纹串、
 `version` 自增。日志可见 `agent_app_published`。
 
 ### 6.4 已发布列表
@@ -844,7 +856,7 @@ curl -s -X POST "$BASE/agent-apps/apps/$APP_ID/publish" \
 curl -s "$BASE/agent-apps/apps/published" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：数组中包含刚发布的 `demo-assistant`（以及系统 default 应用——若其已发布；
+**预期**：信封 `data` 数组中包含刚发布的 `demo-assistant`（以及系统 default 应用——若其已发布；
 default 应用由启动 bootstrap 创建，名称为 `default`）。
 
 ### 6.5 PATCH 已发布应用后回退 draft
@@ -856,7 +868,7 @@ curl -s -X PATCH "$BASE/agent-apps/apps/$APP_ID" \
   -d '{"system_prompt": "你是一个演示助理（v2 修订版）。"}'
 ```
 
-**预期**：返回中 `status` 从 `published` **回退为 `draft`**、`version` 自增。
+**预期**：信封 `data` 中 `status` 从 `published` **回退为 `draft`**、`version` 自增。
 这是安全语义：内容编辑会使已发布指纹失效，防止坏配置继续服务线上会话。
 
 ```bash
@@ -864,7 +876,7 @@ curl -s -X PATCH "$BASE/agent-apps/apps/$APP_ID" \
 curl -s -X POST "$BASE/agent-apps/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：`status` 重新变为 `published`。
+**预期**：信封 `data` 中 `status` 重新变为 `published`。
 
 ---
 
@@ -881,13 +893,13 @@ export SESSION_RESP=$(curl -s -X POST "$BASE/auth/session" \
   -H "Content-Type: application/json" \
   -d "{\"agent_app_id\": $APP_ID}")
 echo "$SESSION_RESP"
-export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"]["access_token"])')
-export SESSION_ID=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["session_id"])')
+export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
+export SESSION_ID=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["session_id"])')
 ```
 
-**预期**：返回新的 `session_id` 与会话 token。此后 `$TOKEN` 切换为该会话 token。
+**预期**：信封 `data` 返回新的 `session_id` 与会话 token。此后 `$TOKEN` 切换为该会话 token。
 
-**失败排查**：404 Agent app 不存在；422 `Agent app is not published`（对应未发布或已回退 draft 的应用）。
+**失败排查**：404 信封（Agent app 不存在）；422 信封，`message` 为 `Agent app is not published`（对应未发布或已回退 draft 的应用）。
 
 ### 7.2 非流式对话
 
@@ -898,10 +910,10 @@ curl -s -X POST "$BASE/chatbot/chat" \
   -d '{"messages": [{"role": "user", "content": "请用 add 工具计算 17+25，并告诉我结果。"}]}'
 ```
 
-**预期**：`ChatResponse.messages` 数组，最后一条为 `role="assistant"` 的回复（内容应给出 42）。
+**预期**：信封 `data.messages` 数组，最后一条为 `role="assistant"` 的回复（内容应给出 42）。
 消息体约束：`content` 长度 1~3000，role 限 `user|assistant|system`。
 
-**失败排查**：500 查日志 `chat_request_failed`，常见为 LLM key 无效（401）或工具调用异常。
+**失败排查**：500 信封，查日志 `chat_request_failed`，常见为 LLM key 无效（401）或工具调用异常。
 
 ### 7.3 SSE 流式对话
 
@@ -923,20 +935,21 @@ curl -N -X POST "$BASE/chatbot/chat/stream" \
 curl -s "$BASE/chatbot/messages" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：`messages` 中包含本会话的完整历史（user/assistant 消息）。
+**预期**：信封 `data.messages` 中包含本会话的完整历史（user/assistant 消息）。
 
 ```bash
 curl -s -X DELETE "$BASE/chatbot/messages" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：`{"message": "Chat history cleared successfully"}`；再次 `GET /messages` 返回空列表。
+**预期**：信封 `{"code": 200, "message": "Chat history cleared successfully", "data": null}`；
+再次 `GET /messages` 信封 `data.messages` 返回空列表。
 
 ### 7.5 默认助理对话（不绑定 AgentApp）
 
 ```bash
 export DEFAULT_RESP=$(curl -s -X POST "$BASE/auth/session" \
   -H "Authorization: Bearer $USER_TOKEN")
-export DEFAULT_TOKEN=$(echo "$DEFAULT_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"]["access_token"])')
+export DEFAULT_TOKEN=$(echo "$DEFAULT_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
 
 curl -s -X POST "$BASE/chatbot/chat" \
   -H "Authorization: Bearer $DEFAULT_TOKEN" \
@@ -944,7 +957,7 @@ curl -s -X POST "$BASE/chatbot/chat" \
   -d '{"messages": [{"role": "user", "content": "你好，介绍一下你自己。"}]}'
 ```
 
-**预期**：正常返回回复。不传 `agent_app_id` 的会话在运行时回退到系统默认 AgentApp
+**预期**：信封 `data.messages` 正常返回回复。不传 `agent_app_id` 的会话在运行时回退到系统默认 AgentApp
 （`name="default"`，由启动 bootstrap / 惰性重建保证存在），使用默认系统提示与默认模型。
 
 ---
@@ -967,12 +980,12 @@ export HIL_APP_ID=$(curl -s -X POST "$BASE/agent-apps/apps" \
     "system_prompt": "你是一个演示助理。当用户要求搜索时，必须调用 duckduckgo_search 工具。",
     "allowed_tools": ["duckduckgo_search"],
     "interrupt_on": {"duckduckgo_search": true}
-  }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+  }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])')
 
 curl -s -X POST "$BASE/agent-apps/apps/$HIL_APP_ID/publish" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：发布成功，`status="published"`。
+**预期**：发布成功，信封 `data.status="published"`。
 
 ### 8.2 绑定会话并触发中断
 
@@ -981,7 +994,7 @@ export HIL_RESP=$(curl -s -X POST "$BASE/auth/session" \
   -H "Authorization: Bearer $USER_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"agent_app_id\": $HIL_APP_ID}")
-export HIL_TOKEN=$(echo "$HIL_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"]["access_token"])')
+export HIL_TOKEN=$(echo "$HIL_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
 
 curl -s -X POST "$BASE/chatbot/chat" \
   -H "Authorization: Bearer $HIL_TOKEN" \
@@ -989,7 +1002,7 @@ curl -s -X POST "$BASE/chatbot/chat" \
   -d '{"messages": [{"role": "user", "content": "搜索一下今天的科技新闻"}]}'
 ```
 
-**预期**：响应**不是**搜索结果，而是中断提示（中断载荷的字符串化展示，或兜底文案
+**预期**：信封 `data.messages` 的最后一条**不是**搜索结果，而是中断提示（中断载荷的字符串化展示，或兜底文案
 "Waiting for input."）。此时该线程处于暂停态，等待续跑输入。
 
 ### 8.3 批准续跑
@@ -1001,7 +1014,7 @@ curl -s -X POST "$BASE/chatbot/chat" \
   -d '{"messages": [{"role": "user", "content": "{\"decisions\":[{\"type\":\"approve\"}]}"}]}'
 ```
 
-**预期**：图从暂停点恢复，工具实际执行，返回含搜索结果的正常回复。
+**预期**：图从暂停点恢复，工具实际执行，信封 `data.messages` 返回含搜索结果的正常回复。
 多个待决动作时 `decisions` 数组需按数量给出逐项决策。
 
 ### 8.4 验证纯文本回复默认 reject 的安全语义
@@ -1034,7 +1047,7 @@ curl -s -X DELETE "$BASE/agent-apps/mcp-servers/demo-stdio" -H "Authorization: B
 curl -s -X DELETE "$BASE/agent-apps/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ```
 
-每个 DELETE 成功返回 200 空体；对不存在的资源返回 404。
+每个 DELETE 成功返回信封 `{"code": 200, "message": "...", "data": null}`；对不存在的资源返回 404 信封。
 另请删除第 4.1 步放入的 `app/tmp_mcp_demo_server.py` 测试脚本文件。
 
 ### 9.2 停止容器与清理数据

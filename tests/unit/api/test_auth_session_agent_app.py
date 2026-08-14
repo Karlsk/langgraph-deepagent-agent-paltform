@@ -21,6 +21,8 @@ from app.models.agent_assets import AgentApp
 from app.models.session import Session as ChatSession
 from app.models.user import User
 
+from tests.conftest import unwrap
+
 pytestmark = pytest.mark.unit
 
 
@@ -70,9 +72,7 @@ class FakeDatabaseService:
                 "agent_app_id": agent_app_id,
             }
         )
-        return ChatSession(
-            id=session_id, user_id=user_id, name=name, username=username, agent_app_id=agent_app_id
-        )
+        return ChatSession(id=session_id, user_id=user_id, name=name, username=username, agent_app_id=agent_app_id)
 
 
 def _make_app_row(status: str = "published") -> AgentApp:
@@ -121,7 +121,7 @@ def test_create_session_without_agent_app_id_leaves_binding_empty(
     response = client.post("/session")
     assert response.status_code == 200
     assert fake_service.create_session_calls[0]["agent_app_id"] is None
-    assert response.json()["session_id"]
+    assert unwrap(response)["session_id"]
 
 
 def test_create_session_with_empty_body_leaves_binding_empty(

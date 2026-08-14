@@ -41,14 +41,14 @@
   - 内容：`@dataclass ApiResponse`（`success`/`data`/`error`/`metadata` + `to_json(ensure_ascii=False)`）；`build_registry(directory)`（装配逻辑独立成函数，供 CLI 与可选 API 共用）；`build_parser()`（子命令 `run`，参数 `--dir` 默认 `app/workflow/config/examples`、`--workflow` 必填、`--input` 默认 `{}`、`--log-level` 默认 INFO、`--json-log` flag）；`main(argv)` 五步：解析参数 + `setup_logging` + `load_dotenv()` → `load_definitions_from_dir` 逐个 `register_workflow` → `execute_workflow` → 成功信封（`data=RunResult.output`，`metadata={"workflow_id","run_id","duration_ms","node_count"}`）→ 失败信封（`success=False`、`error` 为**脱敏后**异常摘要、不含完整 state/密钥）；输出 `print(response.to_json())`（CLI 面向用户输出是 G8/T20 的唯一例外，cli.py 已获 per-file-ignores 豁免），返回码 0/1；异常显式分层（R6）：`WorkflowEngineError` 族与其它未预期异常分别给出友好消息，except 必须有日志 + 信封输出；`__main__.py`：`raise SystemExit(main())`
   - 产出文件：`app/workflow/cli.py`（目标 < 200 行）、`app/workflow/__main__.py`
 - [ ] **TC3 [可选] api.py FastAPI router（0.25d）**
-  - 内容：`POST /workflows/{workflow_id}/execute` 复用同一 `ApiResponse` 信封与 `build_registry` 装配；slowapi rate limit 装饰器；registry 经 DI 提供；同步 `execute_workflow` 经 `run_in_threadpool` 包装；挂载到 `app/api/v1/api.py`
+  - 内容：`POST /workflows/{workflow_id}/execute` **内部复用同一 `ApiResponse` 信封**（CONTRACT §4.12 冻结签名，只读不改）与 `build_registry` 装配，**HTTP 出口经 `api.py` 出口映射投影为宿主统一信封 `{code, message, data}`**（见 §6 "HTTP wire 形态"小节；CLI stdout 信封形态不变）；slowapi rate limit 装饰器；registry 经 DI 提供；同步 `execute_workflow` 经 `run_in_threadpool` 包装；挂载到 `app/api/v1/api.py`
   - 产出文件：`app/workflow/api.py`（可选）、`app/api/v1/api.py`（追加挂载，既有文件改动白名单内）
 
 ## 6. 接口契约
 
 见 CONTRACT §4.11（`setup_logging` / `SECRET_KEY_PATTERNS` / `redact` / `redact_processor`）与 §4.12（`ApiResponse` / `build_registry` / `build_parser` / `main` 签名）、§6 S15（日志摘要与脱敏形态）。
 
-端到端信封形态（成功）：
+端到端信封形态（成功，**CLI stdout，CONTRACT §4.12 逐字冻结，不变**）：
 
 ```json
 {
@@ -58,6 +58,38 @@
   "metadata": {"workflow_id": "demo_minimal", "run_id": "3f2a...", "duration_ms": 12.3, "node_count": 1}
 }
 ```
+
+### HTTP wire 形态（宿主统一信封 `{code, message, data}`）
+
+`api.py` 是契约钦定的入口适配层（AD-02/AD-10、CONTRACT §4.12 所在文件结构）：内部仍复用 CLI 的 `ApiResponse` dataclass（§4.12 冻结签名**只读不改**），在 HTTP 出口经**出口映射**投影为宿主统一信封 `{code, message, data}`（对齐 `app/schemas/base.py` 的 `ApiResponse` 语义：`code` 与 HTTP 状态码一致、`request_id` 走 `X-Request-ID` 头不入信封）。**CLI stdout 信封形态保持上例不变**（CLI stdout 契约是回归防线，`tests/unit/workflow/test_cli.py` 锁定）。另：该端点已在 FastAPI 装饰器声明 `response_model=ApiResponse[dict[str, Any]]` 及 404/500 错误信封 `responses`（仅文档级 OpenAPI 契约；返回值为 `JSONResponse` 实例，运行时 wire 形态仍唯一由出口映射决定，不受影响）。
+
+出口映射规则（`api.py` 内实现，成功 HTTP 200 / `WorkflowNotFoundError` HTTP 404 / 其它异常 HTTP 500）：
+
+| 场景 | code | message | data |
+| --- | --- | --- | --- |
+| 成功且 `RunResult.output` 为 dict | 200 | `"success"` | `{...output 各键..., "metadata": {workflow_id, run_id, duration_ms, node_count}}` |
+| 成功且 `RunResult.output` 非 dict | 200 | `"success"` | `{"result": output, "metadata": {workflow_id, run_id, duration_ms, node_count}}` |
+| 404 / 500 错误 | 404 / 500 | 脱敏后异常摘要（`_redacted_summary`，H6） | `null` |
+
+成功（output 为 dict）HTTP wire 示例：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "greet_result": {"response": "hello"}, "response": "hello", "history": ["..."],
+    "metadata": {"workflow_id": "demo_minimal", "run_id": "3f2a...", "duration_ms": 12.3, "node_count": 1}
+  }
+}
+```
+
+错误 HTTP wire 示例（`message` 为脱敏后的异常摘要）：
+
+```json
+{"code": 404, "message": "workflow not found: workflow not found: demo_minimal", "data": null}
+```
+
 
 ## 7. TDD 测试要点
 

@@ -171,7 +171,7 @@
 | Phase 5 | HTTPNode | `nodes/http_node.py` + `HTTPNodeConfig`；占位符渲染、method/headers/body_template、`response_path` 提取、显式可配置 retry 与 mock | mock httpx 下渲染/调用/提取/重试/失败路径全绿 | H2、H4、H6 |
 | Phase 6 | 图构建器 | `graph_builder.py` 的 `GraphBuilder` 七步；条件路由器（logging、显式 no-match）；普通边；compile | YAML → 编译图可执行，含一条条件分支的 2~3 节点图跑通 | C1、C3、C5 |
 | Phase 7 | 注册表与运行时 | `registry.py` 的 `WorkflowRegistry`（线程安全锁）+ 运行级日志收集 + `load_definitions_from_dir` | 注册/执行/并发安全/日志收集/统一 delete 全绿 | H1、H3、H7 |
-| Phase 8 | 入口集成 | 入口模块 `cli.py` / `__main__.py` / `api.py`（Phase 8 新增，FastAPI router + CLI）串联 加载 → 注册 → 执行 → 响应；结构化日志与脱敏落地 | 端到端请求跑通并返回规范信封 | H6 |
+| Phase 8 | 入口集成 | 入口模块 `cli.py` / `__main__.py` / `api.py`（Phase 8 新增，FastAPI router + CLI）串联 加载 → 注册 → 执行 → 响应；结构化日志与脱敏落地 | 端到端请求跑通并返回规范信封（注：CLI stdout 用 CONTRACT §4.12 信封 `{success,data,error,metadata}`；HTTP 出口经 `api.py` 出口映射投影为宿主统一信封 `{code,message,data}`，见 spec-08 §6） | H6 |
 | Phase 9 | 加固与交付 | 安全审计、并发压测、覆盖率达标（>= 80%）、示例 YAML 与 README、文档校对 | 加固清单全过，示例可运行 | 全部复核 |
 
 **阶段依赖**：Phase 0 → 1 → 2 → 3 为主干基础；Phase 4、5 依赖 Phase 3；Phase 6 依赖 Phase 2/3；Phase 7 依赖 Phase 6；Phase 8 依赖 Phase 7；Phase 9 为最终收口。Phase 4 与 Phase 5 相互独立，可并行。
@@ -230,7 +230,7 @@ tests/               # 镜像包结构的测试
 | `registry.py` | 只负责进程级注册运行时：注册/查询/执行/统一删除 + YAML 目录加载 |
 | `utils.py` | 只放两个状态工具函数，不放任何 LLM/HTTP/领域逻辑 |
 | `logging_conf.py` | 只负责日志初始化与脱敏过滤器 |
-| `cli.py` / `__main__.py` / `api.py` | Phase 8 新增入口模块：CLI 与 FastAPI router，串联 加载 → 注册 → 执行 → 响应信封 |
+| `cli.py` / `__main__.py` / `api.py` | Phase 8 新增入口模块：CLI 与 FastAPI router，串联 加载 → 注册 → 执行 → 响应信封（CLI 输出 CONTRACT §4.12 信封且冻结不变；`api.py` 在 HTTP 出口做 `{code,message,data}` 宿主统一信封投影，见 spec-08 §6） |
 | `nodes/base.py` | 节点抽象契约（K4） |
 | `nodes/factory.py` | 插件注册表 + `create_node` 分发（K5、R4） |
 | `nodes/llm_node.py` | LLM 调用全部内聚于此（含重试、多供应商、env 密钥） |

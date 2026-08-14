@@ -16,6 +16,9 @@ from langchain_core.messages import AIMessage
 
 from app.core.config import settings
 from app.services.agents import assembly
+from tests.conftest import unwrap
+
+from .conftest import assert_error_envelope
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +29,7 @@ def _auth(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
     """Exchange a user token for a chat-session token (management APIs need it)."""
     response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
     assert response.status_code == 200, response.text
-    token = response.json()["token"]["access_token"]
+    token = unwrap(response)["token"]["access_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -48,14 +51,17 @@ def test_subagent_one_shot_test_run_is_isolated(
     )
     assert created.status_code == 201, created.text
     # Inheritance fields left blank default to None (inherit at assembly time).
-    assert created.json()["allowed_tools"] is None
-    assert created.json()["model"] is None
-    assert created.json()["max_turns"] is None
+    created_payload = unwrap(created, expected_code=201)
+    assert created_payload["allowed_tools"] is None
+    assert created_payload["model"] is None
+    assert created_payload["max_turns"] is None
 
     scripted_model.responses = [AIMessage(content="one-shot summary")]
-    result = client.post(f"{API}/agent-apps/subagents/summarizer/test", json={"prompt": "summarize this"}, headers=headers)
+    result = client.post(
+        f"{API}/agent-apps/subagents/summarizer/test", json={"prompt": "summarize this"}, headers=headers
+    )
     assert result.status_code == 200, result.text
-    payload = result.json()
+    payload = unwrap(result)
     assert payload["final_message"] == "one-shot summary"
     assert payload["turns"] == 1
     assert payload["duration_seconds"] > 0
@@ -68,10 +74,10 @@ def test_subagent_one_shot_test_run_is_isolated(
 
 
 def test_subagent_test_unknown_name_404(client: TestClient, user_headers: dict[str, str]) -> None:
-    """Test-running a missing subagent returns 404."""
+    """Test-running a missing subagent returns a 404 error envelope."""
     headers = _auth(client, user_headers)
     response = client.post(f"{API}/agent-apps/subagents/ghost/test", json={"prompt": "hi"}, headers=headers)
-    assert response.status_code == 404
+    assert_error_envelope(response, code=404, message="subagent 'ghost' not found")
 
 
 def test_skill_delete_cascades_user_copies(
@@ -93,21 +99,25 @@ def test_skill_delete_cascades_user_copies(
         headers=headers,
     )
     assert app.status_code == 201, app.text
-    app_id = app.json()["id"]
+    app_id = unwrap(app, expected_code=201)["id"]
     assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers).status_code == 200
 
     session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
     assert session.status_code == 200, session.text
-    session_token = {"Authorization": f"Bearer {session.json()['token']['access_token']}"}
+    session_token = {"Authorization": f"Bearer {unwrap(session)['token']['access_token']}"}
     scripted_model.responses = [AIMessage(content="doomed reply")]
-    chat = client.post(f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=session_token)
+    chat = client.post(
+        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=session_token
+    )
     assert chat.status_code == 200, chat.text
 
     user_copy_dir = os.path.join(settings.SKILLS_ROOT, "users", "system", "doomed-skill")
     assert os.path.isfile(os.path.join(user_copy_dir, "SKILL.md"))
 
     # Unbind the skill from the app (delete rejects dangling references), then delete.
-    assert client.patch(f"{API}/agent-apps/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
+    assert (
+        client.patch(f"{API}/agent-apps/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
+    )
     deleted = client.delete(f"{API}/agent-apps/skills/doomed-skill", headers=headers)
     assert deleted.status_code == 200, deleted.text
 

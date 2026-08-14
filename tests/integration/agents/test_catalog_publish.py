@@ -14,8 +14,9 @@ from langchain_core.messages import AIMessage
 
 from app.core.config import settings
 from app.services.agents import assembly
+from tests.conftest import unwrap
 
-from .conftest import make_mcp_tool
+from .conftest import assert_error_envelope, make_mcp_tool
 
 pytestmark = pytest.mark.integration
 
@@ -26,11 +27,13 @@ def _auth(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
     """Exchange a user token for a chat-session token (management APIs need it)."""
     response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
     assert response.status_code == 200, response.text
-    token = response.json()["token"]["access_token"]
+    token = unwrap(response)["token"]["access_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
-def _create_mcp_server(client: TestClient, headers: dict[str, str], fake_tools: dict[str, list[Any]], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def _create_mcp_server(
+    client: TestClient, headers: dict[str, str], fake_tools: dict[str, list[Any]], monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
     """Register an http MCP server whose fake tools are pre-registered."""
     monkeypatch.setenv("IT_MCP_AUTH", "secret-token")
     fake_tools["it-server"] = [make_mcp_tool("it_search")]
@@ -42,7 +45,7 @@ def _create_mcp_server(client: TestClient, headers: dict[str, str], fake_tools: 
     }
     response = client.post(f"{API}/agent-apps/mcp-servers", json=body, headers=headers)
     assert response.status_code == 201, response.text
-    return response.json()
+    return unwrap(response, expected_code=201)
 
 
 def test_mcp_server_registration_feeds_tool_catalog(
@@ -54,9 +57,10 @@ def test_mcp_server_registration_feeds_tool_catalog(
     # Baseline: only builtin entries, all labelled source=builtin.
     baseline = client.get(f"{API}/agent-apps/tools/catalog", headers=headers)
     assert baseline.status_code == 200
-    baseline_names = {entry["name"] for entry in baseline.json()}
+    baseline_entries = unwrap(baseline)
+    baseline_names = {entry["name"] for entry in baseline_entries}
     assert {"duckduckgo_results_json", "ask_human"} <= baseline_names
-    assert all(entry["source"] == "builtin" for entry in baseline.json())
+    assert all(entry["source"] == "builtin" for entry in baseline_entries)
 
     created = _create_mcp_server(client, headers, fake_mcp, monkeypatch)
     assert created["headers"] == {"Authorization": "${IT_MCP_AUTH}"}
@@ -64,7 +68,7 @@ def test_mcp_server_registration_feeds_tool_catalog(
 
     catalog = client.get(f"{API}/agent-apps/tools/catalog", headers=headers)
     assert catalog.status_code == 200
-    entries = catalog.json()
+    entries = unwrap(catalog)
     by_name = {entry["name"]: entry for entry in entries}
 
     assert by_name["duckduckgo_results_json"]["source"] == "builtin"
@@ -88,7 +92,11 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
     # Global skill (direct input) + subagent with inherited fields left blank.
     skill = client.post(
         f"{API}/agent-apps/skills",
-        json={"name": "report-style", "description": "Report style guide", "body": "# report-style\n\n## Steps\n1. draft\n"},
+        json={
+            "name": "report-style",
+            "description": "Report style guide",
+            "body": "# report-style\n\n## Steps\n1. draft\n",
+        },
         headers=headers,
     )
     assert skill.status_code == 201, skill.text
@@ -103,8 +111,9 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
         headers=headers,
     )
     assert subagent.status_code == 201, subagent.text
-    assert subagent.json()["allowed_tools"] is None
-    assert subagent.json()["model"] is None
+    subagent_payload = unwrap(subagent, expected_code=201)
+    assert subagent_payload["allowed_tools"] is None
+    assert subagent_payload["model"] is None
 
     # AgentApp referencing both assets plus a whitelist containing an unknown tool.
     created = client.post(
@@ -119,25 +128,27 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
         headers=headers,
     )
     assert created.status_code == 201, created.text
-    app_id = created.json()["id"]
-    assert created.json()["status"] == "draft"
+    created_payload = unwrap(created, expected_code=201)
+    app_id = created_payload["id"]
+    assert created_payload["status"] == "draft"
 
-    # Out-of-whitelist publish is rejected with 422 naming the offender.
+    # Out-of-whitelist publish is rejected with a 422 envelope naming the offender.
     denied = client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers)
-    assert denied.status_code == 422
-    assert "ghost_tool" in denied.text
+    assert_error_envelope(denied, code=422)
+    assert "ghost_tool" in denied.json()["message"]
 
     # Fix the whitelist, publish succeeds, /apps/published lists the app.
     fixed = client.patch(f"{API}/agent-apps/apps/{app_id}", json={"allowed_tools": ["it_search"]}, headers=headers)
     assert fixed.status_code == 200, fixed.text
     published = client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers)
     assert published.status_code == 200, published.text
-    assert published.json()["status"] == "published"
-    assert published.json()["published_hash"]
+    published_payload = unwrap(published)
+    assert published_payload["status"] == "published"
+    assert published_payload["published_hash"]
 
     listing = client.get(f"{API}/agent-apps/apps/published", headers=headers)
     assert listing.status_code == 200
-    names = [row["name"] for row in listing.json()]
+    names = [row["name"] for row in unwrap(listing)]
     assert "support-app" in names
 
 
@@ -162,16 +173,18 @@ def test_skill_content_refreshed_on_reassembly(
         headers=headers,
     )
     assert app.status_code == 201, app.text
-    app_id = app.json()["id"]
+    app_id = unwrap(app, expected_code=201)["id"]
     assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers).status_code == 200
 
     session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
     assert session.status_code == 200, session.text
-    session_token = {"Authorization": f"Bearer {session.json()['token']['access_token']}"}
+    session_token = {"Authorization": f"Bearer {unwrap(session)['token']['access_token']}"}
 
     # First chat compiles the app: the user copy carries version-1.
     scripted_model.responses = [AIMessage(content="styled answer")]
-    chat = client.post(f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=session_token)
+    chat = client.post(
+        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=session_token
+    )
     assert chat.status_code == 200, chat.text
 
     skills_root = settings.SKILLS_ROOT
@@ -180,7 +193,9 @@ def test_skill_content_refreshed_on_reassembly(
         assert "version-1" in handle.read()
 
     # Update the global skill; the next compile re-materializes the copy.
-    updated = client.patch(f"{API}/agent-apps/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers)
+    updated = client.patch(
+        f"{API}/agent-apps/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers
+    )
     assert updated.status_code == 200, updated.text
 
     # Clear caches to model a restart, then chat again (reassembly path).
@@ -190,7 +205,9 @@ def test_skill_content_refreshed_on_reassembly(
     runtime_module.clear_runtime_cache()
 
     scripted_model.responses = [AIMessage(content="styled answer v2")]
-    chat2 = client.post(f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi again"}]}, headers=session_token)
+    chat2 = client.post(
+        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi again"}]}, headers=session_token
+    )
     assert chat2.status_code == 200, chat2.text
     with open(user_copy, encoding="utf-8") as handle:
         assert "version-2" in handle.read()

@@ -11,7 +11,8 @@
     "dev:docker": "vite --mode docker",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "type-check": "vue-tsc -b"
+    "type-check": "vue-tsc -b",
+    "test": "vitest run"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
@@ -25,6 +26,7 @@
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "~5.7.3",
     "vite": "^6.0.7",
+    "vitest": "^3.2.4",
     "vue-tsc": "^2.2.0"
   }
 }

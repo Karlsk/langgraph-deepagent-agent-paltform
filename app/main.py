@@ -7,18 +7,25 @@ from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
+    HTTPException,
     Request,
     status,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlmodel import Session, col, select
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from asgi_correlation_id import CorrelationIdMiddleware
 
+from app.api.error_handlers import (
+    http_exception_handler,
+    rate_limit_exceeded_handler,
+    unhandled_exception_handler,
+    validation_exception_handler,
+)
 from app.api.v1.api import api_router
 from app.core.cache import cache_service
 from app.core.config import settings
@@ -144,9 +151,9 @@ if settings.DEBUG:
 # Add correlation ID middleware — must be outermost so request_id is set before all others
 app.add_middleware(CorrelationIdMiddleware)
 
-# Set up rate limiter exception handler
+# Set up rate limiter exception handler (unified envelope output)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
 
 # Inject the workflow registry on app.state (spec-09 TC1, H4/G7: engine keeps no module-level cache)
 app.state.workflow_registry = build_registry(DEFAULT_CONFIG_DIR)
@@ -154,35 +161,17 @@ logger.info("workflow_registry_built", directory=str(DEFAULT_CONFIG_DIR))
 
 
 # Add validation exception handler
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle validation errors from request data.
+app.add_exception_handler(RequestValidationError, validation_exception_handler)  # pyright: ignore[reportArgumentType]
 
-    Args:
-        request: The request that caused the validation error
-        exc: The validation error
 
-    Returns:
-        JSONResponse: A formatted error response
-    """
-    # Log the validation error
-    logger.error(
-        "validation_error",
-        client_host=request.client.host if request.client else "unknown",
-        path=request.url.path,
-        errors=str(exc.errors()),
-    )
-
-    # Format the errors to be more user-friendly
-    formatted_errors = []
-    for error in exc.errors():
-        loc = " -> ".join([str(loc_part) for loc_part in error["loc"] if loc_part != "body"])
-        formatted_errors.append({"field": loc, "message": error["msg"]})
-
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Validation error", "errors": formatted_errors},
-    )
+# Envelope handlers for explicit HTTP errors and unexpected failures.
+# Starlette resolves handlers by walking the raised exception's MRO class
+# by class (most specific first), so the fastapi.HTTPException registration
+# wins for business errors while the Starlette base-class registration is
+# the fallback that catches router-level errors (unknown route 404, 405).
+app.add_exception_handler(HTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
+app.add_exception_handler(Exception, unhandled_exception_handler)
 
 
 # Set up CORS middleware

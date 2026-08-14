@@ -19,18 +19,25 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, create_engine
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.error_handlers import (
+    http_exception_handler,
+    rate_limit_exceeded_handler,
+    unhandled_exception_handler,
+    validation_exception_handler,
+)
 from app.api.v1 import agent_apps as agent_apps_module
 from app.api.v1 import auth as auth_module
 from app.api.v1.api import api_router
@@ -46,6 +53,7 @@ from app.services.database import database_service
 from app.services.llm.llm_store import compute_llm_config_hash
 from app.services.memory import memory_service
 from app.utils.auth import create_access_token
+from tests.conftest import unwrap
 
 
 # ---------------------------------------------------------------------------
@@ -280,10 +288,26 @@ def memory_checkpointer(monkeypatch: pytest.MonkeyPatch) -> MemorySaver:
 
 @pytest.fixture
 def client(db_engine: Any) -> Generator[TestClient, None, None]:
-    """Full api_router under one TestClient with real dependency resolution."""
+    """Full api_router under one TestClient with real dependency resolution.
+
+    Exception handlers (from ``app.api.error_handlers``) mirror the
+    ``app.main`` registrations verbatim (same five registrations, same
+    order) so every error exit emits the production envelope
+    ``{code, message, data}`` instead of FastAPI's default ``{detail}``.
+    """
     app = FastAPI()
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
+    # Production 429 handler from app.api.error_handlers (envelope output),
+    # not slowapi's default {detail} handler — keeps the fixture aligned
+    # with production wiring.
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    # Same dual registration as app.main: fastapi.HTTPException wins for
+    # business errors (most-specific MRO class); the Starlette base-class
+    # entry catches router-level errors (unknown route 404, method 405).
+    app.add_exception_handler(HTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
+    app.add_exception_handler(Exception, unhandled_exception_handler)
     app.include_router(api_router, prefix=settings.API_V1_STR)
     with TestClient(app) as test_client:
         yield test_client
@@ -292,6 +316,24 @@ def client(db_engine: Any) -> Generator[TestClient, None, None]:
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
+
+
+def assert_error_envelope(response: Any, *, code: int, message: str | None = None) -> Any:
+    """Assert the production error envelope ``{code, message, data}``.
+
+    Guards both the HTTP status and the envelope contract (code mirrors the
+    status); returns the ``data`` payload. ``message=None`` skips the exact
+    message check (callers may assert substrings on the returned body).
+    """
+    assert response.status_code == code, response.text
+    body = response.json()
+    assert isinstance(body, dict), f"envelope must be a JSON object, got: {body!r}"
+    assert set(body) == {"code", "message", "data"}, f"unexpected envelope keys: {set(body)}"
+    assert body["code"] == code
+    assert body["message"]
+    if message is not None:
+        assert body["message"] == message
+    return body["data"]
 
 
 async def collect_stream(runtime_obj: Any, *args: Any, **kwargs: Any) -> list[Any]:
@@ -314,18 +356,19 @@ def parse_sse_events(body: str) -> list[dict[str, Any]]:
 
 
 async def create_chat_session(client: TestClient, headers: dict[str, str], agent_app_id: int | None) -> dict[str, Any]:
-    """POST /auth/session and return the session payload."""
+    """POST /auth/session and return the unwrapped session payload."""
     payload: dict[str, Any] = {}
     if agent_app_id is not None:
         payload["agent_app_id"] = agent_app_id
     response = client.post(f"{settings.API_V1_STR}/auth/session", json=payload, headers=headers)
     assert response.status_code == 200, response.text
-    return response.json()
+    return unwrap(response)
 
 
 __all__ = [
     "FakeMcpClient",
     "ScriptedChatModel",
+    "assert_error_envelope",
     "collect_stream",
     "create_chat_session",
     "make_mcp_tool",

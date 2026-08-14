@@ -30,6 +30,7 @@ pytestmark = pytest.mark.integration
 
 API = settings.API_V1_STR
 
+
 def test_lifespan_warmup_degrades_without_external_services(
     db_engine: Any, scripted_model: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -123,8 +124,7 @@ def test_lifespan_shutdown_survives_missing_pool(db_engine: Any, monkeypatch: py
 def test_warm_agent_apps_uses_independent_sessions(db_engine: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Each concurrent warm task owns its own DBSession (no shared session across awaits)."""
     rows = [
-        AgentApp(name=f"warm-{i}", system_prompt="prompt", engine="deepagents", status="published")
-        for i in range(2)
+        AgentApp(name=f"warm-{i}", system_prompt="prompt", engine="deepagents", status="published") for i in range(2)
     ]
     with DBSession(db_engine) as db_session:
         for row in rows:
