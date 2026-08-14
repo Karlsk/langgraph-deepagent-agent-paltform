@@ -20,4 +20,15 @@ describe('design tokens', () => {
     expect(stylesheet).toContain('--ease-standard: cubic-bezier(.2, .8, .2, 1);')
     expect(stylesheet).toContain('@media (prefers-reduced-motion: reduce)')
   })
+
+  it('uses semantic tokens for the application shell', () => {
+    const shell = readFileSync(
+      fileURLToPath(new URL('../src/App.vue', import.meta.url)),
+      'utf8',
+    )
+
+    expect(shell).toContain('background: var(--color-bg-sidebar);')
+    expect(shell).toContain('color: var(--color-text-on-dark);')
+    expect(shell).toContain('background: var(--color-bg-canvas);')
+  })
 })

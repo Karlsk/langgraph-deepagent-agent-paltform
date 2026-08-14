@@ -28,8 +28,6 @@ const activeMenu = computed(() => route.path)
         class="app-menu"
         router
         :default-active="activeMenu"
-        text-color="#5b6b85"
-        active-text-color="#2f6bff"
       >
         <el-menu-item index="/chat">
           <el-icon><ChatLineRound /></el-icon>
@@ -67,14 +65,14 @@ const activeMenu = computed(() => route.path)
 <style scoped>
 .app-shell {
   height: 100%;
-  background: var(--app-bg);
+  background: var(--color-bg-canvas);
 }
 
 .app-sidebar {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--app-border);
-  background: #ffffff;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--color-bg-sidebar);
 }
 
 .app-brand {
@@ -89,10 +87,14 @@ const activeMenu = computed(() => route.path)
   place-items: center;
   width: 38px;
   height: 38px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #2f6bff 0%, #1f52d6 100%);
-  box-shadow: 0 6px 16px rgba(47, 107, 255, 0.28);
-  color: #ffffff;
+  border-radius: var(--radius-md);
+  background: linear-gradient(
+    135deg,
+    var(--color-primary-500) 0%,
+    var(--color-accent-500) 100%
+  );
+  box-shadow: var(--shadow-sm);
+  color: var(--color-text-on-dark);
   font-family: var(--app-font-display);
   font-size: 18px;
   font-weight: 700;
@@ -106,14 +108,14 @@ const activeMenu = computed(() => route.path)
 }
 
 .app-brand__text strong {
-  color: var(--app-ink);
+  color: var(--color-text-on-dark);
   font-family: var(--app-font-display);
   font-size: 15px;
   letter-spacing: 0.01em;
 }
 
 .app-brand__text small {
-  color: var(--app-ink-muted);
+  color: var(--color-text-on-dark-muted);
   font-size: 11px;
 }
 
@@ -121,26 +123,33 @@ const activeMenu = computed(() => route.path)
   flex: 1;
   border-right: none;
   padding: 4px 12px;
+  background: transparent;
 }
 
 .app-menu :deep(.el-menu-item) {
   margin-bottom: 4px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-on-dark-muted);
+  transition:
+    background-color var(--duration-base) var(--ease-standard),
+    color var(--duration-base) var(--ease-standard);
 }
 
 .app-menu :deep(.el-menu-item.is-active) {
-  background: var(--el-color-primary-light-9);
+  background: rgba(255, 255, 255, 0.16);
+  color: var(--color-text-on-dark);
   font-weight: 600;
 }
 
 .app-menu :deep(.el-menu-item:hover) {
-  background: var(--app-bg);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-text-on-dark);
 }
 
 .app-sidebar__footer {
   padding: 16px 20px;
-  border-top: 1px solid var(--app-border);
-  color: var(--app-ink-muted);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--color-text-on-dark-muted);
   font-family: var(--app-font-display);
   font-size: 11px;
   letter-spacing: 0.12em;
@@ -150,6 +159,7 @@ const activeMenu = computed(() => route.path)
 .app-main {
   padding: 24px;
   overflow-y: auto;
+  background: var(--color-bg-canvas);
 }
 
 .app-content {
