@@ -1,0 +1,103 @@
+:root {
+  /* 品牌蓝白色系 —— 覆盖 Element Plus 主题色 */
+  --el-color-primary: #2f6bff;
+  --el-color-primary-light-3: #6692ff;
+  --el-color-primary-light-5: #94b1ff;
+  --el-color-primary-light-7: #c0d1ff;
+  --el-color-primary-light-8: #d7e1ff;
+  --el-color-primary-light-9: #edf2ff;
+  --el-color-primary-dark-2: #1f52d6;
+
+  /* 应用级布局变量 */
+  --app-bg: #f4f7fd;
+  --app-border: #e6ecf7;
+  --app-ink: #101c33;
+  --app-ink-muted: #5b6b85;
+  --app-font-display: 'Sora', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
+    'Microsoft YaHei', sans-serif;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--app-bg);
+  color: var(--app-ink);
+  font-family:
+    'Noto Sans SC',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------------------------------------------------------------- */
+/* 卡片基础样式                                                       */
+/* ---------------------------------------------------------------- */
+.app-card {
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(16, 28, 51, 0.04);
+}
+
+.app-content-card.el-card {
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(16, 28, 51, 0.04);
+}
+
+.app-content-card .el-card__body {
+  padding: 24px;
+}
+
+/* ---------------------------------------------------------------- */
+/* 页面占位骨架通用样式                                                */
+/* ---------------------------------------------------------------- */
+.page-view {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 28px 32px;
+}
+
+.page-view__header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.page-view__eyebrow {
+  margin: 0;
+  color: var(--el-color-primary);
+  font-family: var(--app-font-display);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.page-view__title {
+  margin: 0;
+  color: var(--app-ink);
+  font-family: var(--app-font-display);
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.page-view__desc {
+  margin: 0;
+  color: var(--app-ink-muted);
+  font-size: 13px;
+}
+
+.page-view__body {
+  min-height: 320px;
+}

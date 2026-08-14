@@ -26,3 +26,7 @@ evals/reports/
 
 # SDN real-credential workflow config (template committed instead)
 app/sdn/config/sdn_alert_inspection.yaml
+
+# Frontend
+node_modules/
+*.tsbuildinfo

@@ -164,6 +164,28 @@ stack-logs:
 	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) logs -f
 
 # ---------------------------------------------------------------------------
+# Frontend (agent-web) — plain npm, no run_with_env
+# ---------------------------------------------------------------------------
+web-install:
+	cd agent-web && npm ci
+
+web-dev:
+	cd agent-web && npm run dev
+
+# docker mode is for running vite INSIDE the Docker network (future web
+# containerization), where the compose service name `app` resolves.
+# On the host (incl. `make stack-up` — compose publishes 8000:8000), use
+# `web-dev` instead, which proxies to localhost:8000 by default.
+web-dev-docker:
+	cd agent-web && npm run dev:docker
+
+web-build:
+	cd agent-web && npm run build
+
+web-clean:
+	rm -rf agent-web/node_modules agent-web/dist agent-web/*.tsbuildinfo
+
+# ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
 clean:
@@ -222,6 +244,14 @@ help:
 	@echo "  stack-down           Stop entire stack"
 	@echo "  stack-logs           Tail all service logs"
 	@echo ""
+	@echo "Frontend (agent-web):"
+	@echo "  web-install          Install frontend deps (npm ci)"
+	@echo "  web-dev              Frontend dev server (port 5173, proxies /api)"
+	@echo "  web-dev-docker       Dev server in docker mode (for vite running inside"
+	@echo "                       the Docker network; host dev should use web-dev)"
+	@echo "  web-build            Type-check + production build"
+	@echo "  web-clean            Remove node_modules, dist and tsbuildinfo caches"
+	@echo ""
 	@echo "Misc:"
 	@echo "  clean                Remove .venv, __pycache__, .pytest_cache"
 
@@ -233,4 +263,5 @@ help:
         docker-build docker-up docker-down docker-logs docker-migrate \
         docker-migrate-downgrade docker-migrate-history \
         stack-up stack-down stack-logs \
+        web-install web-dev web-dev-docker web-build web-clean \
         clean help

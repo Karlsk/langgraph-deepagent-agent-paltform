@@ -41,6 +41,7 @@ app/
   services/        # Business logic services
   utils/           # Shared utilities
   workflow/        # Declarative workflow engine (YAML -> LangGraph), under construction
+agent-web/         # Vue 3 + TS + Vite frontend (skeleton, see docs/frontend-spec.md)
 evals/             # LLM evaluation framework (Langfuse-based)
 scripts/           # Environment setup, Docker build scripts
 docs/workflow-reimpl-plan/  # Workflow engine reimplementation plan + specs (contract-driven)
@@ -267,6 +268,17 @@ M0(scaffold+EXP) -> M1(models) -> M2(state) -> M3(node infra) -> M4(LLMNode ∥ 
 ```
 
 EXP closure is the precondition for M1. Each milestone exits only when its spec's DoD is fully green.
+
+## Frontend (agent-web)
+
+`agent-web/` is the Vue 3 + TypeScript + Vite frontend skeleton (Element Plus, blue-white card layout) for this agent console; it currently contains only scaffolding, routing and placeholder views. See `docs/frontend-spec.md` for the full spec.
+
+Skeleton-stage red lines:
+
+- No business logic yet — views are placeholders; do not implement features ahead of the plan.
+- Do NOT introduce state management (Pinia etc.), SSR frameworks (Nuxt), or monorepo tooling on your own.
+- JSON config files (`tsconfig*.json`, `package.json`) must stay strict JSON — no comments allowed (pre-commit `check-json`).
+- All HTTP requests go through `agent-web/src/utils/request.ts` (baseURL `/api/v1`, proxied via `BACKEND_URL`); if backend `API_V1_STR` changes, sync the Vite proxy rule and `request.ts` baseURL together.
 
 ## References
 

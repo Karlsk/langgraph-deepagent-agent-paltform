@@ -57,6 +57,9 @@ README.md
 dist/
 build/
 
+# Frontend (agent-web is built/served separately, not part of the API image)
+agent-web/
+
 # other
 schema.sql
 
