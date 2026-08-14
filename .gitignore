@@ -18,6 +18,7 @@ wheels/
 
 # Misc
 *.ipynb
+.superpowers/
 
 # Reports
 evals/reports/
