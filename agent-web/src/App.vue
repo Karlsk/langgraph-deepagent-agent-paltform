@@ -88,11 +88,7 @@ const activeMenu = computed(() => route.path)
   width: 38px;
   height: 38px;
   border-radius: var(--radius-md);
-  background: linear-gradient(
-    135deg,
-    var(--color-primary-500) 0%,
-    var(--color-accent-500) 100%
-  );
+  background: var(--color-primary-600);
   box-shadow: var(--shadow-sm);
   color: var(--color-text-on-dark);
   font-family: var(--app-font-display);

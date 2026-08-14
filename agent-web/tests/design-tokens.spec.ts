@@ -8,6 +8,34 @@ const stylesheet = readFileSync(
 )
 
 describe('design tokens', () => {
+  it('maps Element Plus color variants to semantic tokens', () => {
+    for (const color of [
+      { name: 'primary', token: '--color-primary-500' },
+      { name: 'success', token: '--color-success-600' },
+      { name: 'warning', token: '--color-warning-600' },
+      { name: 'danger', token: '--color-danger-600' },
+    ]) {
+      for (const [shade, percentage] of [
+        ['light-3', 70],
+        ['light-5', 50],
+        ['light-7', 30],
+        ['light-8', 20],
+        ['light-9', 10],
+      ]) {
+        expect(stylesheet).toContain(
+          `--el-color-${color.name}-${shade}: color-mix(in srgb, var(${color.token}) ${percentage}%, var(--color-bg-surface));`,
+        )
+      }
+
+      expect(stylesheet).toContain(
+        `--el-color-${color.name}-dark-2: color-mix(in srgb, var(${color.token}) 80%, var(--color-text-primary));`,
+      )
+      expect(stylesheet).toContain(
+        `--el-color-${color.name}-rgb: var(--color-${color.name}-rgb);`,
+      )
+    }
+  })
+
   it('defines the approved A-palette semantic tokens', () => {
     expect(stylesheet).toContain('--color-primary-500: #635bff;')
     expect(stylesheet).toContain('--color-accent-500: #36d6b0;')
@@ -30,5 +58,16 @@ describe('design tokens', () => {
     expect(shell).toContain('background: var(--color-bg-sidebar);')
     expect(shell).toContain('color: var(--color-text-on-dark);')
     expect(shell).toContain('background: var(--color-bg-canvas);')
+  })
+
+  it('keeps the light brand glyph on a WCAG-compliant dark-primary mark', () => {
+    const shell = readFileSync(
+      fileURLToPath(new URL('../src/App.vue', import.meta.url)),
+      'utf8',
+    )
+
+    expect(shell).toMatch(
+      /\.app-brand__mark\s*\{[\s\S]*?background: var\(--color-primary-600\);[\s\S]*?color: var\(--color-text-on-dark\);/,
+    )
   })
 })
