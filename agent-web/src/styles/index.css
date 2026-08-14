@@ -31,6 +31,7 @@
 
   --el-color-primary: var(--color-primary-500);
   --el-color-primary-dark-2: var(--color-primary-600);
+  --el-color-primary-light-9: var(--color-primary-50);
   --el-color-success: var(--color-success-600);
   --el-color-warning: var(--color-warning-600);
   --el-color-danger: var(--color-danger-600);
@@ -42,6 +43,11 @@
   --el-text-color-regular: var(--color-text-secondary);
   --el-text-color-secondary: var(--color-text-tertiary);
 
+  /* Compatibility aliases for the root shell pending Task 3 migration. */
+  --app-bg: var(--color-bg-canvas);
+  --app-border: var(--color-border-default);
+  --app-ink: var(--color-text-primary);
+  --app-ink-muted: var(--color-text-secondary);
   --app-font-display: 'Sora', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
     'Microsoft YaHei', sans-serif;
 }
