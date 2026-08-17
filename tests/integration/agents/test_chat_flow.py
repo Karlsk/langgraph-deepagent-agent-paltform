@@ -31,11 +31,11 @@ API = settings.API_V1_STR
 def _publish_app(client: TestClient, headers: dict[str, str], name: str = "chat-app") -> int:
     """Create and publish a minimal AgentApp, returning its id."""
     created = client.post(
-        f"{API}/agent-apps/apps", json={"name": name, "system_prompt": "You are chat."}, headers=headers
+        f"{API}/apps", json={"name": name, "system_prompt": "You are chat."}, headers=headers
     )
     assert created.status_code == 201, created.text
     app_id = unwrap(created, expected_code=201)["id"]
-    published = client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers)
+    published = client.post(f"{API}/apps/{app_id}/publish", headers=headers)
     assert published.status_code == 200, published.text
     return app_id
 
@@ -115,7 +115,7 @@ def test_session_binding_rejects_unpublished_app(client: TestClient, user_header
     """Binding a session to a draft AgentApp fails; missing ids fail with 404."""
     management = _management_headers(client, user_headers)
     created = client.post(
-        f"{API}/agent-apps/apps", json={"name": "draft-app", "system_prompt": "Draft."}, headers=management
+        f"{API}/apps", json={"name": "draft-app", "system_prompt": "Draft."}, headers=management
     )
     assert created.status_code == 201, created.text
     draft_id = unwrap(created, expected_code=201)["id"]
@@ -194,7 +194,7 @@ def test_chat_stream_observes_subagent_task_duration(
     """Streaming a delegating chat observes subagent_task_duration_seconds{subagent}."""
     management = _management_headers(client, user_headers)
     created_sub = client.post(
-        f"{API}/agent-apps/subagents",
+        f"{API}/subagents",
         json={
             "name": "researcher",
             "description": "Research helper",
@@ -206,13 +206,13 @@ def test_chat_stream_observes_subagent_task_duration(
     assert created_sub.status_code == 201, created_sub.text
 
     created = client.post(
-        f"{API}/agent-apps/apps",
+        f"{API}/apps",
         json={"name": "delegating-app", "system_prompt": "You delegate.", "subagent_names": ["researcher"]},
         headers=management,
     )
     assert created.status_code == 201, created.text
     app_id = unwrap(created, expected_code=201)["id"]
-    assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=management).status_code == 200
+    assert client.post(f"{API}/apps/{app_id}/publish", headers=management).status_code == 200
     headers = _session_headers(client, user_headers, app_id)
 
     # Coordinator delegates via the task tool; the subagent answers; coordinator wraps.

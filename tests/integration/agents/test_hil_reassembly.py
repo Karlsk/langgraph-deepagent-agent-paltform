@@ -38,7 +38,7 @@ def _setup_mcp_server(client: TestClient, headers: dict[str, str], fake_tools: d
     """Register an http MCP server exposing the fake ``it_search`` tool."""
     fake_tools["it-server"] = [make_mcp_tool("it_search", reply="tool-result")]
     body = {"name": "it-server", "transport": "http", "url": "https://mcp.example.com/sse"}
-    response = client.post(f"{API}/agent-apps/mcp-servers", json=body, headers=headers)
+    response = client.post(f"{API}/mcp-servers", json=body, headers=headers)
     assert response.status_code == 201, response.text
 
 
@@ -54,7 +54,7 @@ def test_hil_interrupt_then_resume_round_trip(
     _setup_mcp_server(client, headers, fake_mcp)
 
     created = client.post(
-        f"{API}/agent-apps/apps",
+        f"{API}/apps",
         json={
             "name": "hil-app",
             "system_prompt": "You need approval.",
@@ -65,7 +65,7 @@ def test_hil_interrupt_then_resume_round_trip(
     )
     assert created.status_code == 201, created.text
     app_id = unwrap(created, expected_code=201)["id"]
-    assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers).status_code == 200
+    assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
     session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
     assert session.status_code == 200, session.text
@@ -115,13 +115,13 @@ def test_runtime_cache_hit_and_fingerprint_reassembly(
     _setup_mcp_server(client, headers, fake_mcp)
 
     created = client.post(
-        f"{API}/agent-apps/apps",
+        f"{API}/apps",
         json={"name": "cached-app", "system_prompt": "You are cached.", "allowed_tools": ["it_search"]},
         headers=headers,
     )
     assert created.status_code == 201, created.text
     app_id = unwrap(created, expected_code=201)["id"]
-    assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers).status_code == 200
+    assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
     with DBSession(db_engine) as db_session:
         runtime_1 = asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
@@ -130,7 +130,7 @@ def test_runtime_cache_hit_and_fingerprint_reassembly(
 
     # Changing the MCP server configuration changes the fingerprint.
     patched = client.patch(
-        f"{API}/agent-apps/mcp-servers/it-server", json={"url": "https://mcp.example.com/v2"}, headers=headers
+        f"{API}/mcp-servers/it-server", json={"url": "https://mcp.example.com/v2"}, headers=headers
     )
     assert patched.status_code == 200, patched.text
 

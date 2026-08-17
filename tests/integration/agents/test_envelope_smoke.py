@@ -46,7 +46,7 @@ def test_create_endpoint_envelope_code_mirrors_201(client: TestClient, user_head
     headers = _management_headers(client, user_headers)
 
     created = client.post(
-        f"{API}/agent-apps/apps", json={"name": "smoke-app", "system_prompt": "Smoke."}, headers=headers
+        f"{API}/apps", json={"name": "smoke-app", "system_prompt": "Smoke."}, headers=headers
     )
     assert created.status_code == 201
     data = _assert_envelope(created.json(), code=201)
@@ -58,21 +58,21 @@ def test_read_list_and_delete_endpoints_carry_200_envelope(client: TestClient, u
     """GET single, GET list and DELETE all return code=200 envelopes (null data on delete)."""
     headers = _management_headers(client, user_headers)
     app_id = unwrap(
-        client.post(f"{API}/agent-apps/apps", json={"name": "read-app", "system_prompt": "Read."}, headers=headers),
+        client.post(f"{API}/apps", json={"name": "read-app", "system_prompt": "Read."}, headers=headers),
         expected_code=201,
     )["id"]
 
-    single = client.get(f"{API}/agent-apps/apps/{app_id}", headers=headers)
+    single = client.get(f"{API}/apps/{app_id}", headers=headers)
     assert single.status_code == 200
     assert _assert_envelope(single.json(), code=200)["name"] == "read-app"
 
-    listed = client.get(f"{API}/agent-apps/apps", headers=headers)
+    listed = client.get(f"{API}/apps", headers=headers)
     assert listed.status_code == 200
     rows = _assert_envelope(listed.json(), code=200)
     assert isinstance(rows, list)
     assert {row["name"] for row in rows} >= {"read-app"}
 
-    deleted = client.delete(f"{API}/agent-apps/apps/{app_id}", headers=headers)
+    deleted = client.delete(f"{API}/apps/{app_id}", headers=headers)
     assert deleted.status_code == 200
     assert _assert_envelope(deleted.json(), code=200) is None
 
@@ -112,7 +112,7 @@ def test_unauthenticated_protected_endpoint_403_is_enveloped(client: TestClient)
     HTTPBearer rejects a missing Authorization header with 403 "Not
     authenticated" (FastAPI semantics), so the envelope carries code=403.
     """
-    response = client.get(f"{API}/agent-apps/apps")
+    response = client.get(f"{API}/apps")
     assert response.status_code == 403
 
     body = response.json()

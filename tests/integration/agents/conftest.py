@@ -38,8 +38,8 @@ from app.api.error_handlers import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
-from app.api.v1 import agent_apps as agent_apps_module
 from app.api.v1 import auth as auth_module
+from app.api.v1 import mcp_servers as mcp_servers_module
 from app.api.v1.api import api_router
 from app.core.config import settings
 from app.core.limiter import limiter
@@ -252,7 +252,7 @@ def fake_mcp(monkeypatch: pytest.MonkeyPatch) -> Generator[dict[str, list[Any]],
     FakeMcpClient.tools_by_server = tools_by_server
     FakeMcpClient.fail_servers = set()
     monkeypatch.setattr(mcp_manager, "MultiServerMCPClient", FakeMcpClient)
-    monkeypatch.setattr(agent_apps_module, "MultiServerMCPClient", FakeMcpClient)
+    monkeypatch.setattr(mcp_servers_module, "MultiServerMCPClient", FakeMcpClient)
     yield tools_by_server
     mcp_manager._clients.clear()  # noqa: SLF001 — process cache hygiene
     mcp_manager._server_hashes.clear()  # noqa: SLF001

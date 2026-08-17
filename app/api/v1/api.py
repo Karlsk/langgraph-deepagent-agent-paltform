@@ -6,9 +6,13 @@ endpoints like authentication and chatbot functionality.
 
 from fastapi import APIRouter
 
-from app.api.v1.agent_apps import router as agent_apps_router
+from app.api.v1.apps import router as apps_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.chatbot import router as chatbot_router
+from app.api.v1.llm_configs import router as llm_configs_router
+from app.api.v1.mcp_servers import router as mcp_servers_router
+from app.api.v1.skills import router as skills_router
+from app.api.v1.subagents import router as subagents_router
 from app.core.logging import logger
 from app.workflow.api import router as workflow_router
 
@@ -17,7 +21,11 @@ api_router = APIRouter()
 # Include routers
 api_router.include_router(auth_router, prefix="/auth", tags=["Auth"])
 api_router.include_router(chatbot_router, prefix="/chatbot", tags=["Chatbot"])
-api_router.include_router(agent_apps_router, prefix="/agent-apps", tags=["Agent Apps"])
+api_router.include_router(subagents_router, tags=["SubAgents"])
+api_router.include_router(skills_router, tags=["Skills"])
+api_router.include_router(apps_router, tags=["Agent Apps"])
+api_router.include_router(mcp_servers_router, tags=["MCP Servers"])
+api_router.include_router(llm_configs_router, tags=["LLM Configs"])
 api_router.include_router(workflow_router, tags=["Workflow"])
 
 

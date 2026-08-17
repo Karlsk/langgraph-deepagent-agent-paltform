@@ -43,7 +43,7 @@ def _create_mcp_server(
         "url": "https://mcp.example.com/sse",
         "headers": {"Authorization": "${IT_MCP_AUTH}"},
     }
-    response = client.post(f"{API}/agent-apps/mcp-servers", json=body, headers=headers)
+    response = client.post(f"{API}/mcp-servers", json=body, headers=headers)
     assert response.status_code == 201, response.text
     return unwrap(response, expected_code=201)
 
@@ -55,7 +55,7 @@ def test_mcp_server_registration_feeds_tool_catalog(
     headers = _auth(client, user_headers)
 
     # Baseline: only builtin entries, all labelled source=builtin.
-    baseline = client.get(f"{API}/agent-apps/tools/catalog", headers=headers)
+    baseline = client.get(f"{API}/tools/catalog", headers=headers)
     assert baseline.status_code == 200
     baseline_entries = unwrap(baseline)
     baseline_names = {entry["name"] for entry in baseline_entries}
@@ -66,7 +66,7 @@ def test_mcp_server_registration_feeds_tool_catalog(
     assert created["headers"] == {"Authorization": "${IT_MCP_AUTH}"}
     assert created["content_hash"]
 
-    catalog = client.get(f"{API}/agent-apps/tools/catalog", headers=headers)
+    catalog = client.get(f"{API}/tools/catalog", headers=headers)
     assert catalog.status_code == 200
     entries = unwrap(catalog)
     by_name = {entry["name"]: entry for entry in entries}
@@ -91,7 +91,7 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
 
     # Global skill (direct input) + subagent with inherited fields left blank.
     skill = client.post(
-        f"{API}/agent-apps/skills",
+        f"{API}/skills",
         json={
             "name": "report-style",
             "description": "Report style guide",
@@ -101,7 +101,7 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
     )
     assert skill.status_code == 201, skill.text
     subagent = client.post(
-        f"{API}/agent-apps/subagents",
+        f"{API}/subagents",
         json={
             "name": "researcher",
             "description": "Research helper",
@@ -117,7 +117,7 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
 
     # AgentApp referencing both assets plus a whitelist containing an unknown tool.
     created = client.post(
-        f"{API}/agent-apps/apps",
+        f"{API}/apps",
         json={
             "name": "support-app",
             "system_prompt": "You are support.",
@@ -133,20 +133,20 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
     assert created_payload["status"] == "draft"
 
     # Out-of-whitelist publish is rejected with a 422 envelope naming the offender.
-    denied = client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers)
+    denied = client.post(f"{API}/apps/{app_id}/publish", headers=headers)
     assert_error_envelope(denied, code=422)
     assert "ghost_tool" in denied.json()["message"]
 
     # Fix the whitelist, publish succeeds, /apps/published lists the app.
-    fixed = client.patch(f"{API}/agent-apps/apps/{app_id}", json={"allowed_tools": ["it_search"]}, headers=headers)
+    fixed = client.patch(f"{API}/apps/{app_id}", json={"allowed_tools": ["it_search"]}, headers=headers)
     assert fixed.status_code == 200, fixed.text
-    published = client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers)
+    published = client.post(f"{API}/apps/{app_id}/publish", headers=headers)
     assert published.status_code == 200, published.text
     published_payload = unwrap(published)
     assert published_payload["status"] == "published"
     assert published_payload["published_hash"]
 
-    listing = client.get(f"{API}/agent-apps/apps/published", headers=headers)
+    listing = client.get(f"{API}/apps/published", headers=headers)
     assert listing.status_code == 200
     names = [row["name"] for row in unwrap(listing)]
     assert "support-app" in names
@@ -161,20 +161,20 @@ def test_skill_content_refreshed_on_reassembly(
     """Updating a global skill changes the user copy after the next assembly."""
     headers = _auth(client, user_headers)
     skill = client.post(
-        f"{API}/agent-apps/skills",
+        f"{API}/skills",
         json={"name": "style-guide", "description": "Style", "body": "# style-guide\n\nversion-1\n"},
         headers=headers,
     )
     assert skill.status_code == 201, skill.text
 
     app = client.post(
-        f"{API}/agent-apps/apps",
+        f"{API}/apps",
         json={"name": "styled-app", "system_prompt": "You are styled.", "skill_names": ["style-guide"]},
         headers=headers,
     )
     assert app.status_code == 201, app.text
     app_id = unwrap(app, expected_code=201)["id"]
-    assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers).status_code == 200
+    assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
     session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
     assert session.status_code == 200, session.text
@@ -194,7 +194,7 @@ def test_skill_content_refreshed_on_reassembly(
 
     # Update the global skill; the next compile re-materializes the copy.
     updated = client.patch(
-        f"{API}/agent-apps/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers
+        f"{API}/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers
     )
     assert updated.status_code == 200, updated.text
 

@@ -40,7 +40,7 @@ def test_subagent_one_shot_test_run_is_isolated(
     headers = _auth(client, user_headers)
 
     created = client.post(
-        f"{API}/agent-apps/subagents",
+        f"{API}/subagents",
         json={
             "name": "summarizer",
             "description": "Summarizes text",
@@ -58,7 +58,7 @@ def test_subagent_one_shot_test_run_is_isolated(
 
     scripted_model.responses = [AIMessage(content="one-shot summary")]
     result = client.post(
-        f"{API}/agent-apps/subagents/summarizer/test", json={"prompt": "summarize this"}, headers=headers
+        f"{API}/subagents/summarizer/test", json={"prompt": "summarize this"}, headers=headers
     )
     assert result.status_code == 200, result.text
     payload = unwrap(result)
@@ -76,7 +76,7 @@ def test_subagent_one_shot_test_run_is_isolated(
 def test_subagent_test_unknown_name_404(client: TestClient, user_headers: dict[str, str]) -> None:
     """Test-running a missing subagent returns a 404 error envelope."""
     headers = _auth(client, user_headers)
-    response = client.post(f"{API}/agent-apps/subagents/ghost/test", json={"prompt": "hi"}, headers=headers)
+    response = client.post(f"{API}/subagents/ghost/test", json={"prompt": "hi"}, headers=headers)
     assert_error_envelope(response, code=404, message="subagent 'ghost' not found")
 
 
@@ -86,7 +86,7 @@ def test_skill_delete_cascades_user_copies(
     """Deleting a global skill removes the per-user copies created by assembly."""
     headers = _auth(client, user_headers)
     skill = client.post(
-        f"{API}/agent-apps/skills",
+        f"{API}/skills",
         json={"name": "doomed-skill", "description": "Temporary", "body": "# doomed-skill\n"},
         headers=headers,
     )
@@ -94,13 +94,13 @@ def test_skill_delete_cascades_user_copies(
 
     # Publish an app bound to the skill and chat once so assembly copies it.
     app = client.post(
-        f"{API}/agent-apps/apps",
+        f"{API}/apps",
         json={"name": "doomed-app", "system_prompt": "You are doomed.", "skill_names": ["doomed-skill"]},
         headers=headers,
     )
     assert app.status_code == 201, app.text
     app_id = unwrap(app, expected_code=201)["id"]
-    assert client.post(f"{API}/agent-apps/apps/{app_id}/publish", headers=headers).status_code == 200
+    assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
     session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
     assert session.status_code == 200, session.text
@@ -116,9 +116,9 @@ def test_skill_delete_cascades_user_copies(
 
     # Unbind the skill from the app (delete rejects dangling references), then delete.
     assert (
-        client.patch(f"{API}/agent-apps/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
+        client.patch(f"{API}/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
     )
-    deleted = client.delete(f"{API}/agent-apps/skills/doomed-skill", headers=headers)
+    deleted = client.delete(f"{API}/skills/doomed-skill", headers=headers)
     assert deleted.status_code == 200, deleted.text
 
     assert not os.path.exists(user_copy_dir)

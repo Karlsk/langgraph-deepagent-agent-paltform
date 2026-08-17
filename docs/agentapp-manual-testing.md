@@ -4,9 +4,11 @@
 构建启动 → 认证 → Skill → MCP → SubAgent → AgentApp → Chat → HIL（人工介入）。
 
 > **核实基线**：本文所有端点、环境变量与命令均对照以下源码核实过：
-> `app/api/v1/api.py`（路由 prefix）、`app/api/v1/auth.py`、`app/api/v1/agent_apps.py`、
-> `app/api/v1/chatbot.py`、`app/schemas/agent_apps.py`、`app/schemas/auth.py`、`app/schemas/chat.py`、
-> `app/core/config.py`、`Makefile`、`Dockerfile`、`docker-compose.yml`、`scripts/docker-entrypoint.sh`。
+> `app/api/v1/api.py`（路由注册）、`app/api/v1/auth.py`、`app/api/v1/agent_assets_common.py`、
+> `app/api/v1/subagents.py`、`app/api/v1/skills.py`、`app/api/v1/apps.py`、`app/api/v1/mcp_servers.py`、
+> `app/api/v1/llm_configs.py`、`app/api/v1/chatbot.py`、`app/schemas/agent_apps.py`、`app/schemas/auth.py`、
+> `app/schemas/chat.py`、`app/core/config.py`、`Makefile`、`Dockerfile`、`docker-compose.yml`、
+> `scripts/docker-entrypoint.sh`。
 > 若代码变更，请以源码为准。
 
 ## 全文约定
@@ -23,7 +25,7 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 - **两类 token 的关键区别**（来自 `auth.py` 的依赖注入）：
   - `POST /auth/register`、`POST /auth/login` 返回的是**用户 token**；
   - `POST /auth/session` 用用户 token 换取**会话 token**；
-  - `/agent-apps/*` 与 `/chatbot/*` 全部端点都依赖 `get_current_session`，**必须使用会话 token**。
+  - `/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/llm-configs/*`、`/tools/*` 与 `/chatbot/*` 全部端点都依赖 `get_current_session`，**必须使用会话 token**。
   第 2 节会给出切换 `$TOKEN` 的明确步骤。
 - **统一响应信封**：除豁免端点外，所有端点返回 `{code, message, data}` 信封——`code` 数值与
   HTTP status 完全一致（资产创建端点 HTTP 201 且 `code=201`；`POST /auth/register`
@@ -150,7 +152,7 @@ LOG_FORMAT=console
 
 > **核实结论（入库改造后）**：LLM 配置分两条链路——
 > - **Agent 资产链路（AgentApp / SubAgent / 对话）已 DB 化**：模型配置存于 `llm_config` 表，
->   经 `/agent-apps/llm-configs` API 管理；AgentApp/SubAgent 的 `model` 字段是 LlmConfig
+>   经 `/llm-configs` API 管理；AgentApp/SubAgent 的 `model` 字段是 LlmConfig
 >   **引用名**（NULL 解析为 `default`）。`.env` 的 LLM 变量**仅作启动时 default 配置的一次性种子**。
 > - **系统级链路（会话命名、skill 草稿生成、LLMService 循环回退、evals）仍走 env**：
 >   `app/services/llm/registry.py` 的 `ChatOpenAI` 未显式传 `base_url`，依赖链自动回退读环境变量——
@@ -162,7 +164,7 @@ LOG_FORMAT=console
 `OPENAI_API_KEY`（api_key）、`OPENAI_BASE_URL` 环境变量（base_url，未设则为空）、
 `DEFAULT_LLM_MODEL`（model_name）、`DEFAULT_LLM_TEMPERATURE`（temperature）。
 **注意：种子不含 `max_tokens`**（刻意保持为空，走 provider 默认值——进程级预算不应冻结入库）；
-如需对 Agent 链路限额，用 `PATCH /agent-apps/llm-configs/default` 显式设置 `max_tokens`。
+如需对 Agent 链路限额，用 `PATCH /llm-configs/default` 显式设置 `max_tokens`。
 `MAX_TOKENS` 环境变量**不种子到该行**，仅作用于系统级链路（`app/services/llm/registry.py`
 以 `max_completion_tokens` 下发）及消息历史裁剪预算（`app/utils/graph.py`）。
 **仅 insert-if-missing，不覆盖已存在行**——改 `.env` 后重启**不会**更新库里配置。
@@ -171,7 +173,7 @@ LOG_FORMAT=console
 
 ```bash
 # 方式一：直接 PATCH default 配置（NULL 引用的应用随之生效）
-curl -s -X PATCH "$BASE/agent-apps/llm-configs/default" \
+curl -s -X PATCH "$BASE/llm-configs/default" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -185,11 +187,11 @@ curl -s -X PATCH "$BASE/agent-apps/llm-configs/default" \
 ```
 
 **改 env 后想让 default 配置同步更新**：`default` 是设计约束下**无条件禁删**的配置
-（`DELETE /agent-apps/llm-configs/default` 恒返回 422，见 5.5.4 节负向用例），不能走
+（`DELETE /llm-configs/default` 恒返回 422，见 5.5.4 节负向用例），不能走
 「删除 + 重启重建」路径；正确做法是直接 PATCH 覆盖：
 
 ```bash
-curl -s -X PATCH "$BASE/agent-apps/llm-configs/default" \
+curl -s -X PATCH "$BASE/llm-configs/default" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -370,7 +372,7 @@ export USER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
 
 ### 2.3 创建会话并切换到会话 token
 
-**目的**：后续所有 `/agent-apps/*` 与 `/chatbot/*` 端点都要求**会话 token**。此处先不绑定
+**目的**：后续所有资产端点（`/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/llm-configs/*`、`/tools/*`）与 `/chatbot/*` 端点都要求**会话 token**。此处先不绑定
 AgentApp（body 可省略），第 7 节再创建绑定会话。
 
 ```bash
@@ -394,13 +396,13 @@ export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.loa
 
 ## 3. Skill 功能
 
-所有端点位于 `$BASE/agent-apps/skills*`，需要会话 token。
+所有端点位于 `$BASE/skills*`，需要会话 token。
 `name` 规则：`^[a-z0-9][a-z0-9_-]*$`，最长 64 字符，创建后不可改名。
 
 ### 3.1 创建全局 Skill（直接输入）
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/skills" \
+curl -s -X POST "$BASE/skills" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -418,8 +420,8 @@ curl -s -X POST "$BASE/agent-apps/skills" \
 ### 3.2 列表与详情
 
 ```bash
-curl -s "$BASE/agent-apps/skills" -H "Authorization: Bearer $TOKEN"
-curl -s "$BASE/agent-apps/skills/csv-report" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/skills" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：列表信封 `data` 为元数据数组（不含正文）；详情信封 `data` 同 `SkillRead`。
@@ -428,7 +430,7 @@ curl -s "$BASE/agent-apps/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ### 3.3 读取正文
 
 ```bash
-curl -s "$BASE/agent-apps/skills/csv-report/content" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/skills/csv-report/content" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：信封 `data` 为 `{"name": "csv-report", "content": "<完整 SKILL.md 正文>"}`，与创建时 body 一致。
@@ -436,7 +438,7 @@ curl -s "$BASE/agent-apps/skills/csv-report/content" -H "Authorization: Bearer $
 ### 3.4 PATCH 更新
 
 ```bash
-curl -s -X PATCH "$BASE/agent-apps/skills/csv-report" \
+curl -s -X PATCH "$BASE/skills/csv-report" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"description": "生成 CSV 数据周报（v2，含图表建议）"}'
@@ -448,7 +450,7 @@ curl -s -X PATCH "$BASE/agent-apps/skills/csv-report" \
 **负向用例（name 不可变）**：
 
 ```bash
-curl -s -X PATCH "$BASE/agent-apps/skills/csv-report" \
+curl -s -X PATCH "$BASE/skills/csv-report" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "renamed"}'
@@ -459,7 +461,7 @@ curl -s -X PATCH "$BASE/agent-apps/skills/csv-report" \
 ### 3.5 LLM 草稿生成（⚠️ 需外部资源 / 会消耗 token）
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/skills/generate" \
+curl -s -X POST "$BASE/skills/generate" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"description": "一个帮助撰写 Git 提交信息的技能", "hint": "遵循 Conventional Commits"}'
@@ -473,14 +475,14 @@ curl -s -X POST "$BASE/agent-apps/skills/generate" \
 
 ### 3.6 删除（建议放到第 9 节收尾时再测）
 
-`DELETE $BASE/agent-apps/skills/csv-report` 会级联清理该 skill 的用户副本。由于第 6 节创建的
+`DELETE $BASE/skills/csv-report` 会级联清理该 skill 的用户副本。由于第 6 节创建的
 AgentApp 会引用该 skill，**先删 skill 会导致发布校验报 422**，所以请保留到收尾阶段再验证。
 
 ---
 
 ## 4. MCP 功能
 
-所有端点位于 `$BASE/agent-apps/mcp-servers*` 与 `$BASE/agent-apps/tools/catalog`。
+所有端点位于 `$BASE/mcp-servers*` 与 `$BASE/tools/catalog`。
 
 ### 4.1 准备最小本地 stdio MCP server
 
@@ -520,7 +522,7 @@ if __name__ == "__main__":
 ### 4.2 注册 MCP server
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/mcp-servers" \
+curl -s -X POST "$BASE/mcp-servers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -543,7 +545,7 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
 ### 4.3 查看工具目录，确认 builtin + mcp 与 source 标签
 
 ```bash
-curl -s "$BASE/agent-apps/tools/catalog" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/tools/catalog" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：信封 `data` 数组中同时包含：
@@ -561,7 +563,7 @@ MCP server 的 `env`（stdio）与 `headers`（http）中，凡是需要注入�
 
 ```bash
 # 正确：占位符（要求 app 容器内存在 DEMO_API_TOKEN 环境变量才能实际生效）
-curl -s -X POST "$BASE/agent-apps/mcp-servers" \
+curl -s -X POST "$BASE/mcp-servers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -577,7 +579,7 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
 **负向用例（明文 secret 被拒）**：
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/mcp-servers" \
+curl -s -X POST "$BASE/mcp-servers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -593,7 +595,7 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
 ### 4.5 负向用例：shell 命令被 422 拒绝
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/mcp-servers" \
+curl -s -X POST "$BASE/mcp-servers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -614,7 +616,7 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
 再注册一个指向**同一脚本**的 server（工具名 `add`/`echo` 与 `demo-stdio` 冲突）：
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/mcp-servers" \
+curl -s -X POST "$BASE/mcp-servers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -629,19 +631,19 @@ curl -s -X POST "$BASE/agent-apps/mcp-servers" \
 若探活失败/超时（返回 None），冲突检查会被跳过而创建成功（HTTP 201 信封）——此时查日志确认
 `mcp_server_tool_probe_timeout` / `mcp_server_tool_probe_failed`，属于设计上的降级行为。
 
-> 另可用 `GET/PATCH/DELETE $BASE/agent-apps/mcp-servers/demo-stdio` 验证单条读改删；
+> 另可用 `GET/PATCH/DELETE $BASE/mcp-servers/demo-stdio` 验证单条读改删；
 > PATCH 同样禁止 `name`，且改 `command/args/transport` 时会重新做白名单与冲突校验。
 
 ---
 
 ## 5. SubAgent 功能
 
-所有端点位于 `$BASE/agent-apps/subagents*`。
+所有端点位于 `$BASE/subagents*`。
 
 ### 5.1 创建（含留空继承字段）
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/subagents" \
+curl -s -X POST "$BASE/subagents" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -664,10 +666,10 @@ curl -s -X POST "$BASE/agent-apps/subagents" \
 ### 5.2 列表 / 详情 / 更新
 
 ```bash
-curl -s "$BASE/agent-apps/subagents" -H "Authorization: Bearer $TOKEN"
-curl -s "$BASE/agent-apps/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/subagents" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
 
-curl -s -X PATCH "$BASE/agent-apps/subagents/search-helper" \
+curl -s -X PATCH "$BASE/subagents/search-helper" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"max_turns": 3}'
@@ -679,7 +681,7 @@ curl -s -X PATCH "$BASE/agent-apps/subagents/search-helper" \
 ### 5.3 单轮测试运行（⚠️ 需外部资源 / 会消耗 token）
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/subagents/search-helper/test" \
+curl -s -X POST "$BASE/subagents/search-helper/test" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "用一句话介绍你自己。"}'
@@ -694,7 +696,7 @@ curl -s -X POST "$BASE/agent-apps/subagents/search-helper/test" \
 ### 5.4 负向用例：PATCH name 被 422 拒绝
 
 ```bash
-curl -s -X PATCH "$BASE/agent-apps/subagents/search-helper" \
+curl -s -X PATCH "$BASE/subagents/search-helper" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "renamed-helper"}'
@@ -704,14 +706,14 @@ curl -s -X PATCH "$BASE/agent-apps/subagents/search-helper" \
 
 ### 5.5 LLM 配置管理（llm-configs CRUD）
 
-所有端点位于 `$BASE/agent-apps/llm-configs*`。LlmConfig 是 AgentApp/SubAgent `model` 字段
+所有端点位于 `$BASE/llm-configs*`。LlmConfig 是 AgentApp/SubAgent `model` 字段
 （引用名）的实际承载体；`name` 规则同其他资产（`^[a-z0-9][a-z0-9_-]*$`，创建后不可改名）。
 **任何响应都不返回 `api_key` 明文，只返回 `api_key_masked`（`****`+尾 4 位）。**
 
 #### 5.5.1 创建配置
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/llm-configs" \
+curl -s -X POST "$BASE/llm-configs" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -732,8 +734,8 @@ curl -s -X POST "$BASE/agent-apps/llm-configs" \
 #### 5.5.2 列表与详情（恒掩码）
 
 ```bash
-curl -s "$BASE/agent-apps/llm-configs" -H "Authorization: Bearer $TOKEN"
-curl -s "$BASE/agent-apps/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/llm-configs" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：列表/详情的信封 `data` 均含启动时 bootstrap 种子的 `default` 配置与刚创建的 `proxy`；
@@ -743,7 +745,7 @@ curl -s "$BASE/agent-apps/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
 
 ```bash
 # 只改温度，不带 api_key
-curl -s -X PATCH "$BASE/agent-apps/llm-configs/proxy" \
+curl -s -X PATCH "$BASE/llm-configs/proxy" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"temperature": 0.5}'
@@ -756,7 +758,7 @@ curl -s -X PATCH "$BASE/agent-apps/llm-configs/proxy" \
 
 ```bash
 # 负向 1：default 禁删
-curl -s -X DELETE "$BASE/agent-apps/llm-configs/default" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/llm-configs/default" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：422 信封，`message` 表明 default 配置受保护。
@@ -764,11 +766,11 @@ curl -s -X DELETE "$BASE/agent-apps/llm-configs/default" -H "Authorization: Bear
 ```bash
 # 负向 2：被引用的配置禁删（先把某个 AgentApp 的 model 指向 proxy，
 # 或在 6.1 创建 app 时传 "model": "proxy" 后再删）
-curl -s -X PATCH "$BASE/agent-apps/apps/$APP_ID" \
+curl -s -X PATCH "$BASE/apps/$APP_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"model": "proxy"}'
-curl -s -X DELETE "$BASE/agent-apps/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：DELETE 返回 422 信封，`message` 列出引用方（`agent_app:<name>` / `subagent:<name>`）。
@@ -781,12 +783,12 @@ curl -s -X DELETE "$BASE/agent-apps/llm-configs/proxy" -H "Authorization: Bearer
 
 ## 6. AgentApp 功能
 
-所有端点位于 `$BASE/agent-apps/apps*`。创建后 `status=draft`，需显式 publish 才能被会话绑定。
+所有端点位于 `$BASE/apps*`。创建后 `status=draft`，需显式 publish 才能被会话绑定。
 
 ### 6.1 创建（关联 skill + subagent，allowed_tools 含内置 + MCP 工具）
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/apps" \
+curl -s -X POST "$BASE/apps" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -816,7 +818,7 @@ export APP_ID=<上一步信封 data 中返回的 id>
 先创建一个 `allowed_tools` 含不存在工具的应用再发布：
 
 ```bash
-export BAD_APP_ID=$(curl -s -X POST "$BASE/agent-apps/apps" \
+export BAD_APP_ID=$(curl -s -X POST "$BASE/apps" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -825,7 +827,7 @@ export BAD_APP_ID=$(curl -s -X POST "$BASE/agent-apps/apps" \
     "allowed_tools": ["no_such_tool"]
   }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])')
 
-curl -s -X POST "$BASE/agent-apps/apps/$BAD_APP_ID/publish" \
+curl -s -X POST "$BASE/apps/$BAD_APP_ID/publish" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -838,12 +840,12 @@ curl -s -X POST "$BASE/agent-apps/apps/$BAD_APP_ID/publish" \
 应用或子代理的 `model` 引用不存在/被禁用的 LlmConfig（如把 `model` PATCH 成 `ghost-config`）
 也返回 422 信封，`message` 列出缺失/禁用的配置名。
 
-（可用 `DELETE $BASE/agent-apps/apps/$BAD_APP_ID` 清理该脏数据应用。）
+（可用 `DELETE $BASE/apps/$BAD_APP_ID` 清理该脏数据应用。）
 
 ### 6.3 正常发布
 
 ```bash
-curl -s -X POST "$BASE/agent-apps/apps/$APP_ID/publish" \
+curl -s -X POST "$BASE/apps/$APP_ID/publish" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -853,7 +855,7 @@ curl -s -X POST "$BASE/agent-apps/apps/$APP_ID/publish" \
 ### 6.4 已发布列表
 
 ```bash
-curl -s "$BASE/agent-apps/apps/published" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/apps/published" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：信封 `data` 数组中包含刚发布的 `demo-assistant`（以及系统 default 应用——若其已发布；
@@ -862,7 +864,7 @@ default 应用由启动 bootstrap 创建，名称为 `default`）。
 ### 6.5 PATCH 已发布应用后回退 draft
 
 ```bash
-curl -s -X PATCH "$BASE/agent-apps/apps/$APP_ID" \
+curl -s -X PATCH "$BASE/apps/$APP_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"system_prompt": "你是一个演示助理（v2 修订版）。"}'
@@ -873,7 +875,7 @@ curl -s -X PATCH "$BASE/agent-apps/apps/$APP_ID" \
 
 ```bash
 # 重新发布恢复
-curl -s -X POST "$BASE/agent-apps/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
+curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：信封 `data` 中 `status` 重新变为 `published`。
@@ -972,7 +974,7 @@ curl -s -X POST "$BASE/chatbot/chat" \
 ### 8.1 创建并发布一个对搜索工具中断的应用
 
 ```bash
-export HIL_APP_ID=$(curl -s -X POST "$BASE/agent-apps/apps" \
+export HIL_APP_ID=$(curl -s -X POST "$BASE/apps" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -982,7 +984,7 @@ export HIL_APP_ID=$(curl -s -X POST "$BASE/agent-apps/apps" \
     "interrupt_on": {"duckduckgo_search": true}
   }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])')
 
-curl -s -X POST "$BASE/agent-apps/apps/$HIL_APP_ID/publish" -H "Authorization: Bearer $TOKEN"
+curl -s -X POST "$BASE/apps/$HIL_APP_ID/publish" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：发布成功，信封 `data.status="published"`。
@@ -1039,12 +1041,12 @@ curl -s -X POST "$BASE/chatbot/chat" \
 
 ```bash
 # 删除顺序建议：先应用，再子代理/MCP，最后 skill（避免发布引用校验干扰）
-curl -s -X DELETE "$BASE/agent-apps/apps/$HIL_APP_ID" -H "Authorization: Bearer $TOKEN"
-curl -s -X DELETE "$BASE/agent-apps/apps/$APP_ID" -H "Authorization: Bearer $TOKEN"
-curl -s -X DELETE "$BASE/agent-apps/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
-curl -s -X DELETE "$BASE/agent-apps/mcp-servers/demo-stdio" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/apps/$HIL_APP_ID" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/apps/$APP_ID" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/mcp-servers/demo-stdio" -H "Authorization: Bearer $TOKEN"
 # skill 删除会级联清理用户副本（含 {SKILLS_ROOT}/users/<user_id>/ 下的物化文件）
-curl -s -X DELETE "$BASE/agent-apps/skills/csv-report" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ```
 
 每个 DELETE 成功返回信封 `{"code": 200, "message": "...", "data": null}`；对不存在的资源返回 404 信封。

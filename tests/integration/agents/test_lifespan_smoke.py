@@ -84,7 +84,7 @@ def test_import_app_main_smoke() -> None:
     assert main_module.app is not None
     routes = {getattr(route, "path", None) for route in main_module.app.routes}
     assert f"{API}/chatbot/chat" in routes
-    assert f"{API}/agent-apps/apps/published" in routes
+    assert f"{API}/apps/published" in routes
 
 
 def test_lifespan_shutdown_closes_shared_checkpoint_pool(monkeypatch: pytest.MonkeyPatch) -> None:
