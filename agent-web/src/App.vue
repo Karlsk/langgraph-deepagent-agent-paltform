@@ -1,10 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   Connection,
-  Expand,
-  Fold,
   MagicStick,
   Setting,
   User,
@@ -13,32 +11,26 @@ import {
 
 const route = useRoute()
 const activeMenu = computed(() => route.path)
-const isSidebarCollapsed = ref(false)
-const sidebarWidth = computed(() =>
-  isSidebarCollapsed.value
-    ? 'var(--sidebar-width-collapsed)'
-    : 'var(--sidebar-width-expanded)',
-)
+const pageTitle = computed(() => String(route.meta.title ?? ''))
 </script>
 
 <template>
   <el-container class="app-shell">
-    <el-aside id="app-sidebar" class="app-sidebar" :width="sidebarWidth">
-      <div class="app-brand" :class="{ 'app-brand--collapsed': isSidebarCollapsed }">
+    <el-header class="app-header" height="auto">
+      <div class="app-brand">
         <span class="app-brand__mark" aria-hidden="true">A</span>
-        <span v-if="!isSidebarCollapsed" class="app-brand__text">
+        <span class="app-brand__text">
           <strong>Agent Web</strong>
           <small>AI Agent Platform</small>
         </span>
       </div>
 
       <el-menu
-        class="app-menu"
-        :class="{ 'app-menu--collapsed': isSidebarCollapsed }"
+        class="app-nav"
+        mode="horizontal"
         router
         :default-active="activeMenu"
-        :collapse="isSidebarCollapsed"
-        :collapse-transition="false"
+        :ellipsis="false"
       >
         <el-menu-item index="/chat">
           <el-icon><ChatDotRound /></el-icon>
@@ -62,32 +54,20 @@ const sidebarWidth = computed(() =>
         </el-menu-item>
       </el-menu>
 
-      <div
-        class="app-sidebar__footer"
-        :class="{ 'app-sidebar__footer--collapsed': isSidebarCollapsed }"
-      >
-        <button
-          type="button"
-          class="app-sidebar__toggle"
-          :aria-expanded="!isSidebarCollapsed"
-          aria-controls="app-sidebar"
-          :aria-label="isSidebarCollapsed ? '展开侧栏' : '折叠侧栏'"
-          :title="isSidebarCollapsed ? '展开侧栏' : '折叠侧栏'"
-          @click="isSidebarCollapsed = !isSidebarCollapsed"
-        >
-          <el-icon><Expand v-if="isSidebarCollapsed" /><Fold v-else /></el-icon>
-          <span v-if="!isSidebarCollapsed">折叠侧栏</span>
-        </button>
-        <span class="app-sidebar__version">
-          {{ isSidebarCollapsed ? 'v0.1' : 'Version 0.1.0' }}
-        </span>
+      <div class="app-user">
+        <el-avatar :size="32" class="app-user__avatar">
+          <el-icon><User /></el-icon>
+        </el-avatar>
+        <span class="app-user__name">管理员</span>
       </div>
-    </el-aside>
+    </el-header>
 
     <el-main class="app-main">
-      <div class="app-content app-card">
-        <router-view />
-      </div>
+      <el-breadcrumb class="app-breadcrumb" separator="/">
+        <el-breadcrumb-item :to="{ path: '/' }">首页</el-breadcrumb-item>
+        <el-breadcrumb-item>{{ pageTitle }}</el-breadcrumb-item>
+      </el-breadcrumb>
+      <router-view />
     </el-main>
   </el-container>
 </template>
@@ -95,186 +75,139 @@ const sidebarWidth = computed(() =>
 <style scoped>
 .app-shell {
   height: 100%;
+  flex-direction: column;
   background: var(--color-bg-canvas);
 }
 
-.app-sidebar {
+.app-header {
   display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  border-right: 1px solid var(--color-sidebar-border);
-  background: var(--color-bg-sidebar);
-  background-image:
-    radial-gradient(
-      circle at 12% 0%,
-      color-mix(in srgb, var(--color-primary-500) 12%, transparent) 0%,
-      transparent 34%
-    ),
-    radial-gradient(
-      circle at 88% 100%,
-      color-mix(in srgb, var(--color-accent-500) 8%, transparent) 0%,
-      transparent 32%
-    );
-  transition: width var(--duration-base) var(--ease-standard);
+  align-items: center;
+  gap: 24px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--color-border-default);
+  background: var(--color-bg-surface);
 }
 
 .app-brand {
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: 82px;
-  padding: 20px 18px 18px;
-  white-space: nowrap;
-}
-
-.app-brand--collapsed {
-  justify-content: center;
-  padding-inline: 0;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .app-brand__mark {
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   border-radius: var(--radius-md);
-  border: 1px solid color-mix(in srgb, var(--color-primary-500) 42%, transparent);
-  background: color-mix(in srgb, var(--color-primary-500) 16%, transparent);
-  box-shadow:
-    0 0 20px color-mix(in srgb, var(--color-primary-500) 16%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  color: var(--color-text-on-dark);
+  background: linear-gradient(
+    135deg,
+    var(--color-primary-500),
+    var(--color-accent-500)
+  );
+  color: var(--color-bg-surface);
   font-family: var(--app-font-display);
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
 }
 
 .app-brand__text {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   line-height: 1.2;
 }
 
 .app-brand__text strong {
-  background: linear-gradient(
-    115deg,
-    var(--color-primary-500) 0%,
-    var(--color-accent-500) 100%
-  );
-  background-clip: text;
-  -webkit-background-clip: text;
+  color: var(--color-text-primary);
   font-family: var(--app-font-display);
-  font-size: 20px;
+  font-size: 16px;
   font-weight: 800;
   letter-spacing: 0.02em;
-  -webkit-text-fill-color: transparent;
 }
 
 .app-brand__text small {
-  color: var(--color-text-on-dark-muted);
+  color: var(--color-text-tertiary);
   font-size: 11px;
 }
 
-.app-menu {
+.app-nav {
   flex: 1;
-  overflow-y: auto;
-  border-right: none;
-  padding: 4px 10px;
+  min-width: 0;
+  border-bottom: none;
   background: transparent;
 }
 
-.app-menu :deep(.el-menu-item) {
-  position: relative;
-  margin-bottom: 4px;
-  border-radius: var(--radius-md);
-  color: var(--color-text-on-dark);
-  white-space: nowrap;
+.app-nav :deep(.el-menu-item) {
+  border-bottom: 2px solid transparent;
+  color: var(--color-text-secondary);
   transition:
-    background-color var(--duration-base) var(--ease-standard),
+    border-color var(--duration-base) var(--ease-standard),
     color var(--duration-base) var(--ease-standard);
 }
 
-.app-menu :deep(.el-menu-item.is-active) {
-  background: var(--color-sidebar-active);
-  color: var(--color-text-on-dark);
+.app-nav :deep(.el-menu-item:hover) {
+  color: var(--color-text-primary);
+  background: transparent;
+}
+
+.app-nav :deep(.el-menu-item.is-active) {
+  border-bottom-color: var(--color-primary-500);
+  color: var(--color-primary-500);
   font-weight: 600;
-  box-shadow: inset var(--sidebar-indicator-width) 0 0 var(--color-primary-500);
 }
 
-.app-menu :deep(.el-menu-item:hover) {
-  background: var(--color-sidebar-hover);
-  color: var(--color-text-on-dark);
-}
-
-.app-menu--collapsed :deep(.el-menu-item) {
-  padding-inline: 0;
-}
-
-.app-sidebar__footer {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 16px 20px;
-  border-top: 1px solid var(--color-sidebar-border);
-  color: var(--color-text-on-dark-muted);
-  font-family: var(--app-font-display);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.app-sidebar__footer--collapsed {
-  align-items: center;
-  padding-inline: 8px;
-}
-
-.app-sidebar__toggle {
+.app-user {
   display: flex;
   align-items: center;
-  justify-content: flex-start;
   gap: 10px;
-  width: 100%;
-  min-height: 36px;
-  padding: 0 10px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--color-text-on-dark-muted);
-  cursor: pointer;
-  font-family: inherit;
+  flex-shrink: 0;
+}
+
+.app-user__avatar {
+  background: var(--color-primary-50);
+  color: var(--color-primary-500);
+}
+
+.app-user__name {
+  color: var(--color-text-primary);
   font-size: 13px;
-  transition:
-    background-color var(--duration-base) var(--ease-standard),
-    color var(--duration-base) var(--ease-standard);
-}
-
-.app-sidebar__toggle:hover {
-  border-color: var(--color-sidebar-border);
-  background: var(--color-sidebar-hover);
-  color: var(--color-text-on-dark);
-}
-
-.app-sidebar__footer--collapsed .app-sidebar__toggle {
-  justify-content: center;
-  padding-inline: 0;
-}
-
-.app-sidebar__version {
-  color: var(--color-text-on-dark-muted);
-  font-family: var(--app-font-display);
-  font-size: 10px;
-  letter-spacing: 0.1em;
+  font-weight: 600;
 }
 
 .app-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
   padding: 24px;
   overflow-y: auto;
   background: var(--color-bg-canvas);
 }
 
-.app-content {
-  height: 100%;
-  overflow: hidden;
+.app-breadcrumb {
+  flex-shrink: 0;
+}
+
+@media (max-width: 768px) {
+  .app-header {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px 16px;
+  }
+
+  .app-nav {
+    flex-basis: 100%;
+    order: 3;
+    overflow-x: auto;
+  }
+
+  .app-user {
+    margin-left: auto;
+  }
+
+  .app-main {
+    padding: 16px;
+  }
 }
 </style>

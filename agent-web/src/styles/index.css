@@ -13,16 +13,9 @@
   --color-bg-canvas: #f8f8fc;
   --color-bg-subtle: #f1f1f6;
   --color-bg-surface: #ffffff;
-  --color-bg-dark: #0b0f16;
-  --color-bg-sidebar: var(--color-bg-dark);
-  --color-sidebar-hover: rgba(255, 255, 255, 0.1);
-  --color-sidebar-active: rgba(255, 255, 255, 0.12);
-  --color-sidebar-border: rgba(255, 255, 255, 0.08);
   --color-text-primary: #24242e;
   --color-text-secondary: #666674;
   --color-text-tertiary: #90909d;
-  --color-text-on-dark: #f4f4fa;
-  --color-text-on-dark-muted: #a9a9bc;
   --color-border-default: #e4e4ec;
   --color-border-strong: #d2d2df;
   --radius-sm: 6px;
@@ -36,9 +29,6 @@
   --duration-base: 180ms;
   --duration-slow: 240ms;
   --ease-standard: cubic-bezier(.2, .8, .2, 1);
-  --sidebar-width-expanded: 236px;
-  --sidebar-width-collapsed: 72px;
-  --sidebar-indicator-width: 3px;
 
   --el-color-primary: var(--color-primary-500);
   --el-color-primary-light-3: color-mix(in srgb, var(--color-primary-500) 70%, var(--color-bg-surface));
@@ -80,11 +70,6 @@
   --el-text-color-regular: var(--color-text-secondary);
   --el-text-color-secondary: var(--color-text-tertiary);
 
-  /* Compatibility aliases for the root shell pending Task 3 migration. */
-  --app-bg: var(--color-bg-canvas);
-  --app-border: var(--color-border-default);
-  --app-ink: var(--color-text-primary);
-  --app-ink-muted: var(--color-text-secondary);
   --app-font-display: 'Sora', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
     'Microsoft YaHei', sans-serif;
 }
@@ -112,11 +97,12 @@ body {
 /* ---------------------------------------------------------------- */
 /* 卡片基础样式                                                       */
 /* ---------------------------------------------------------------- */
-.app-card {
+.content-card {
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-lg);
   background: var(--color-bg-surface);
   box-shadow: var(--shadow-sm);
+  padding: 20px;
 }
 
 .app-content-card.el-card {
@@ -135,14 +121,26 @@ body {
 .page-view {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  padding: 28px 32px;
+  gap: 16px;
 }
 
 .page-view__header {
   display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.page-view__header > div:first-child {
+  display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.page-view__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .page-view__eyebrow {
@@ -172,6 +170,75 @@ body {
 
 .page-view__body {
   min-height: 320px;
+}
+
+/* ---------------------------------------------------------------- */
+/* 按钮规范（作用于 el-button，统一圆角与动效）                          */
+/* ---------------------------------------------------------------- */
+.el-button.app-btn {
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  transition: all var(--duration-base) var(--ease-standard);
+}
+
+.el-button.app-btn--primary {
+  border: none;
+  background: linear-gradient(
+    135deg,
+    var(--color-primary-500),
+    var(--color-accent-500)
+  );
+  color: var(--color-bg-surface);
+}
+
+.el-button.app-btn--primary:hover,
+.el-button.app-btn--primary:focus {
+  border: none;
+  background: linear-gradient(
+    135deg,
+    var(--color-primary-500),
+    var(--color-accent-500)
+  );
+  color: var(--color-bg-surface);
+  filter: brightness(1.08);
+}
+
+.el-button.app-btn--secondary {
+  border: 1px solid var(--color-border-default);
+  background: var(--color-bg-surface);
+  color: var(--color-text-primary);
+}
+
+.el-button.app-btn--secondary:hover,
+.el-button.app-btn--secondary:focus {
+  border-color: var(--color-primary-500);
+  background: var(--color-bg-surface);
+  color: var(--color-primary-500);
+}
+
+.el-button.app-btn--danger {
+  border-color: var(--color-danger-600);
+  background: var(--color-danger-600);
+  color: var(--color-bg-surface);
+}
+
+.el-button.app-btn--danger:hover,
+.el-button.app-btn--danger:focus {
+  border-color: var(--color-danger-600);
+  background: var(--color-danger-600);
+  color: var(--color-bg-surface);
+  filter: brightness(1.08);
+}
+
+@media (max-width: 768px) {
+  .page-view__header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .page-view__actions {
+    margin-left: 0;
+  }
 }
 
 :where(button, a, input, textarea, select, [tabindex]):focus-visible {

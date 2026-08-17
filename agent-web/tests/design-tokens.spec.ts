@@ -39,8 +39,6 @@ describe('design tokens', () => {
   it('defines the approved A-palette semantic tokens', () => {
     expect(stylesheet).toContain('--color-primary-500: #635bff;')
     expect(stylesheet).toContain('--color-accent-500: #36d6b0;')
-    expect(stylesheet).toContain('--color-bg-dark: #0b0f16;')
-    expect(stylesheet).toContain('--color-bg-sidebar: var(--color-bg-dark);')
     expect(stylesheet).toContain('--color-bg-canvas: #f8f8fc;')
   })
 
@@ -56,23 +54,13 @@ describe('design tokens', () => {
       'utf8',
     )
 
-    expect(shell).toContain('background: var(--color-bg-sidebar);')
-    expect(shell).toContain('color: var(--color-text-on-dark);')
+    expect(shell).toContain('background: var(--color-bg-surface);')
+    expect(shell).toContain('border-bottom: 1px solid var(--color-border-default);')
     expect(shell).toContain('background: var(--color-bg-canvas);')
+    expect(shell).toContain('color: var(--color-text-primary);')
   })
 
-  it('keeps the light Agent Web glyph readable on the dark sidebar', () => {
-    const shell = readFileSync(
-      fileURLToPath(new URL('../src/App.vue', import.meta.url)),
-      'utf8',
-    )
-
-    expect(shell).toMatch(
-      /\.app-brand__mark\s*\{[\s\S]*?background: color-mix\(in srgb, var\(--color-primary-500\) 16%, transparent\);[\s\S]*?color: var\(--color-text-on-dark\);/,
-    )
-  })
-
-  it('defines the Agent Web sidebar brand, navigation, and collapse tokens', () => {
+  it('defines the top-bar brand, navigation and user area', () => {
     const shell = readFileSync(
       fileURLToPath(new URL('../src/App.vue', import.meta.url)),
       'utf8',
@@ -81,27 +69,16 @@ describe('design tokens', () => {
     expect(shell).toContain('>Agent Web</strong>')
     expect(shell).toContain('aria-hidden="true">A</span>')
     expect(shell).toContain('<small>AI Agent Platform</small>')
+    expect(shell).toContain('mode="horizontal"')
     expect(shell).toContain('ChatDotRound')
     expect(shell).toContain('User')
     expect(shell).toContain('Setting')
-    expect(shell).toContain('Fold')
-    expect(shell).toContain('Expand')
-    expect(shell).toContain(':aria-label="isSidebarCollapsed')
-    expect(shell).toContain("'展开侧栏' : '折叠侧栏'")
-    expect(shell).toContain('Version 0.1.0')
+    expect(shell).toContain('el-breadcrumb')
+    expect(shell).toContain('el-avatar')
 
-    expect(stylesheet).toContain(
-      '--color-sidebar-hover: rgba(255, 255, 255, 0.1);',
-    )
-    expect(stylesheet).toContain(
-      '--color-sidebar-active: rgba(255, 255, 255, 0.12);',
-    )
-    expect(stylesheet).toContain('--sidebar-indicator-width: 3px;')
-    expect(stylesheet).toContain('--sidebar-width-expanded: 236px;')
-    expect(stylesheet).toContain('--sidebar-width-collapsed: 72px;')
-    expect(shell).toContain('background: var(--color-sidebar-hover);')
-    expect(shell).toContain(
-      'box-shadow: inset var(--sidebar-indicator-width) 0 0 var(--color-primary-500);',
-    )
+    expect(stylesheet).toContain('.content-card')
+    expect(stylesheet).toContain('padding: 20px;')
+    expect(stylesheet).toContain('border-radius: var(--radius-lg);')
+    expect(stylesheet).toContain('@media (max-width: 768px)')
   })
 })
