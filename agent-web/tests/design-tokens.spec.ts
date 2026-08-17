@@ -54,13 +54,15 @@ describe('design tokens', () => {
       'utf8',
     )
 
+    expect(shell).toContain('background: var(--color-bg-dark);')
     expect(shell).toContain('background: var(--color-bg-surface);')
+    expect(shell).toContain('background: var(--color-bg-subtle);')
     expect(shell).toContain('border-bottom: 1px solid var(--color-border-default);')
     expect(shell).toContain('background: var(--color-bg-canvas);')
     expect(shell).toContain('color: var(--color-text-primary);')
   })
 
-  it('defines the top-bar brand, navigation and user area', () => {
+  it('defines the sidebar brand, navigation and footer', () => {
     const shell = readFileSync(
       fileURLToPath(new URL('../src/App.vue', import.meta.url)),
       'utf8',
@@ -69,16 +71,36 @@ describe('design tokens', () => {
     expect(shell).toContain('>Agent Web</strong>')
     expect(shell).toContain('aria-hidden="true">A</span>')
     expect(shell).toContain('<small>AI Agent Platform</small>')
-    expect(shell).toContain('mode="horizontal"')
+    expect(shell).toContain('mode="vertical"')
+    expect(shell).toContain(':collapse="collapsed"')
+    expect(shell).toContain('Fold')
+    expect(shell).toContain('Expand')
+    expect(shell).toContain('v0.1.0')
     expect(shell).toContain('ChatDotRound')
     expect(shell).toContain('User')
     expect(shell).toContain('Setting')
     expect(shell).toContain('el-breadcrumb')
     expect(shell).toContain('el-avatar')
 
+    expect(stylesheet).toContain('--color-bg-dark: #0b0f16;')
+    expect(stylesheet).toContain('--color-text-on-dark')
     expect(stylesheet).toContain('.content-card')
     expect(stylesheet).toContain('padding: 20px;')
     expect(stylesheet).toContain('border-radius: var(--radius-lg);')
     expect(stylesheet).toContain('@media (max-width: 768px)')
+  })
+
+  it('defines the top-bar action buttons and crumb bar', () => {
+    const shell = readFileSync(
+      fileURLToPath(new URL('../src/App.vue', import.meta.url)),
+      'utf8',
+    )
+
+    expect(shell).toContain('FullScreen')
+    expect(shell).toContain('Moon')
+    expect(shell).toContain('app-header__icon-btn')
+    expect(shell).toContain('app-crumb-bar')
+    expect(shell).toContain('el-breadcrumb')
+    expect(shell).toContain('el-avatar')
   })
 })

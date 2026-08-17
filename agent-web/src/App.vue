@@ -1,25 +1,48 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import {
+  ChatDotRound,
   Connection,
+  Expand,
+  Fold,
+  FullScreen,
   MagicStick,
+  Moon,
   Setting,
   User,
-  ChatDotRound,
 } from '@element-plus/icons-vue'
+
+import { notifyWarning } from '@/utils/notify'
 
 const route = useRoute()
 const activeMenu = computed(() => route.path)
 const pageTitle = computed(() => String(route.meta.title ?? ''))
+
+const collapsed = ref(false)
+function toggleSidebar(): void {
+  collapsed.value = !collapsed.value
+}
+
+async function toggleFullscreen(): Promise<void> {
+  if (document.fullscreenElement) {
+    await document.exitFullscreen()
+  } else {
+    await document.documentElement.requestFullscreen()
+  }
+}
+
+function handleThemePlaceholder(): void {
+  notifyWarning('暗色主题即将上线，敬请期待')
+}
 </script>
 
 <template>
   <el-container class="app-shell">
-    <el-header class="app-header" height="auto">
+    <el-aside class="app-sidebar" :width="collapsed ? '64px' : '232px'">
       <div class="app-brand">
         <span class="app-brand__mark" aria-hidden="true">A</span>
-        <span class="app-brand__text">
+        <span v-if="!collapsed" class="app-brand__text">
           <strong>Agent Web</strong>
           <small>AI Agent Platform</small>
         </span>
@@ -27,71 +50,110 @@ const pageTitle = computed(() => String(route.meta.title ?? ''))
 
       <el-menu
         class="app-nav"
-        mode="horizontal"
+        mode="vertical"
         router
+        :collapse="collapsed"
+        :collapse-transition="false"
         :default-active="activeMenu"
-        :ellipsis="false"
       >
         <el-menu-item index="/chat">
           <el-icon><ChatDotRound /></el-icon>
-          <span>对话</span>
+          <template #title>对话</template>
         </el-menu-item>
         <el-menu-item index="/agent">
           <el-icon><User /></el-icon>
-          <span>Agent 管理</span>
+          <template #title>Agent 管理</template>
         </el-menu-item>
         <el-menu-item index="/skill">
           <el-icon><MagicStick /></el-icon>
-          <span>技能管理</span>
+          <template #title>技能管理</template>
         </el-menu-item>
         <el-menu-item index="/mcp">
           <el-icon><Connection /></el-icon>
-          <span>MCP 管理</span>
+          <template #title>MCP 管理</template>
         </el-menu-item>
         <el-menu-item index="/llm">
           <el-icon><Setting /></el-icon>
-          <span>模型管理</span>
+          <template #title>模型管理</template>
         </el-menu-item>
       </el-menu>
 
-      <div class="app-user">
-        <el-avatar :size="32" class="app-user__avatar">
-          <el-icon><User /></el-icon>
-        </el-avatar>
-        <span class="app-user__name">管理员</span>
+      <div class="app-sidebar__footer">
+        <button
+          class="app-sidebar__toggle"
+          type="button"
+          :aria-label="collapsed ? '展开侧边栏' : '折叠侧边栏'"
+          @click="toggleSidebar"
+        >
+          <el-icon>
+            <Expand v-if="collapsed" />
+            <Fold v-else />
+          </el-icon>
+        </button>
+        <span v-if="!collapsed" class="app-sidebar__version">v0.1.0</span>
       </div>
-    </el-header>
+    </el-aside>
 
-    <el-main class="app-main">
-      <el-breadcrumb class="app-breadcrumb" separator="/">
-        <el-breadcrumb-item :to="{ path: '/' }">首页</el-breadcrumb-item>
-        <el-breadcrumb-item>{{ pageTitle }}</el-breadcrumb-item>
-      </el-breadcrumb>
-      <router-view />
-    </el-main>
+    <el-container class="app-body">
+      <el-header class="app-header" height="auto">
+        <div class="app-header__actions">
+          <button
+            class="app-header__icon-btn"
+            type="button"
+            aria-label="全屏"
+            @click="toggleFullscreen"
+          >
+            <el-icon><FullScreen /></el-icon>
+          </button>
+          <button
+            class="app-header__icon-btn"
+            type="button"
+            aria-label="切换主题"
+            @click="handleThemePlaceholder"
+          >
+            <el-icon><Moon /></el-icon>
+          </button>
+          <button class="app-header__icon-btn" type="button" aria-label="用户信息">
+            <el-avatar :size="28" class="app-user__avatar">
+              <el-icon><User /></el-icon>
+            </el-avatar>
+          </button>
+        </div>
+      </el-header>
+
+      <div class="app-crumb-bar">
+        <el-breadcrumb separator="/">
+          <el-breadcrumb-item :to="{ path: '/' }">首页</el-breadcrumb-item>
+        </el-breadcrumb>
+        <strong class="app-crumb-bar__title">{{ pageTitle }}</strong>
+      </div>
+
+      <el-main class="app-main">
+        <router-view />
+      </el-main>
+    </el-container>
   </el-container>
 </template>
 
 <style scoped>
 .app-shell {
   height: 100%;
-  flex-direction: column;
   background: var(--color-bg-canvas);
 }
 
-.app-header {
+.app-sidebar {
   display: flex;
-  align-items: center;
-  gap: 24px;
-  padding: 0 24px;
-  border-bottom: 1px solid var(--color-border-default);
-  background: var(--color-bg-surface);
+  flex-direction: column;
+  background: var(--color-bg-dark);
+  transition: width var(--duration-base) var(--ease-standard);
+  overflow: hidden;
 }
 
 .app-brand {
   display: flex;
   align-items: center;
   gap: 10px;
+  padding: 20px 16px;
   flex-shrink: 0;
 }
 
@@ -100,6 +162,7 @@ const pageTitle = computed(() => String(route.meta.title ?? ''))
   place-items: center;
   width: 34px;
   height: 34px;
+  flex-shrink: 0;
   border-radius: var(--radius-md);
   background: linear-gradient(
     135deg,
@@ -117,10 +180,11 @@ const pageTitle = computed(() => String(route.meta.title ?? ''))
   flex-direction: column;
   gap: 1px;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
 .app-brand__text strong {
-  color: var(--color-text-primary);
+  color: var(--color-text-on-dark);
   font-family: var(--app-font-display);
   font-size: 16px;
   font-weight: 800;
@@ -128,41 +192,124 @@ const pageTitle = computed(() => String(route.meta.title ?? ''))
 }
 
 .app-brand__text small {
-  color: var(--color-text-tertiary);
+  color: var(--color-text-on-dark-muted);
   font-size: 11px;
 }
 
 .app-nav {
   flex: 1;
-  min-width: 0;
-  border-bottom: none;
+  border-right: none;
   background: transparent;
+  overflow-y: auto;
 }
 
 .app-nav :deep(.el-menu-item) {
-  border-bottom: 2px solid transparent;
-  color: var(--color-text-secondary);
+  color: var(--color-text-on-dark-muted);
   transition:
-    border-color var(--duration-base) var(--ease-standard),
+    background var(--duration-base) var(--ease-standard),
     color var(--duration-base) var(--ease-standard);
 }
 
 .app-nav :deep(.el-menu-item:hover) {
-  color: var(--color-text-primary);
-  background: transparent;
+  background: var(--color-bg-dark-raised);
+  color: var(--color-text-on-dark);
 }
 
 .app-nav :deep(.el-menu-item.is-active) {
-  border-bottom-color: var(--color-primary-500);
-  color: var(--color-primary-500);
+  position: relative;
+  background: var(--color-bg-dark-raised);
+  color: var(--color-text-on-dark);
   font-weight: 600;
 }
 
-.app-user {
+.app-nav :deep(.el-menu-item.is-active::before) {
+  content: '';
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--color-primary-500);
+}
+
+.app-sidebar__footer {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-bg-dark-raised);
   flex-shrink: 0;
+}
+
+.app-sidebar__toggle {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-on-dark-muted);
+  cursor: pointer;
+  font-size: 16px;
+  transition:
+    background var(--duration-base) var(--ease-standard),
+    color var(--duration-base) var(--ease-standard);
+}
+
+.app-sidebar__toggle:hover {
+  background: var(--color-bg-dark-raised);
+  color: var(--color-text-on-dark);
+}
+
+.app-sidebar__version {
+  color: var(--color-text-on-dark-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.app-body {
+  flex-direction: column;
+  min-width: 0;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 24px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--color-border-default);
+  background: var(--color-bg-surface);
+}
+
+.app-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-header__icon-btn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: 15px;
+  transition:
+    background var(--duration-base) var(--ease-standard),
+    color var(--duration-base) var(--ease-standard);
+}
+
+.app-header__icon-btn:hover {
+  background: var(--color-primary-50);
+  color: var(--color-primary-500);
 }
 
 .app-user__avatar {
@@ -170,9 +317,18 @@ const pageTitle = computed(() => String(route.meta.title ?? ''))
   color: var(--color-primary-500);
 }
 
-.app-user__name {
+.app-crumb-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 24px;
+  background: var(--color-bg-subtle);
+}
+
+.app-crumb-bar__title {
   color: var(--color-text-primary);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 
@@ -185,25 +341,31 @@ const pageTitle = computed(() => String(route.meta.title ?? ''))
   background: var(--color-bg-canvas);
 }
 
-.app-breadcrumb {
-  flex-shrink: 0;
-}
-
 @media (max-width: 768px) {
+  .app-sidebar {
+    width: 64px !important;
+  }
+
+  .app-brand {
+    justify-content: center;
+    padding: 20px 0;
+  }
+
+  .app-brand__text,
+  .app-sidebar__version {
+    display: none;
+  }
+
+  .app-sidebar__footer {
+    justify-content: center;
+  }
+
   .app-header {
-    flex-wrap: wrap;
-    gap: 8px;
-    padding: 12px 16px;
+    padding: 0 16px;
   }
 
-  .app-nav {
-    flex-basis: 100%;
-    order: 3;
-    overflow-x: auto;
-  }
-
-  .app-user {
-    margin-left: auto;
+  .app-crumb-bar {
+    padding: 0 16px;
   }
 
   .app-main {

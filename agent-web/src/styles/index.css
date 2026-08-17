@@ -13,6 +13,10 @@
   --color-bg-canvas: #f8f8fc;
   --color-bg-subtle: #f1f1f6;
   --color-bg-surface: #ffffff;
+  --color-bg-dark: #0b0f16;
+  --color-bg-dark-raised: #161b26;
+  --color-text-on-dark: #f1f1f6;
+  --color-text-on-dark-muted: #9a9ab0;
   --color-text-primary: #24242e;
   --color-text-secondary: #666674;
   --color-text-tertiary: #90909d;
