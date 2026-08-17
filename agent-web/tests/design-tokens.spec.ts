@@ -61,7 +61,7 @@ describe('design tokens', () => {
     expect(shell).toContain('background: var(--color-bg-canvas);')
   })
 
-  it('keeps the light Hify glyph readable on the dark sidebar', () => {
+  it('keeps the light Agent Web glyph readable on the dark sidebar', () => {
     const shell = readFileSync(
       fileURLToPath(new URL('../src/App.vue', import.meta.url)),
       'utf8',
@@ -72,13 +72,14 @@ describe('design tokens', () => {
     )
   })
 
-  it('defines the Hify sidebar brand, navigation, and collapse tokens', () => {
+  it('defines the Agent Web sidebar brand, navigation, and collapse tokens', () => {
     const shell = readFileSync(
       fileURLToPath(new URL('../src/App.vue', import.meta.url)),
       'utf8',
     )
 
-    expect(shell).toContain('>Hify</strong>')
+    expect(shell).toContain('>Agent Web</strong>')
+    expect(shell).toContain('aria-hidden="true">A</span>')
     expect(shell).toContain('<small>AI Agent Platform</small>')
     expect(shell).toContain('ChatDotRound')
     expect(shell).toContain('User')

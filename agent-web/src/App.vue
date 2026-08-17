@@ -25,9 +25,9 @@ const sidebarWidth = computed(() =>
   <el-container class="app-shell">
     <el-aside id="app-sidebar" class="app-sidebar" :width="sidebarWidth">
       <div class="app-brand" :class="{ 'app-brand--collapsed': isSidebarCollapsed }">
-        <span class="app-brand__mark" aria-hidden="true">H</span>
+        <span class="app-brand__mark" aria-hidden="true">A</span>
         <span v-if="!isSidebarCollapsed" class="app-brand__text">
-          <strong>Hify</strong>
+          <strong>Agent Web</strong>
           <small>AI Agent Platform</small>
         </span>
       </div>
