@@ -4,7 +4,7 @@
     "useDefineForClassFields": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],
     "strict": true,
     "types": ["vitest/globals", "node"],
     "noUnusedLocals": true,
@@ -22,5 +22,5 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["tests/**/*.ts", "src/api/**/*.ts", "src/router/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts", "src/views/**/*.ts", "src/views/**/*.vue"]
+  "include": ["tests/**/*.ts", "src/api/**/*.ts", "src/router/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts", "src/composables/**/*.ts", "src/components/**/*.vue", "src/views/**/*.ts", "src/views/**/*.vue"]
 }
