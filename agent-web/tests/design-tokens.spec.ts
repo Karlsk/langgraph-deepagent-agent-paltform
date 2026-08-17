@@ -39,7 +39,8 @@ describe('design tokens', () => {
   it('defines the approved A-palette semantic tokens', () => {
     expect(stylesheet).toContain('--color-primary-500: #635bff;')
     expect(stylesheet).toContain('--color-accent-500: #36d6b0;')
-    expect(stylesheet).toContain('--color-bg-sidebar: #171725;')
+    expect(stylesheet).toContain('--color-bg-dark: #0b0f16;')
+    expect(stylesheet).toContain('--color-bg-sidebar: var(--color-bg-dark);')
     expect(stylesheet).toContain('--color-bg-canvas: #f8f8fc;')
   })
 
@@ -60,14 +61,46 @@ describe('design tokens', () => {
     expect(shell).toContain('background: var(--color-bg-canvas);')
   })
 
-  it('keeps the light brand glyph on a WCAG-compliant dark-primary mark', () => {
+  it('keeps the light Hify glyph readable on the dark sidebar', () => {
     const shell = readFileSync(
       fileURLToPath(new URL('../src/App.vue', import.meta.url)),
       'utf8',
     )
 
     expect(shell).toMatch(
-      /\.app-brand__mark\s*\{[\s\S]*?background: var\(--color-primary-600\);[\s\S]*?color: var\(--color-text-on-dark\);/,
+      /\.app-brand__mark\s*\{[\s\S]*?background: color-mix\(in srgb, var\(--color-primary-500\) 16%, transparent\);[\s\S]*?color: var\(--color-text-on-dark\);/,
+    )
+  })
+
+  it('defines the Hify sidebar brand, navigation, and collapse tokens', () => {
+    const shell = readFileSync(
+      fileURLToPath(new URL('../src/App.vue', import.meta.url)),
+      'utf8',
+    )
+
+    expect(shell).toContain('>Hify</strong>')
+    expect(shell).toContain('<small>AI Agent Platform</small>')
+    expect(shell).toContain('ChatDotRound')
+    expect(shell).toContain('User')
+    expect(shell).toContain('Setting')
+    expect(shell).toContain('Fold')
+    expect(shell).toContain('Expand')
+    expect(shell).toContain(':aria-label="isSidebarCollapsed')
+    expect(shell).toContain("'展开侧栏' : '折叠侧栏'")
+    expect(shell).toContain('Version 0.1.0')
+
+    expect(stylesheet).toContain(
+      '--color-sidebar-hover: rgba(255, 255, 255, 0.1);',
+    )
+    expect(stylesheet).toContain(
+      '--color-sidebar-active: rgba(255, 255, 255, 0.12);',
+    )
+    expect(stylesheet).toContain('--sidebar-indicator-width: 3px;')
+    expect(stylesheet).toContain('--sidebar-width-expanded: 236px;')
+    expect(stylesheet).toContain('--sidebar-width-collapsed: 72px;')
+    expect(shell).toContain('background: var(--color-sidebar-hover);')
+    expect(shell).toContain(
+      'box-shadow: inset var(--sidebar-indicator-width) 0 0 var(--color-primary-500);',
     )
   })
 })

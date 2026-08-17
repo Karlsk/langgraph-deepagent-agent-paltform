@@ -13,7 +13,11 @@
   --color-bg-canvas: #f8f8fc;
   --color-bg-subtle: #f1f1f6;
   --color-bg-surface: #ffffff;
-  --color-bg-sidebar: #171725;
+  --color-bg-dark: #0b0f16;
+  --color-bg-sidebar: var(--color-bg-dark);
+  --color-sidebar-hover: rgba(255, 255, 255, 0.1);
+  --color-sidebar-active: rgba(255, 255, 255, 0.12);
+  --color-sidebar-border: rgba(255, 255, 255, 0.08);
   --color-text-primary: #24242e;
   --color-text-secondary: #666674;
   --color-text-tertiary: #90909d;
@@ -32,6 +36,9 @@
   --duration-base: 180ms;
   --duration-slow: 240ms;
   --ease-standard: cubic-bezier(.2, .8, .2, 1);
+  --sidebar-width-expanded: 236px;
+  --sidebar-width-collapsed: 72px;
+  --sidebar-indicator-width: 3px;
 
   --el-color-primary: var(--color-primary-500);
   --el-color-primary-light-3: color-mix(in srgb, var(--color-primary-500) 70%, var(--color-bg-surface));
