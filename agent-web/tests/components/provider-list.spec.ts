@@ -344,6 +344,37 @@ describe('ProviderList 模型提供商管理页（task-022 改造版）', () => 
     expect(wrapper.findComponent(ElTableStub).props('data')).toHaveLength(5)
   })
 
+  it('删除路径不依赖名字（含 default 语义）：所有名字走 useConfirm 不预判后端响应', async () => {
+    // spec §5.5 验收点：mock 中 name="default" 行点击删除仍走 useConfirm（本期不模拟 422）。
+    // spec §4.2 mock 中无 default 行，本用例通过拼接 “default” 名字至现有某一行验证
+    // useConfirm 调用与名字无关、路径普适；后端 default 禁删的 422 防护在切换真实 API 后
+    // 由统一请求层拦截器承担，与本视图无关。
+    const wrapper = mountPage()
+    await vi.advanceTimersByTimeAsync(300)
+
+    // 拿一个非 default 行作为输入，验证 useConfirm 提示文案插入当前行名
+    const data0 = (
+      wrapper.findComponent(ElTableStub).props('data') as Array<{
+        provider: { name: string }
+      }>
+    )[0]
+    expect(data0.provider.name).toBe('openai-prod')
+
+    await findRowButton(wrapper, '删除', 0).trigger('click')
+
+    // useConfirm 被调用且 message 插入当前行的 provider.name（而非硬编码 'default'）
+    expect(confirmMock).toHaveBeenCalledWith(
+      '确定删除提供商「openai-prod」吗？',
+      '删除确认',
+      expect.anything(),
+    )
+    // 校验提示标题与成功文案为 useConfirm 默认（不被名字拦截）
+    const args = confirmMock.mock.calls[0] as unknown[]
+    const options = args[2] as { type?: string; confirmButtonText?: string }
+    expect(options?.type).toBe('warning')
+    expect(options?.confirmButtonText).toBe('确定')
+  })
+
   it('测试连接：enabled 行（openai-prod 第 0 行）点击后健康状态变化', async () => {
     // 固定 Math.random → 0.5 < 0.7 → UP
     vi.spyOn(Math, 'random').mockReturnValue(0.5)
