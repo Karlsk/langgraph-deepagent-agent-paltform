@@ -279,6 +279,7 @@ Skeleton-stage red lines:
 - Do NOT introduce state management (Pinia etc.), SSR frameworks (Nuxt), or monorepo tooling on your own.
 - JSON config files (`tsconfig*.json`, `package.json`) must stay strict JSON — no comments allowed (pre-commit `check-json`).
 - All HTTP requests go through `agent-web/src/utils/request.ts` (baseURL `/api/v1`, proxied via `BACKEND_URL`); if backend `API_V1_STR` changes, sync the Vite proxy rule and `request.ts` baseURL together.
+- Design conventions (design tokens / page skeleton / button rules), code conventions, the five base building blocks (`WebAgentTable` / `WebAgentFormDialog` / `useConfirm` / `useRequest` / `notify`) and the unified request-layer contract are documented in `agent-web/README.md` — read it before adding frontend features.
 
 ## References
 
