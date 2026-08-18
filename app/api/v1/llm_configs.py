@@ -13,7 +13,7 @@ excluded from every response; only the masked projection is ever returned.
 from collections.abc import Mapping
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
@@ -23,6 +23,7 @@ from app.api.v1.agent_assets_common import (
     _read_patch_body,
     _validate_payload,
     get_db_session,
+    paginate_by_name,
 )
 from app.api.v1.auth import get_current_session
 from app.core.config import settings
@@ -31,7 +32,7 @@ from app.core.logging import logger
 from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, AgentApp, LlmConfig, SubAgentConfig
 from app.models.session import Session as ChatSession
 from app.schemas.agent_apps import LlmConfigCreate, LlmConfigRead, LlmConfigUpdate
-from app.schemas.base import ApiResponse
+from app.schemas.base import ApiResponse, PageResult
 from app.services.llm.llm_store import compute_llm_config_hash
 
 router = APIRouter()
@@ -110,6 +111,51 @@ async def list_llm_configs(
         return ApiResponse.success([_llm_config_read(row) for row in rows])
     except Exception as exc:
         logger.exception("llm_config_list_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/llm-configs/page", response_model=ApiResponse[PageResult[LlmConfigRead]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["llm_config"][0])
+async def list_llm_configs_page(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    keyword: str | None = Query(None, max_length=200),
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[PageResult[dict[str, Any]]]:
+    """List LLM configurations with server-side pagination (api_key masked).
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        page: 1-based page number.
+        page_size: Rows per page (exposed as ``pageSize``).
+        keyword: Optional case-insensitive substring matched against name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a PageResult of masked LLM config projections
+        ordered by name.
+    """
+    try:
+        paged = paginate_by_name(
+            db,
+            LlmConfig,
+            page=page,
+            page_size=page_size,
+            keyword=keyword,
+            order_by=col(LlmConfig.name),
+        )
+        masked = PageResult[dict[str, Any]](
+            items=[_llm_config_read(row) for row in paged.items],
+            total=paged.total,
+            page=paged.page,
+            page_size=paged.page_size,
+        )
+        return ApiResponse.success(masked)
+    except Exception as exc:
+        logger.exception("llm_config_list_page_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

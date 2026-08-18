@@ -1,11 +1,12 @@
 import type { PageQuery, PageResult } from '@/types'
 
 /**
- * 本地分页适配器：把后端裸列表包装为 PageResult<T>。
+ * 本地分页适配器：把裸列表包装为 PageResult<T>。
  *
- * 后端当前所有列表端点均返回裸 list（无分页参数），WebAgentTable 坚持
- * PageResult 契约先行 —— 父组件现阶段用本函数做前端分页，未来后端提供
- * 真分页端点后只需替换 api 实现（透传 query 到 config.params），组件零改动。
+ * 后端已提供真分页端点（GET /<module>/page，返回 PageResult，见
+ * @/api/assets.ts 的 listXxxPage 系列）；本适配器仅用于 mock 数据或
+ * 已持有全量数组时的前端分页。WebAgentTable 坚持 PageResult 契约先行，
+ * 两种数据源可无缝切换，组件零改动。
  */
 export function paginateLocal<T>(
   items: T[],

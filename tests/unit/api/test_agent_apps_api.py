@@ -1121,3 +1121,111 @@ def test_tools_catalog_returns_builtin_and_mcp_entries(client: TestClient, catal
     entries = unwrap(response)
     assert {"name": "duckduckgo_results_json", "source": "builtin", "server": None} in entries
     assert {"name": "echo", "source": "mcp", "server": "fs-server"} in entries
+
+
+# ---------------------------------------------------------------------------
+# Pagination (listPage endpoints)
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_subagents(client: TestClient) -> None:
+    """Seed two sub-agents ordered by name: researcher, writer."""
+    client.post("/subagents", json=_subagent_body())
+    client.post("/subagents", json=_subagent_body(name="writer"))
+
+
+def test_list_subagents_page_defaults_echo_pagination(client: TestClient) -> None:
+    """GET /subagents/page returns a PageResult with default page/pageSize."""
+    _seed_two_subagents(client)
+
+    payload = unwrap(client.get("/subagents/page"))
+
+    assert [row["name"] for row in payload["items"]] == ["researcher", "writer"]
+    assert payload["total"] == 2
+    assert payload["page"] == 1
+    assert payload["pageSize"] == 10
+
+
+def test_list_subagents_page_keyword_filters_case_insensitively(client: TestClient) -> None:
+    """Keyword matches name via case-insensitive substring."""
+    _seed_two_subagents(client)
+
+    payload = unwrap(client.get("/subagents/page", params={"keyword": "RES"}))
+
+    assert [row["name"] for row in payload["items"]] == ["researcher"]
+    assert payload["total"] == 1
+
+
+def test_list_subagents_page_beyond_last_returns_empty_items(client: TestClient) -> None:
+    """Pages past the end return empty items but keep the filtered total."""
+    _seed_two_subagents(client)
+
+    payload = unwrap(client.get("/subagents/page", params={"page": 3}))
+
+    assert payload["items"] == []
+    assert payload["total"] == 2
+    assert payload["page"] == 3
+
+
+def test_list_subagents_page_respects_page_size_window(client: TestClient) -> None:
+    """The pageSize alias mirrors the query param and slices the ordered rows."""
+    _seed_two_subagents(client)
+
+    payload = unwrap(client.get("/subagents/page", params={"page": 2, "pageSize": 1}))
+
+    assert [row["name"] for row in payload["items"]] == ["writer"]
+    assert payload["pageSize"] == 1
+    assert payload["total"] == 2
+
+
+def test_list_subagents_page_rejects_out_of_bounds_params(client: TestClient) -> None:
+    """Values below page 1 or above pageSize 100 are rejected with 422."""
+    assert client.get("/subagents/page", params={"page": 0}).status_code == 422
+    assert client.get("/subagents/page", params={"pageSize": 101}).status_code == 422
+
+
+def test_list_skills_page_returns_page_result(client: TestClient) -> None:
+    """GET /skills/page paginates skill metadata with keyword filtering."""
+    client.post("/skills", json=_skill_body())
+    client.post("/skills", json=_skill_body(name="csv-clean", description="Clean CSV", body="# csv\n"))
+
+    payload = unwrap(client.get("/skills/page", params={"keyword": "PDF"}))
+
+    assert [row["name"] for row in payload["items"]] == ["pdf-export"]
+    assert payload["total"] == 1
+    assert payload["pageSize"] == 10
+
+
+def test_list_agent_apps_page_returns_page_result(client: TestClient) -> None:
+    """GET /apps/page paginates agent apps ordered by id."""
+    client.post("/apps", json=_app_body())
+    client.post("/apps", json=_app_body(name="sales-app"))
+
+    payload = unwrap(client.get("/apps/page"))
+
+    assert {row["name"] for row in payload["items"]} == {"support-app", "sales-app"}
+    assert payload["total"] == 2
+    assert payload["pageSize"] == 10
+
+
+def test_list_mcp_servers_page_returns_page_result(client: TestClient) -> None:
+    """GET /mcp-servers/page paginates MCP servers with keyword filtering."""
+    client.post("/mcp-servers", json=_mcp_body())
+
+    payload = unwrap(client.get("/mcp-servers/page", params={"keyword": "FS"}))
+
+    assert [row["name"] for row in payload["items"]] == ["fs-server"]
+    assert payload["total"] == 1
+
+
+def test_list_llm_configs_page_masks_api_key(client: TestClient) -> None:
+    """GET /llm-configs/page returns masked projections inside a PageResult."""
+    client.post("/llm-configs", json=_llm_config_body())
+
+    payload = unwrap(client.get("/llm-configs/page"))
+
+    assert payload["total"] == 1
+    assert payload["pageSize"] == 10
+    row = payload["items"][0]
+    assert row["api_key_masked"] == "****1234"
+    assert "api_key" not in row

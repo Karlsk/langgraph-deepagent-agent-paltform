@@ -10,7 +10,7 @@ failures return 422; unexpected failures return 500 after ``logger.exception``.
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
@@ -20,6 +20,7 @@ from app.api.v1.agent_assets_common import (
     _read_patch_body,
     _validate_payload,
     get_db_session,
+    paginate_by_name,
 )
 from app.api.v1.auth import get_current_session
 from app.core.config import settings
@@ -34,7 +35,7 @@ from app.schemas.agent_apps import (
     SubAgentTestResult,
     SubAgentUpdate,
 )
-from app.schemas.base import ApiResponse
+from app.schemas.base import ApiResponse, PageResult
 from app.services.agents.test_runner import run_subagent_once
 
 router = APIRouter()
@@ -85,6 +86,45 @@ async def list_subagents(
         return ApiResponse.success(list(db.exec(select(SubAgentConfig).order_by(col(SubAgentConfig.name))).all()))
     except Exception as exc:
         logger.exception("subagent_list_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/subagents/page", response_model=ApiResponse[PageResult[SubAgentRead]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
+async def list_subagents_page(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    keyword: str | None = Query(None, max_length=200),
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """List sub-agent configurations with server-side pagination.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        page: 1-based page number.
+        page_size: Rows per page (exposed as ``pageSize``).
+        keyword: Optional case-insensitive substring matched against name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a PageResult of sub-agent rows ordered by name.
+    """
+    try:
+        return ApiResponse.success(
+            paginate_by_name(
+                db,
+                SubAgentConfig,
+                page=page,
+                page_size=page_size,
+                keyword=keyword,
+                order_by=col(SubAgentConfig.name),
+            )
+        )
+    except Exception as exc:
+        logger.exception("subagent_list_page_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

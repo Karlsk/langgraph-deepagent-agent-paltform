@@ -17,7 +17,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
@@ -28,6 +28,7 @@ from app.api.v1.agent_assets_common import (
     _read_patch_body,
     _validate_payload,
     get_db_session,
+    paginate_by_name,
 )
 from app.api.v1.auth import get_current_session
 from app.core.config import settings
@@ -41,7 +42,7 @@ from app.schemas.agent_apps import (
     McpServerUpdate,
     ToolCatalogEntry,
 )
-from app.schemas.base import ApiResponse
+from app.schemas.base import ApiResponse, PageResult
 from app.services.agents.mcp_manager import (
     build_connection_config,
     build_tool_catalog,
@@ -235,6 +236,45 @@ async def list_mcp_servers(
         return ApiResponse.success(list(db.exec(select(McpServerConfig).order_by(col(McpServerConfig.name))).all()))
     except Exception as exc:
         logger.exception("mcp_server_list_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/mcp-servers/page", response_model=ApiResponse[PageResult[McpServerRead]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
+async def list_mcp_servers_page(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    keyword: str | None = Query(None, max_length=200),
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """List MCP server configurations with server-side pagination.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        page: 1-based page number.
+        page_size: Rows per page (exposed as ``pageSize``).
+        keyword: Optional case-insensitive substring matched against name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a PageResult of MCP server rows ordered by name.
+    """
+    try:
+        return ApiResponse.success(
+            paginate_by_name(
+                db,
+                McpServerConfig,
+                page=page,
+                page_size=page_size,
+                keyword=keyword,
+                order_by=col(McpServerConfig.name),
+            )
+        )
+    except Exception as exc:
+        logger.exception("mcp_server_list_page_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

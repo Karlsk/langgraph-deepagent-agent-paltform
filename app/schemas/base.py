@@ -46,3 +46,17 @@ class ApiResponse(BaseModel, Generic[T]):
     def error(cls, code: int, message: str) -> "ApiResponse[Any]":
         """Build an error envelope with a null payload."""
         return cls(code=code, message=message, data=None)
+
+
+class PageResult(BaseModel, Generic[T]):
+    """Server-side pagination payload carried inside ``ApiResponse.data``.
+
+    Serialized with a camelCase ``pageSize`` alias to match the frontend
+    ``PageResult`` contract (items/total/page/pageSize); Python code keeps
+    snake_case attribute access via ``page_size``.
+    """
+
+    items: list[T] = Field(default_factory=list, description="Rows of the current page")
+    total: int = Field(description="Total number of rows matching the query")
+    page: int = Field(description="1-based page number echoed from the request")
+    page_size: int = Field(serialization_alias="pageSize", description="Page size echoed from the request")

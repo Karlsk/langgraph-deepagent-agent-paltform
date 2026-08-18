@@ -28,6 +28,7 @@ from sqlmodel import Session, select
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.metrics import skill_sync_total
+from app.schemas.base import PageResult
 from app.core.observability import langfuse_callback_handler
 from app.models.agent_assets import SkillAsset
 from app.services.llm import llm_service
@@ -304,6 +305,17 @@ async def delete_global(session: Session, *, name: str) -> None:
     logger.info("global_skill_deleted", name=name)
 
 
+def _global_skill_metadata(asset: SkillAsset) -> dict[str, Any]:
+    """Project a skill row into its list-view metadata dict."""
+    return {
+        "name": asset.name,
+        "description": asset.description,
+        "content_hash": asset.content_hash,
+        "version": asset.version,
+        "created_by": asset.created_by,
+    }
+
+
 async def list_global(session: Session) -> list[dict[str, Any]]:
     """List metadata of all global skills.
 
@@ -314,16 +326,40 @@ async def list_global(session: Session) -> list[dict[str, Any]]:
         List of dicts with name/description/content_hash/version/created_by.
     """
     assets = session.exec(select(SkillAsset)).all()
-    return [
-        {
-            "name": asset.name,
-            "description": asset.description,
-            "content_hash": asset.content_hash,
-            "version": asset.version,
-            "created_by": asset.created_by,
-        }
-        for asset in assets
-    ]
+    return [_global_skill_metadata(asset) for asset in assets]
+
+
+async def list_global_page(
+    session: Session,
+    *,
+    page: int = 1,
+    page_size: int = 10,
+    keyword: str | None = None,
+) -> PageResult[dict[str, Any]]:
+    """List metadata of global skills with server-side pagination.
+
+    Args:
+        session: SQLModel DB session.
+        page: 1-based page number (bounds validated by the API layer).
+        page_size: Rows per page (bounds validated by the API layer).
+        keyword: Optional case-insensitive substring matched against name.
+
+    Returns:
+        PageResult carrying metadata dicts of the requested page, the
+        filtered total and the echoed page/pageSize values.
+    """
+    assets = list(session.exec(select(SkillAsset)).all())
+    if keyword:
+        needle = keyword.lower()
+        assets = [asset for asset in assets if needle in asset.name.lower()]
+    total = len(assets)
+    start = (page - 1) * page_size
+    return PageResult(
+        items=[_global_skill_metadata(asset) for asset in assets[start : start + page_size]],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 async def read_global(name: str) -> str:

@@ -10,7 +10,7 @@ failures return 422; unexpected failures return 500 after ``logger.exception``.
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session as DBSession
 
 from app.api.v1.agent_assets_common import (
@@ -33,7 +33,7 @@ from app.schemas.agent_apps import (
     SkillRead,
     SkillUpdate,
 )
-from app.schemas.base import ApiResponse
+from app.schemas.base import ApiResponse, PageResult
 from app.services.agents import skills_store
 
 router = APIRouter()
@@ -66,6 +66,39 @@ async def list_skills(
         return ApiResponse.success(await skills_store.list_global(db))
     except Exception as exc:
         logger.exception("skill_list_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/skills/page", response_model=ApiResponse[PageResult[SkillRead]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
+async def list_skills_page(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    keyword: str | None = Query(None, max_length=200),
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """List metadata of global skills with server-side pagination.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        page: 1-based page number.
+        page_size: Rows per page (exposed as ``pageSize``).
+        keyword: Optional case-insensitive substring matched against name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a PageResult of skill metadata rows
+        (name/description/content_hash/version/created_by).
+    """
+    try:
+        return ApiResponse.success(
+            await skills_store.list_global_page(db, page=page, page_size=page_size, keyword=keyword)
+        )
+    except Exception as exc:
+        logger.exception("skill_list_page_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

@@ -11,7 +11,7 @@ failures return 500 after ``logger.exception``.
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
@@ -20,6 +20,7 @@ from app.api.v1.agent_assets_common import (
     _read_patch_body,
     _validate_payload,
     get_db_session,
+    paginate_by_name,
 )
 from app.api.v1.auth import get_current_session
 from app.api.v1.llm_configs import _llm_fingerprint
@@ -30,7 +31,7 @@ from app.core.logging import logger
 from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, AgentApp, LlmConfig, SkillAsset, SubAgentConfig
 from app.models.session import Session as ChatSession
 from app.schemas.agent_apps import AgentAppCreate, AgentAppRead, AgentAppUpdate
-from app.schemas.base import ApiResponse
+from app.schemas.base import ApiResponse, PageResult
 from app.services.agents import assembly
 from app.services.agents.mcp_manager import build_tool_catalog
 
@@ -67,6 +68,45 @@ async def list_agent_apps(
         return ApiResponse.success(list(db.exec(select(AgentApp).order_by(col(AgentApp.id))).all()))
     except Exception as exc:
         logger.exception("agent_app_list_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/apps/page", response_model=ApiResponse[PageResult[AgentAppRead]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
+async def list_agent_apps_page(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    keyword: str | None = Query(None, max_length=200),
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """List agent applications with server-side pagination.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        page: 1-based page number.
+        page_size: Rows per page (exposed as ``pageSize``).
+        keyword: Optional case-insensitive substring matched against name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a PageResult of agent app rows ordered by id.
+    """
+    try:
+        return ApiResponse.success(
+            paginate_by_name(
+                db,
+                AgentApp,
+                page=page,
+                page_size=page_size,
+                keyword=keyword,
+                order_by=col(AgentApp.id),
+            )
+        )
+    except Exception as exc:
+        logger.exception("agent_app_list_page_failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

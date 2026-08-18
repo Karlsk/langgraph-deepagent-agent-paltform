@@ -422,9 +422,13 @@ curl -s -X POST "$BASE/skills" \
 ```bash
 curl -s "$BASE/skills" -H "Authorization: Bearer $TOKEN"
 curl -s "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
+
+# 分页列表（可选）：page 从 1 开始，pageSize 上限 100，keyword 对 name 大小写不敏感模糊匹配
+curl -s "$BASE/skills/page?page=1&pageSize=10&keyword=csv" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：列表信封 `data` 为元数据数组（不含正文）；详情信封 `data` 同 `SkillRead`。
+分页端点信封 `data` 为 `{items, total, page, pageSize}`（`items` 元素同 `SkillRead`）。
 不存在时 404，信封 `message` 为 `skill '<name>' not found`。
 
 ### 3.3 读取正文
@@ -669,6 +673,9 @@ curl -s -X POST "$BASE/subagents" \
 curl -s "$BASE/subagents" -H "Authorization: Bearer $TOKEN"
 curl -s "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
 
+# 分页列表（可选）：同 Skill 分页参数约定
+curl -s "$BASE/subagents/page?page=1&pageSize=10&keyword=search" -H "Authorization: Bearer $TOKEN"
+
 curl -s -X PATCH "$BASE/subagents/search-helper" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -736,10 +743,13 @@ curl -s -X POST "$BASE/llm-configs" \
 ```bash
 curl -s "$BASE/llm-configs" -H "Authorization: Bearer $TOKEN"
 curl -s "$BASE/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
+
+# 分页列表（可选）：items 同样恒掩码
+curl -s "$BASE/llm-configs/page?page=1&pageSize=10" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：列表/详情的信封 `data` 均含启动时 bootstrap 种子的 `default` 配置与刚创建的 `proxy`；
-每条记录只有 `api_key_masked`，无明文。不存在时 404 信封。
+每条记录只有 `api_key_masked`，无明文（分页端点的 `items` 同样遵守）。不存在时 404 信封。
 
 #### 5.5.3 PATCH 更新（api_key 省略 = 保留原值）
 
@@ -856,6 +866,10 @@ curl -s -X POST "$BASE/apps/$APP_ID/publish" \
 
 ```bash
 curl -s "$BASE/apps/published" -H "Authorization: Bearer $TOKEN"
+
+# 分页列表（可选）：apps 按 id 序；mcp-servers 按 name 序，keyword 对 name 模糊匹配
+curl -s "$BASE/apps/page?page=1&pageSize=10" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/mcp-servers/page?page=1&pageSize=10&keyword=demo" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：信封 `data` 数组中包含刚发布的 `demo-assistant`（以及系统 default 应用——若其已发布；

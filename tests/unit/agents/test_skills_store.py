@@ -274,6 +274,30 @@ def test_list_global_returns_metadata(skills_root: Path, db: FakeDBSession) -> N
     assert alpha["content_hash"] == hashlib.sha256(b"a").hexdigest()
 
 
+def test_list_global_page_paginates_and_filters(skills_root: Path, db: FakeDBSession) -> None:
+    """list_global_page returns a PageResult honoring page/pageSize/keyword."""
+    asyncio.run(skills_store.create_global(db, name="alpha", description="d1", body="a"))
+    asyncio.run(skills_store.create_global(db, name="beta", description="d2", body="b"))
+    asyncio.run(skills_store.create_global(db, name="gamma", description="d3", body="c"))
+
+    page_one = asyncio.run(skills_store.list_global_page(db, page=1, page_size=2))
+    assert page_one.total == 3
+    assert page_one.page == 1
+    assert page_one.page_size == 2
+    assert [i["name"] for i in page_one.items] == ["alpha", "beta"]
+
+    page_two = asyncio.run(skills_store.list_global_page(db, page=2, page_size=2))
+    assert [i["name"] for i in page_two.items] == ["gamma"]
+
+    filtered = asyncio.run(skills_store.list_global_page(db, keyword="BET"))
+    assert filtered.total == 1
+    assert [i["name"] for i in filtered.items] == ["beta"]
+
+    beyond = asyncio.run(skills_store.list_global_page(db, page=5))
+    assert beyond.items == []
+    assert beyond.total == 3
+
+
 def test_read_global_returns_body(skills_root: Path, db: FakeDBSession) -> None:
     """read_global returns the raw SKILL.md body."""
     asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="hello body"))
