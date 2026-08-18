@@ -108,6 +108,15 @@ export function put<T>(
   return request.put(url, data, config) as unknown as Promise<T>
 }
 
+/** PATCH 请求（部分更新），返回解包后的业务数据。沿用与 POST 同形态：响应拦截器已统一解包。provider.ts 用于 /providers/{name} 与 /providers/{name}/models/{model} 的局部更新。 */
+export function patch<T>(
+  url: string,
+  data?: unknown,
+  config?: AxiosRequestConfig,
+): Promise<T> {
+  return request.patch(url, data, config) as unknown as Promise<T>
+}
+
 /** DELETE 请求（后端 data 恒为 null，通常以 void 承接） */
 export function del<T = void>(
   url: string,
