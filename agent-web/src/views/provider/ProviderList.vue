@@ -3,16 +3,15 @@
  * 模型提供商管理页：基于后端 Provider / Model 契约（snake_case 行字段 +
  * OPENAI/ANTHROPIC/OLLAMA/OPENAI_COMPATIBLE 类型枚举）的 CRUD 视图。
  *
- * 本期实现：
- * - 数据源：本地 5 行 mock（嵌套 ProviderRowWithMeta 形状，与后端契约一致），
- *   经 paginateLocal 适配 PageResult 契约；
- * - 列：名称 / 类型 / Base URL / API Key（脱敏只读） / 模型数 / 健康状态 tag /
- *   启用状态 tag / 操作（编辑 / 测试连接 / 删除）；
- * - 表单：name / type / base_url / api_key（创建非 OLLAMA 必填，编辑选填；
- *   留空 → PATCH 不携带 auth_config，沿用后端"省略即保留"语义）。
+ * 数据源：`listProvidersPage(query)` 走真实后端（`/providers/page`），
+ * 返回 `PageResult<ProviderRowWithMeta>`（行附 model_count + health）。
+ * 列表 / CRUD / 测试连接 全部走 `@/api/provider` 的函数。
  *
- * 下期切换到真实 API 时，仅需把 api() 替换为 listProvidersPage()，行结构与
- * 类型契约均已对齐；request.ts token 注入 TODO 关闭后启用。
+ * 表单：name / type / base_url / api_key（创建非 OLLAMA 必填，编辑选填；
+ * 留空 → PATCH 不携带 auth_config，沿用后端"省略即保留"语义）。
+ *
+ * 单行操作后统一 `tableRef.refresh()` 拉全量，保证后端 422 → 401 等场景下
+ * 数据一致；测试连接只回写 ConnectionTestResult 快照，刷新策略同上。
  */
 import { ref } from 'vue'
 import type { FormRules } from 'element-plus'
@@ -20,14 +19,20 @@ import type { FormRules } from 'element-plus'
 import WebAgentFormDialog from '@/components/WebAgentFormDialog.vue'
 import WebAgentTable from '@/components/WebAgentTable.vue'
 import type { TableColumnConfig } from '@/components/WebAgentTable.vue'
-import type {
-  ProviderHealthSnapshot,
-  ProviderRowWithMeta,
-  ProviderType,
+import ProviderModelDialog from '@/views/provider/ProviderModelDialog.vue'
+import {
+  createProvider,
+  deleteProvider,
+  listProvidersPage,
+  testProviderConnection,
+  updateProvider,
+  type ProviderCreatePayload,
+  type ProviderHealthSnapshot,
+  type ProviderRowWithMeta,
+  type ProviderType,
 } from '@/api/provider'
 import { useConfirm } from '@/composables/useConfirm'
 import { notifySuccess } from '@/utils/notify'
-import { paginateLocal } from '@/utils/paginate'
 import type { PageQuery, PageResult } from '@/types'
 
 /** Provider / Model 资源类型枚举（与 SQLModel Provider.type 字段对齐） */
@@ -57,85 +62,6 @@ const HEALTH_TAG: Record<
   UNKNOWN: { type: 'info', label: '未探测' },
 }
 
-/** 5 行本地 mock（嵌套 ProviderRowWithMeta，与后端契约一致） */
-const providers = ref<ProviderRowWithMeta[]>([
-  {
-    provider: {
-      id: 1,
-      name: 'openai-prod',
-      type: 'OPENAI',
-      base_url: 'https://api.openai.com/v1',
-      api_key_masked: '****open',
-      enabled: true,
-      created_by: 'seed',
-      created_at: '2026-06-11 09:20',
-      updated_at: '2026-06-11 09:20',
-    },
-    model_count: 3,
-    health: { status: 'UP', last_check_at: '2026-08-18 10:00', last_success_at: '2026-08-18 10:00', fail_count: 0, latency_ms: 214, error_message: null },
-  },
-  {
-    provider: {
-      id: 2,
-      name: 'anthropic-main',
-      type: 'ANTHROPIC',
-      base_url: 'https://api.anthropic.com',
-      api_key_masked: '****mock',
-      enabled: true,
-      created_by: 'seed',
-      created_at: '2026-06-24 15:40',
-      updated_at: '2026-06-24 15:40',
-    },
-    model_count: 2,
-    health: { status: 'UP', last_check_at: '2026-08-18 10:00', last_success_at: '2026-08-18 10:00', fail_count: 0, latency_ms: 412, error_message: null },
-  },
-  {
-    provider: {
-      id: 3,
-      name: 'openai-compatible-lab',
-      type: 'OPENAI_COMPATIBLE',
-      base_url: 'https://generativelanguage.googleapis.com/v1beta',
-      api_key_masked: '****aiza',
-      enabled: false,
-      created_by: 'seed',
-      created_at: '2026-07-02 14:30',
-      updated_at: '2026-07-02 14:30',
-    },
-    model_count: 1,
-    health: { status: 'UNKNOWN', last_check_at: null, last_success_at: null, fail_count: 0, latency_ms: null, error_message: null },
-  },
-  {
-    provider: {
-      id: 4,
-      name: 'ollama-local',
-      type: 'OLLAMA',
-      base_url: 'http://localhost:11434',
-      api_key_masked: '',
-      enabled: true,
-      created_by: 'seed',
-      created_at: '2026-07-18 10:05',
-      updated_at: '2026-07-18 10:05',
-    },
-    model_count: 0,
-    health: { status: 'UNKNOWN', last_check_at: null, last_success_at: null, fail_count: 0, latency_ms: null, error_message: null },
-  },
-  {
-    provider: {
-      id: 5,
-      name: 'openai-staging',
-      type: 'OPENAI',
-      base_url: 'https://staging.openai.com/v1',
-      api_key_masked: '****005',
-      enabled: true,
-      created_by: 'seed',
-      created_at: '2026-08-05 18:12',
-      updated_at: '2026-08-05 18:12',
-    },
-    model_count: 2,
-    health: { status: 'DEGRADED', last_check_at: '2026-08-18 09:30', last_success_at: '2026-08-18 09:30', fail_count: 0, latency_ms: 6500, error_message: null },
-  },
-])
-
 const columns: TableColumnConfig[] = [
   { label: '名称', prop: 'name', width: 160, slot: 'name' },
   { label: '类型', prop: 'type', width: 110, slot: 'type' },
@@ -144,19 +70,26 @@ const columns: TableColumnConfig[] = [
   { label: '模型数', prop: 'model_count', width: 80 },
   { label: '健康状态', prop: 'health', width: 100, slot: 'health' },
   { label: '状态', prop: 'enabled', width: 80, slot: 'status' },
-  { label: '操作', prop: 'actions', width: 230, slot: 'actions' },
+  { label: '操作', prop: 'actions', width: 290, slot: 'actions' },
 ]
 
-/** mock API：本地数组经 paginateLocal 包装为 PageResult 契约 */
+/** 表格数据源：直接透传到 listProvidersPage，由后端做分页 / 关键字过滤 */
 async function api(query: PageQuery): Promise<PageResult<ProviderRowWithMeta>> {
-  await new Promise((resolve) => setTimeout(resolve, 200))
-  return paginateLocal(providers.value, query)
+  return listProvidersPage(query)
 }
 
 const tableRef = ref<{ refresh: () => void }>()
 const dialogRef = ref<InstanceType<typeof WebAgentFormDialog>>()
 const dialogVisible = ref(false)
 const editingName = ref<string | null>(null)
+
+/** ProviderModelDialog 状态：保存当前弹窗对应的 provider 名，控制弹窗可见性 */
+const modelDialogVisible = ref(false)
+const modelDialogProviderName = ref<string | null>(null)
+function handleManageModels(row: ProviderRowWithMeta): void {
+  modelDialogProviderName.value = row.provider.name
+  modelDialogVisible.value = true
+}
 
 interface ProviderFormShape {
   name: string
@@ -192,23 +125,17 @@ function handleEdit(row: ProviderRowWithMeta): void {
   } satisfies ProviderFormShape)
 }
 
-/** 模拟按需连通性探测：200ms 后随机返回 UP / DEGRADED / DOWN，写回该行 health */
+/**
+ * 按需连通性探测：调 `/providers/{name}/test` 拿 ConnectionTestResult，
+ * 持久化的 health 行已由后端写入 provider_health；前端仅展示结果，
+ * 刷新表格从 `/providers/page` 拉最新 health 快照。
+ */
 async function handleTestConnection(row: ProviderRowWithMeta): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 200))
-  const dice = Math.random()
-  const nextStatus: ProviderHealthSnapshot['status'] =
-    dice < 0.7 ? 'UP' : dice < 0.9 ? 'DEGRADED' : 'DOWN'
-  const latencyMs = nextStatus === 'DOWN' ? null : Math.floor(100 + Math.random() * 5000)
-  const errorMessage = nextStatus === 'DOWN' ? 'connection refused (mock)' : null
-  row.health = {
-    status: nextStatus,
-    last_check_at: new Date().toISOString().replace('T', ' ').slice(0, 16),
-    last_success_at: nextStatus === 'UP' ? new Date().toISOString().replace('T', ' ').slice(0, 16) : row.health.last_success_at,
-    fail_count: nextStatus === 'DOWN' ? row.health.fail_count + 1 : 0,
-    latency_ms: latencyMs,
-    error_message: errorMessage,
-  }
-  notifySuccess(`已探测：${HEALTH_TAG[nextStatus].label}${latencyMs !== null ? `（${latencyMs}ms）` : ''}`)
+  const result = await testProviderConnection(row.provider.name)
+  const label = HEALTH_TAG[result.status].label
+  const latency =
+    result.latency_ms !== null ? `（${result.latency_ms}ms）` : ''
+  notifySuccess(`已探测：${label}${latency}`)
   tableRef.value?.refresh()
 }
 
@@ -232,42 +159,32 @@ async function handleSubmit(data: Record<string, unknown>): Promise<void> {
   }
 
   dialogRef.value?.setSubmitting(true)
-  await new Promise((resolve) => setTimeout(resolve, 300))
-
-  if (editingName.value !== null) {
-    // 编辑：name 不可改，仅修改 type / base_url / auth_config（省略 = 保留）
-    const target = providers.value.find((item) => item.provider.name === editingName.value)
-    if (target) {
-      target.provider.type = type
-      target.provider.base_url = baseUrl
+  try {
+    if (editingName.value !== null) {
+      // 编辑：name 不可改，仅修改 type / base_url / auth_config（省略 = 保留）
+      const payload: Partial<ProviderCreatePayload> = {
+        type,
+        base_url: baseUrl,
+      }
       // 仅当 api_key 非空时携带，等价于 PATCH 不带 auth_config → 后端保留原值
       if (apiKey) {
-        target.provider.api_key_masked = `****${apiKey.slice(-4)}`
+        payload.auth_config = { api_key: apiKey }
       }
-    }
-  } else {
-    const nextId = providers.value.reduce(
-      (max, item) => Math.max(max, item.provider.id),
-      0,
-    ) + 1
-    providers.value.push({
-      provider: {
-        id: nextId,
+      await updateProvider(editingName.value, payload)
+    } else {
+      const payload: ProviderCreatePayload = {
         name,
         type,
         base_url: baseUrl,
-        api_key_masked: apiKey ? `****${apiKey.slice(-4)}` : '',
+        auth_config: apiKey ? { api_key: apiKey } : undefined,
         enabled: true,
-        created_by: 'user',
-        created_at: new Date().toISOString().replace('T', ' ').slice(0, 16),
-        updated_at: null,
-      },
-      model_count: 0,
-      health: { status: 'UNKNOWN', last_check_at: null, last_success_at: null, fail_count: 0, latency_ms: null, error_message: null },
-    })
+      }
+      await createProvider(payload)
+    }
+  } finally {
+    dialogRef.value?.setSubmitting(false)
   }
 
-  dialogRef.value?.setSubmitting(false)
   dialogRef.value?.close()
   notifySuccess(`已保存：${name}`)
   tableRef.value?.refresh()
@@ -277,9 +194,7 @@ function handleDelete(row: ProviderRowWithMeta): void {
   const confirmAndDelete = useConfirm(
     `确定删除提供商「${row.provider.name}」吗？`,
     async () => {
-      providers.value = providers.value.filter(
-        (item) => item.provider.name !== row.provider.name,
-      )
+      await deleteProvider(row.provider.name)
     },
     { title: '删除确认', successMessage: '删除成功' },
   )
@@ -341,6 +256,9 @@ function healthTooltip(row: ProviderRowWithMeta): string {
           </el-tag>
         </template>
         <template #actions="{ row }">
+          <el-button link type="primary" size="small" @click="handleManageModels(row as ProviderRowWithMeta)">
+            模型管理
+          </el-button>
           <el-button link type="primary" size="small" @click="handleEdit(row as ProviderRowWithMeta)">
             编辑
           </el-button>
@@ -368,14 +286,14 @@ function healthTooltip(row: ProviderRowWithMeta): string {
       @submit="handleSubmit"
     >
       <template #default="{ form, mode }">
-        <el-form-item label="名称" prop="name">
+        <el-form-item label="Name" prop="name">
           <el-input
             v-model="form.name"
             placeholder="请输入提供商名称"
             :disabled="mode === 'edit'"
           />
         </el-form-item>
-        <el-form-item label="类型" prop="type">
+        <el-form-item label="Type" prop="type">
           <el-select v-model="form.type" placeholder="请选择类型">
             <el-option
               v-for="item in PROVIDER_TYPES"
@@ -397,6 +315,12 @@ function healthTooltip(row: ProviderRowWithMeta): string {
         </el-form-item>
       </template>
     </WebAgentFormDialog>
+
+    <ProviderModelDialog
+      v-if="modelDialogProviderName"
+      v-model="modelDialogVisible"
+      :provider-name="modelDialogProviderName"
+    />
   </div>
 </template>
 

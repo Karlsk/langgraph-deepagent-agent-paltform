@@ -1,9 +1,27 @@
+/**
+ * 应用路由表（任务 #23 新增认证守卫 + /login）。
+ *
+ * - `/login`：登录页，无需守卫；
+ * - 其他路由：`beforeEach` 守卫检查 `useAuth().sessionToken`，未登录时跳转
+ *   `/login?redirect=<原路径>`；
+ * - 已登录但访问 `/login` 时，重定向到 redirect 参数或默认 `/llm`（避免重复登录）。
+ *
+ * 注意：useAuth 是模块单例，导航守卫中调用 hasSession() 不会引入循环。
+ */
 import { createRouter, createWebHistory } from 'vue-router'
+
+import { hasSession } from '@/composables/useAuth'
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/chat' },
+    {
+      path: '/login',
+      name: 'login',
+      component: () => import('@/views/auth/Login.vue'),
+      meta: { title: '登录' },
+    },
     {
       path: '/chat',
       name: 'chat',
@@ -35,6 +53,23 @@ const router = createRouter({
       meta: { title: '模型管理' },
     },
   ],
+})
+
+router.beforeEach((to) => {
+  // 登录页与公共根路径：不强制鉴权
+  if (to.name === 'login') {
+    // 已登录用户访问 /login：直接重定向到目标或默认 /llm
+    if (hasSession()) {
+      const redirect = (to.query.redirect as string | undefined) ?? '/llm'
+      return redirect
+    }
+    return true
+  }
+  // 受保护路由：未登录跳 /login，并携带 redirect 用于登录后回跳
+  if (!hasSession()) {
+    return { name: 'login', query: { redirect: to.fullPath } }
+  }
+  return true
 })
 
 export default router

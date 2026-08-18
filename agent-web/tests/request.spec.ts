@@ -10,6 +10,13 @@ import { ElMessage } from 'element-plus'
 import { getHealth } from '@/api/health'
 import { del, get, post, put } from '@/utils/request'
 
+vi.mock('@/utils/authStorage', () => ({
+  getSessionToken: vi.fn(),
+  setSessionToken: vi.fn(),
+  clearSessionToken: vi.fn(),
+  clearAuth: vi.fn(),
+}))
+
 type ResponseHandler = (response: unknown) => unknown
 type ErrorHandler = (error: unknown) => unknown
 type Adapter = (config: Record<string, unknown>) => Promise<unknown>
@@ -53,10 +60,23 @@ vi.mock('element-plus', () => ({
   ElMessage: { error: vi.fn() },
 }))
 
+const authStorage = await import('@/utils/authStorage')
+const getSessionTokenMock = authStorage.getSessionToken as unknown as ReturnType<typeof vi.fn>
+const clearAuthMock = authStorage.clearAuth as unknown as ReturnType<typeof vi.fn>
+
+/** 模拟 vue-router：捕获 replace 调用并暴露当前路由 */
+const routerMock = {
+  currentRoute: { value: { name: 'llm', fullPath: '/llm' } },
+  replace: vi.fn(),
+}
+vi.mock('@/router', () => ({ default: routerMock }))
+
 // 拦截器在模块加载时一次性注册；提前捕获处理器，
 // 避免 beforeEach 的 clearAllMocks 清空注册记录后无法取回。
 const [onFulfilled, onRejected] = fakeInstance.interceptors.response.use.mock
   .calls[0] as [ResponseHandler, ErrorHandler]
+const onRequestFulfilled = fakeInstance.interceptors.request.use.mock
+  .calls[0]?.[0] as (config: Record<string, unknown>) => Record<string, unknown> | undefined
 
 /** 构造 AxiosResponse 形状的响应对象 */
 function axiosResponse(data: unknown, status = 200): Record<string, unknown> {
@@ -79,6 +99,7 @@ function makeAxiosError(
 
 /**
  * 受控 adapter：模拟 axios 的拦截链语义 ——
+ * 先走请求拦截器（与 axios 真实行为一致），再调 adapter；
  * adapter 成功 -> 响应成功回调；adapter 拒绝 -> 响应错误回调；
  * 成功回调自身返回的 reject（非 2xx 防御分支）直接透传给调用方。
  */
@@ -87,9 +108,13 @@ async function dispatch(config: Record<string, unknown>): Promise<unknown> {
   if (!adapter) {
     throw new Error('adapter not stubbed')
   }
+  // 手动跑请求拦截器，让 mock 调用方能观察到请求头被写入
+  const intercepted = onRequestFulfilled
+    ? onRequestFulfilled(config) ?? config
+    : config
   let response: unknown
   try {
-    response = await adapter(config)
+    response = await adapter(intercepted)
   } catch (error: unknown) {
     return onRejected(error)
   }
@@ -108,6 +133,9 @@ function stubAdapterReject(error: unknown): void {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  getSessionTokenMock.mockReturnValue(null)
+  routerMock.currentRoute.value = { name: 'llm', fullPath: '/llm' }
+  routerMock.replace.mockReset()
   fakeInstance.get.mockImplementation((url: string, config?: unknown) =>
     dispatch({ ...(config as object), method: 'get', url }),
   )
@@ -213,11 +241,79 @@ describe('裸响应透传（豁免端点）', () => {
 })
 
 describe('健康检查 API', () => {
-  it('通过统一请求层请求相对的 health 路径，并返回裸健康状态', async () => {
+  it('通过统一请求层请求相对的 health 端点，并返回裸健康状态', async () => {
     const health = { status: 'healthy', version: '1.0.0' }
     stubAdapter(axiosResponse(health))
 
     await expect(getHealth()).resolves.toEqual(health)
     expect(fakeInstance.get).toHaveBeenCalledWith('health', undefined)
+  })
+})
+
+describe('认证 token 注入', () => {
+  it('有会话 token 时请求携带 Authorization: Bearer xxx', async () => {
+    getSessionTokenMock.mockReturnValue('session-abc')
+    const observed: Array<Record<string, unknown>> = []
+    fakeInstance.adapter = vi.fn(async (config: Record<string, unknown>) => {
+      observed.push(config)
+      return axiosResponse({ status: 'ok' })
+    })
+
+    await expect(get('/protected')).resolves.toEqual({ status: 'ok' })
+    const observedHeaders = (observed[0]?.headers ?? {}) as Record<string, unknown>
+    // request.ts 会同时兼容 AxiosHeaders.set 与普通对象赋值，提取字符串 Authorization
+    const headerValue =
+      (typeof observedHeaders.get === 'function'
+        ? (observedHeaders.get as (k: string) => unknown)('Authorization')
+        : observedHeaders.Authorization) ?? null
+    expect(headerValue).toBe('Bearer session-abc')
+  })
+
+  it('无会话 token 时不写入 Authorization 头', async () => {
+    getSessionTokenMock.mockReturnValue(null)
+    const observed: Array<Record<string, unknown>> = []
+    fakeInstance.adapter = vi.fn(async (config: Record<string, unknown>) => {
+      observed.push(config)
+      return axiosResponse({ status: 'ok' })
+    })
+
+    await expect(get('/public')).resolves.toEqual({ status: 'ok' })
+    const headers = (observed[0]?.headers ?? {}) as Record<string, unknown>
+    expect(headers.Authorization).toBeUndefined()
+  })
+})
+
+describe('401 会话过期处理', () => {
+  it('非登录页 401：清除 token 并跳转 /login?reason=expired', async () => {
+    getSessionTokenMock.mockReturnValue('stale-token')
+    const error = makeAxiosError(
+      axiosResponse({ code: 401, message: 'expired', data: null }, 401),
+      'Request failed with status code 401',
+    )
+    stubAdapterReject(error)
+
+    await expect(get('/protected')).rejects.toBe(error)
+    // 让 request.ts 中 401 分支的动态 import + router.replace 异步任务完成
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(clearAuthMock).toHaveBeenCalledTimes(1)
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      name: 'login',
+      query: { redirect: '/llm', reason: 'expired' },
+    })
+    expect(ElMessage.error).toHaveBeenCalledWith('会话已失效，请重新登录')
+  })
+
+  it('登录页 401（密码错误）：不跳转、不清 token', async () => {
+    routerMock.currentRoute.value = { name: 'login', fullPath: '/login' }
+    const error = makeAxiosError(
+      axiosResponse({ detail: 'Incorrect email or password' }, 401),
+      'Request failed with status code 401',
+    )
+    stubAdapterReject(error)
+
+    await expect(get('/auth/login')).rejects.toBe(error)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(clearAuthMock).not.toHaveBeenCalled()
+    expect(routerMock.replace).not.toHaveBeenCalled()
   })
 })

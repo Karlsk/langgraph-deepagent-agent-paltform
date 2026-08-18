@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   ChatDotRound,
   Connection,
@@ -13,11 +13,16 @@ import {
   User,
 } from '@element-plus/icons-vue'
 
-import { notifyWarning } from '@/utils/notify'
+import { bootstrap as bootstrapAuth, currentUser, logout as logoutAction } from '@/composables/useAuth'
+import { notifySuccess } from '@/utils/notify'
+
+bootstrapAuth()
 
 const route = useRoute()
+const router = useRouter()
 const activeMenu = computed(() => route.path)
 const pageTitle = computed(() => String(route.meta.title ?? ''))
+const user = currentUser()
 
 const collapsed = ref(false)
 function toggleSidebar(): void {
@@ -32,8 +37,10 @@ async function toggleFullscreen(): Promise<void> {
   }
 }
 
-function handleThemePlaceholder(): void {
-  notifyWarning('暗色主题即将上线，敬请期待')
+async function handleLogout(): Promise<void> {
+  logoutAction()
+  notifySuccess('已注销')
+  await router.replace({ name: 'login' })
 }
 </script>
 
@@ -47,6 +54,9 @@ function handleThemePlaceholder(): void {
           <small>AI Agent Platform</small>
         </span>
       </div>
+      <span v-if="user && !collapsed" class="app-brand__user" :title="user.email">
+        {{ user.username ?? user.email }}
+      </span>
 
       <el-menu
         class="app-nav"
@@ -109,7 +119,6 @@ function handleThemePlaceholder(): void {
             class="app-header__icon-btn"
             type="button"
             aria-label="切换主题"
-            @click="handleThemePlaceholder"
           >
             <el-icon><Moon /></el-icon>
           </button>
@@ -117,6 +126,15 @@ function handleThemePlaceholder(): void {
             <el-avatar :size="28" class="app-user__avatar">
               <el-icon><User /></el-icon>
             </el-avatar>
+          </button>
+          <button
+            v-if="user"
+            class="app-header__icon-btn"
+            aria-label="注销"
+            title="注销"
+            @click="handleLogout"
+          >
+            <span class="app-header__logout-text">注销</span>
           </button>
         </div>
       </el-header>
@@ -315,6 +333,21 @@ function handleThemePlaceholder(): void {
 .app-user__avatar {
   background: var(--color-primary-50);
   color: var(--color-primary-500);
+}
+.app-header__logout-text {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.app-brand__user {
+  color: var(--color-text-on-dark-muted);
+  font-size: 12px;
+  margin-top: 4px;
+  margin-left: 44px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--color-bg-dark-raised);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .app-crumb-bar {
