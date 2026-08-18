@@ -6,7 +6,7 @@
 > **核实基线**：本文所有端点、环境变量与命令均对照以下源码核实过：
 > `app/api/v1/api.py`（路由注册）、`app/api/v1/auth.py`、`app/api/v1/agent_assets_common.py`、
 > `app/api/v1/subagents.py`、`app/api/v1/skills.py`、`app/api/v1/apps.py`、`app/api/v1/mcp_servers.py`、
-> `app/api/v1/llm_configs.py`、`app/api/v1/chatbot.py`、`app/schemas/agent_apps.py`、`app/schemas/auth.py`、
+> `app/api/v1/providers.py`、`app/api/v1/chatbot.py`、`app/schemas/agent_apps.py`、`app/schemas/auth.py`、
 > `app/schemas/chat.py`、`app/core/config.py`、`Makefile`、`Dockerfile`、`docker-compose.yml`、
 > `scripts/docker-entrypoint.sh`。
 > 若代码变更，请以源码为准。
@@ -25,7 +25,7 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 - **两类 token 的关键区别**（来自 `auth.py` 的依赖注入）：
   - `POST /auth/register`、`POST /auth/login` 返回的是**用户 token**；
   - `POST /auth/session` 用用户 token 换取**会话 token**；
-  - `/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/llm-configs/*`、`/tools/*` 与 `/chatbot/*` 全部端点都依赖 `get_current_session`，**必须使用会话 token**。
+  - `/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/providers/*`、`/tools/*` 与 `/chatbot/*` 全部端点都依赖 `get_current_session`，**必须使用会话 token**。
   第 2 节会给出切换 `$TOKEN` 的明确步骤。
 - **统一响应信封**：除豁免端点外，所有端点返回 `{code, message, data}` 信封——`code` 数值与
   HTTP status 完全一致（资产创建端点 HTTP 201 且 `code=201`；`POST /auth/register`
@@ -57,8 +57,8 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 | 变量 | docker 必需 | 默认值（config.py） | 说明 |
 |---|---|---|---|
 | `APP_ENV` | ★ | development | 决定加载 `.env.<APP_ENV>`；compose 构建参数同名 |
-| `OPENAI_API_KEY` | ★ | 空 | LLM 调用；entrypoint 强校验。**Agent 链路中仅作启动时 default LLM 配置的一次性种子来源**（见 0.5 节） |
-| `OPENAI_BASE_URL` | 可选 | 空 | 自定义 LLM 端点（OpenAI 兼容代理）；同上仅作 default 配置种子，入库后以 `/llm-configs` API 管理（见 0.5 节） |
+| `OPENAI_API_KEY` | ★ | 空 | LLM 调用；entrypoint 强校验。**Agent 链路中仅作启动时 default provider/model 对的一次性种子来源**（见 0.5 节） |
+| `OPENAI_BASE_URL` | 可选 | 空 | 自定义 LLM 端点（OpenAI 兼容代理）；同上仅作 default 对种子，入库后以 `/providers` API 管理（见 0.5 节） |
 | `OPENAI_API_BASE` | 可选 | 空 | 与上一行**同值**；系统级 langchain 层读取（见 0.5 节） |
 | `JWT_SECRET_KEY` | ★ | compose 中有兜底值 | entrypoint 强校验，生产务必自行设置 |
 | `POSTGRES_HOST` | ★ | localhost | 容器内必须填 `db`（compose 服务名） |
@@ -72,7 +72,7 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 | `VALKEY_HOST` | 可选 | 空 | 置空即禁用缓存（compose 仍会启动 valkey 容器但不被使用） |
 
 内置限流默认值（`config.py`）：`chat=30/min`、`chat_stream=20/min`、`messages=50/min`、
-`register=10/hour`、`login=20/min`、`subagent/skill/agent_app/mcp_server/llm_config/tools_catalog=60/min`、
+`register=10/hour`、`login=20/min`、`subagent/skill/agent_app/mcp_server/provider/model_config/tools_catalog=60/min`、
 `subagent_test=5/min`、`skill_generate=5/min`。均可用同名大写环境变量覆盖，如
 `RATE_LIMIT_CHAT`、`RATE_LIMIT_SUBAGENT_TEST` 等。
 
@@ -86,7 +86,7 @@ DEBUG=true
 API_V1_STR=/api/v1
 
 # ★ LLM（必填真实值）
-# 以下变量在 Agent 链路中仅作启动时 default LLM 配置的一次性种子（入库后以 /llm-configs API 管理，见 0.5 节）；
+# 以下变量在 Agent 链路中仅作启动时 default provider/model 对的一次性种子（入库后以 /providers API 管理，见 0.5 节）；
 # 系统级 LLM 调用（会话命名、skill 草稿等）仍直接读取这些变量。
 OPENAI_API_KEY=<your-llm-api-key>
 DEFAULT_LLM_MODEL=gpt-5-mini
@@ -150,21 +150,21 @@ LOG_FORMAT=console
 
 ### 0.5 自定义 LLM 端点（用不了 GPT 官方时）
 
-> **核实结论（入库改造后）**：LLM 配置分两条链路——
-> - **Agent 资产链路（AgentApp / SubAgent / 对话）已 DB 化**：模型配置存于 `llm_config` 表，
->   经 `/llm-configs` API 管理；AgentApp/SubAgent 的 `model` 字段是 LlmConfig
->   **引用名**（NULL 解析为 `default`）。`.env` 的 LLM 变量**仅作启动时 default 配置的一次性种子**。
+> **核实结论（Provider 体系改造后）**：LLM 配置分两条链路——
+> - **Agent 资产链路（AgentApp / SubAgent / 对话）已 DB 化**：连接配置存于 `provider` 表、
+>   模型清单存于 `model_config` 表，经 `/providers` API 管理；AgentApp/SubAgent 的 `model` 字段是
+>   **`provider/model` 引用**（NULL 解析为 `default/default`）。`.env` 的 LLM 变量**仅作启动时 default 对的一次性种子**。
 > - **系统级链路（会话命名、skill 草稿生成、LLMService 循环回退、evals）仍走 env**：
 >   `app/services/llm/registry.py` 的 `ChatOpenAI` 未显式传 `base_url`，依赖链自动回退读环境变量——
 >   langchain-openai 读 `OPENAI_API_BASE`，openai SDK 读 `OPENAI_BASE_URL`。
 
-#### a. Agent 链路：经 `/llm-configs` API 配置（推荐方式）
+#### a. Agent 链路：经 `/providers` API 配置（推荐方式）
 
-首次启动时 bootstrap 会 insert-if-missing 一条 `name=default` 的 LlmConfig，种子来源为：
-`OPENAI_API_KEY`（api_key）、`OPENAI_BASE_URL` 环境变量（base_url，未设则为空）、
-`DEFAULT_LLM_MODEL`（model_name）、`DEFAULT_LLM_TEMPERATURE`（temperature）。
+首次启动时 bootstrap 会 insert-if-missing `name=default` 的 Provider + `name=default` 的 ModelConfig，种子来源为：
+`OPENAI_API_KEY`（auth_config.api_key）、`OPENAI_BASE_URL` 环境变量（base_url，未设则为空）、
+`DEFAULT_LLM_MODEL`（model_id）、`DEFAULT_LLM_TEMPERATURE`（extra_params.temperature）。
 **注意：种子不含 `max_tokens`**（刻意保持为空，走 provider 默认值——进程级预算不应冻结入库）；
-如需对 Agent 链路限额，用 `PATCH /llm-configs/default` 显式设置 `max_tokens`。
+如需对 Agent 链路限额，用 `PATCH /providers/default/models/default` 显式设置 `extra_params.max_tokens`。
 `MAX_TOKENS` 环境变量**不种子到该行**，仅作用于系统级链路（`app/services/llm/registry.py`
 以 `max_completion_tokens` 下发）及消息历史裁剪预算（`app/utils/graph.py`）。
 **仅 insert-if-missing，不覆盖已存在行**——改 `.env` 后重启**不会**更新库里配置。
@@ -172,34 +172,26 @@ LOG_FORMAT=console
 切换到 OpenAI 兼容代理（例如 MiniMax-M3）：
 
 ```bash
-# 方式一：直接 PATCH default 配置（NULL 引用的应用随之生效）
-curl -s -X PATCH "$BASE/llm-configs/default" \
+# 方式一：直接 PATCH default 对（NULL 引用的应用随之生效）
+curl -s -X PATCH "$BASE/providers/default" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model_name": "MiniMax-M3",
-    "api_key": "<your-proxy-api-key>",
+    "auth_config": {"api_key": "<your-proxy-api-key>"},
     "base_url": "https://your-proxy.example.com/v1"
   }'
+curl -s -X PATCH "$BASE/providers/default/models/default" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model_id": "MiniMax-M3"}'
 
-# 方式二：新建独立配置，再让 AgentApp 显式引用
+# 方式二：新建独立 provider + model，再让 AgentApp 显式引用 "provider/model"
 （完整 CRUD 步骤见 5.5 节）
 ```
 
-**改 env 后想让 default 配置同步更新**：`default` 是设计约束下**无条件禁删**的配置
-（`DELETE /llm-configs/default` 恒返回 422，见 5.5.4 节负向用例），不能走
-「删除 + 重启重建」路径；正确做法是直接 PATCH 覆盖：
-
-```bash
-curl -s -X PATCH "$BASE/llm-configs/default" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_name": "<new-model-name>",
-    "api_key": "<your-api-key>",
-    "base_url": "https://your-proxy.example.com/v1"
-  }'
-```
+**改 env 后想让 default 对同步更新**：`default/default` 是设计约束下**无条件禁删**的对
+（`DELETE /providers/default` 与 `DELETE /providers/default/models/default` 恒返回 422，
+见 5.5 节负向用例），不能走「删除 + 重启重建」路径；正确做法是直接 PATCH 覆盖（同上方方式一）。
 
 #### b. 系统级链路：env 回退（会话命名 / skill 草稿等）
 
@@ -213,21 +205,21 @@ OPENAI_API_BASE=https://your-proxy.example.com/v1
 
 改完重启容器（`make docker-up ENV=development`）；本地直跑则 `make dev` 重启。
 
-**代理兼容性注意事项**（仅约束系统级链路；Agent 链路的 model_name 完全由你配置，无此限制）：
+**代理兼容性注意事项**（仅约束系统级链路；Agent 链路的 model_id 完全由你配置，无此限制）：
 
 - **a. 模型名固定**：系统级发往端点的 `model` 名固定为 registry 硬编码的 4 个——
   `gpt-5-mini` / `gpt-5` / `gpt-5.4` / `gpt-5.4-nano`。`DEFAULT_LLM_MODEL` 写成清单外的
   其他名字会在系统级链路**静默降级**到清单第一个模型（当前即 `gpt-5-mini`）：降级发生在
   `LLMService` 初始化时，发现 `DEFAULT_LLM_MODEL` 不在清单内即记录
   `default_model_not_found_using_first` 警告并改用清单首个模型；
-  Agent 链路则以 LlmConfig 的 `model_name` 原样下发，不受此清单约束。
+  Agent 链路则以 ModelConfig 的 `model_id` 原样下发，不受此清单约束。
 - **b. 专有请求参数**：registry 给实例传了 OpenAI 专有的 `reasoning`（如 `{"effort": "low"}`）
   与 `max_completion_tokens` 参数，会随系统级请求体发往端点；对请求字段严格校验的代理可能拒绝。
 - **c. `.env.example` 示例值陷阱**：`.env.example` 中 Atlas Cloud 注释段的
   `DEFAULT_LLM_MODEL=deepseek-ai/deepseek-v4-pro` 示例值**不在系统级硬编码清单内**，照抄会使
-  default 配置的种子 model_name 为清单外名字（Agent 链路正常、系统级链路静默降级），请注意甄别。
+  default 模型的种子 model_id 为清单外名字（Agent 链路正常、系统级链路静默降级），请注意甄别。
 
-> 另注：代理的 key 在 Agent 链路填入 LlmConfig 的 `api_key` 字段（任何响应/日志只返回掩码
+> 另注：代理的 key 在 Agent 链路填入 Provider 的 `auth_config.api_key` 字段（任何响应/日志只返回掩码
 > `****`+尾 4 位）；系统级链路直接填 `OPENAI_API_KEY`（entrypoint 强校验非空）。
 
 ---
@@ -285,11 +277,12 @@ make docker-migrate-history ENV=development   # （可选）查看迁移历史�
 ```
 
 **预期**：alembic 依次执行迁移脚本（含 `b25d38b0cd7c_initial_schema`、`e4f1a8c2b9d3_agent_assets`、
-`f3a1b7c9d204_llm_config`），无报错退出。
+`f3a1b7c9d204_llm_config`、`a3f7e9b1c852_provider_models`），无报错退出。
 
-> 存量库升级说明：`f3a1b7c9d204_llm_config` 会把 `agent_app.model` / `subagent_config.model`
-> 的非 NULL 值回填为 `'default'`（字段语义从模型名切换为 LlmConfig 引用名）；迁移不种子数据，
-> default 配置由首次启动的 bootstrap 创建。
+> 存量库升级说明：`a3f7e9b1c852_provider_models` 建 `provider` / `model_config` / `provider_health`
+> 三表，把每行存量 llm_config 拆为 provider + model_config，并把 `agent_app.model` /
+> `subagent_config.model` 的非 NULL 值 `X` 改写为 `X/X`（字段语义切换为 `provider/model` 引用，
+> NULL 保持 NULL），最后 drop `llm_config` 表。default 对仍由首次启动的 bootstrap 创建。
 
 **失败排查**：
 - 连不上 db：确认容器已 healthy（`docker compose ps`），且 `POSTGRES_HOST=db`。
@@ -372,7 +365,7 @@ export USER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
 
 ### 2.3 创建会话并切换到会话 token
 
-**目的**：后续所有资产端点（`/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/llm-configs/*`、`/tools/*`）与 `/chatbot/*` 端点都要求**会话 token**。此处先不绑定
+**目的**：后续所有资产端点（`/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/providers/*`、`/tools/*`）与 `/chatbot/*` 端点都要求**会话 token**。此处先不绑定
 AgentApp（body 可省略），第 7 节再创建绑定会话。
 
 ```bash
@@ -662,8 +655,8 @@ curl -s -X POST "$BASE/subagents" \
 `data.model=null`、`data.max_turns=null`（留空即**继承父 AgentApp** 的工具/模型）、
 `data.version=1`、`data.content_hash` 非空。
 
-> `model` 字段的语义是 **LlmConfig 引用名**（见 5.5 节）；留空继承父应用引用，
-> NULL 最终解析到 `default` 配置。
+> `model` 字段的语义是 **`provider/model` 引用**（见 5.5 节）；留空继承父应用引用，
+> NULL 最终解析到 `default/default`。
 
 **失败排查**：422 信封：重名（`message` 为 `subagent 'xxx' already exists`）或 `name` 不符合命名规则（`Validation error` + `data` 错误列表）。
 
@@ -711,83 +704,120 @@ curl -s -X PATCH "$BASE/subagents/search-helper" \
 
 **预期**：422 信封，`message` 为 `name is immutable and cannot be changed`。
 
-### 5.5 LLM 配置管理（llm-configs CRUD）
+### 5.5 Provider / Model 管理（providers CRUD + 按需健康探测）
 
-所有端点位于 `$BASE/llm-configs*`。LlmConfig 是 AgentApp/SubAgent `model` 字段
-（引用名）的实际承载体；`name` 规则同其他资产（`^[a-z0-9][a-z0-9_-]*$`，创建后不可改名）。
-**任何响应都不返回 `api_key` 明文，只返回 `api_key_masked`（`****`+尾 4 位）。**
+所有端点位于 `$BASE/providers*`。Provider 是连接配置（endpoint + 凭证），其下挂若干
+ModelConfig；AgentApp/SubAgent `model` 字段引用 **`provider名/model名`** 对
+（NULL 解析为 `default/default`）。`name` 规则同其他资产（`^[a-z0-9][a-z0-9_-]*$`，天然不含 `/`，创建后不可改名）。
+**任何响应都不返回 `auth_config` 明文，只返回 `api_key_masked`（`****`+尾 4 位）。**
+删除均为**软删**（`deleted=True`）：删 provider 会级联软删其全部 model，并物理删除其健康行。
 
-#### 5.5.1 创建配置
+#### 5.5.1 创建 provider + model
 
 ```bash
-curl -s -X POST "$BASE/llm-configs" \
+curl -s -X POST "$BASE/providers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "proxy",
-    "model_name": "MiniMax-M3",
-    "api_key": "sk-your-proxy-key-1234",
+    "type": "OPENAI_COMPATIBLE",
     "base_url": "https://your-proxy.example.com/v1",
-    "temperature": 0.2,
-    "description": "OpenAI 兼容代理配置"
+    "auth_config": {"api_key": "sk-your-proxy-key-1234"}
+  }'
+
+curl -s -X POST "$BASE/providers/proxy/models" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "m3",
+    "model_id": "MiniMax-M3",
+    "context_size": 204800,
+    "extra_params": {"temperature": 0.2}
   }'
 ```
 
-**预期**：HTTP 201 且 `code=201`，信封 `data` 为 `LlmConfigRead`：含 `data.api_key_masked`（如 `****1234`）、
-`data.content_hash` 非空、`data.enabled=true`；**响应 JSON 中不存在 `api_key` 字段**。
+**预期**：两条均 HTTP 201 且 `code=201`。provider 信封 `data` 含 `api_key_masked`（如 `****1234`）、
+**不存在 `auth_config`/`api_key` 字段**；model 信封 `data` 含 `ref="proxy/m3"`、`model_id`、`context_size`、`extra_params`。
 
-**失败排查**：422 信封：重名（`message` 为错误文案）/ `name` 非法或缺 `model_name`/`api_key`（`Validation error` + `data` 错误列表）。
+**失败排查**：422 信封：重名 / 非 OLLAMA 类型缺 `auth_config.api_key` / model 名含 `/` 或
+同 provider 下 `(name)`、`(model_id)` 重复；不存在 provider 下建 model 返回 404 信封。
 
-#### 5.5.2 列表与详情（恒掩码）
+#### 5.5.2 列表与分页（恒掩码 + model_count + health）
 
 ```bash
-curl -s "$BASE/llm-configs" -H "Authorization: Bearer $TOKEN"
-curl -s "$BASE/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/providers" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/providers/proxy" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/providers/proxy/models" -H "Authorization: Bearer $TOKEN"
 
-# 分页列表（可选）：items 同样恒掩码
-curl -s "$BASE/llm-configs/page?page=1&pageSize=10" -H "Authorization: Bearer $TOKEN"
+# 分页列表：items 附加 model_count（启用且未删的 model 数）与 health 快照
+curl -s "$BASE/providers/page?page=1&pageSize=10" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：列表/详情的信封 `data` 均含启动时 bootstrap 种子的 `default` 配置与刚创建的 `proxy`；
-每条记录只有 `api_key_masked`，无明文（分页端点的 `items` 同样遵守）。不存在时 404 信封。
+**预期**：列表/详情均含启动时 bootstrap 种子的 `default` provider 与刚创建的 `proxy`；
+每条记录只有 `api_key_masked`，无明文。未探测过的 provider `health.status="UNKNOWN"`；
+分页越界参数（`page<1` 或 `pageSize>100`）返回 422 信封。
 
-#### 5.5.3 PATCH 更新（api_key 省略 = 保留原值）
+#### 5.5.3 按需连通性探测（test 端点，写回 provider_health）
 
 ```bash
-# 只改温度，不带 api_key
-curl -s -X PATCH "$BASE/llm-configs/proxy" \
+curl -s -X POST "$BASE/providers/proxy/test" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：`code=200`，信封 `data` 为 `{status, latency_ms, error_message}`。探测用 `models.list()`
+（零推理成本），无后台任务：
+
+- 成功且延迟 ≤ 阈值（`PROVIDER_HEALTH_DEGRADED_MS`，默认 5000ms）：`status="UP"`、`error_message=null`；
+- 成功但延迟超阈值：`status="DEGRADED"`；
+- 失败：`status="DOWN"`、`error_message` 非空（截断 500 字符）、`fail_count` 递增；
+- 探测后再查 `GET /providers/page`，对应行 `health` 应反映最新状态（UP 时 `fail_count=0` 且 `last_success_at` 非空）；
+- 被禁用的 provider 探测返回 422 信封。
+
+#### 5.5.4 PATCH 更新（auth_config 省略 = 保留原值）
+
+```bash
+# 只改启用状态，不带 auth_config
+curl -s -X PATCH "$BASE/providers/proxy" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"temperature": 0.5}'
+  -d '{"enabled": false}'
+
+curl -s -X PATCH "$BASE/providers/proxy/models/m3" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"extra_params": {"temperature": 0.5}}'
 ```
 
-**预期**：`code=200`，信封 `data` 中 `temperature=0.5`、`content_hash` 刷新、`api_key_masked` 不变（原 key 保留）。
-空 payload 返回 422 信封，`message` 为 `nothing to update`；携带 `name` 返回 422 信封，`message` 含 `name is immutable`。
+**预期**：`code=200`，字段生效且 `api_key_masked` 不变（原 key 保留）。空 payload 返回 422 信封
+（`message` 为 `nothing to update`）；携带 `name` 或显式 null 打在 NOT NULL 字段上返回 422 信封；
+把非 OLLAMA provider 的 `auth_config` 改成无 `api_key` 也被 422 拒绝。
 
-#### 5.5.4 DELETE 守卫
+#### 5.5.5 DELETE 守卫（软删 + 级联 + 引用保护）
 
 ```bash
-# 负向 1：default 禁删
-curl -s -X DELETE "$BASE/llm-configs/default" -H "Authorization: Bearer $TOKEN"
+# 负向 1：default 对禁删
+curl -s -X DELETE "$BASE/providers/default" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/providers/default/models/default" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：422 信封，`message` 表明 default 配置受保护。
+**预期**：两条均 422 信封，`message` 表明 default 对受保护。
 
 ```bash
-# 负向 2：被引用的配置禁删（先把某个 AgentApp 的 model 指向 proxy，
-# 或在 6.1 创建 app 时传 "model": "proxy" 后再删）
+# 负向 2：被引用的 model 禁删（先把某个 AgentApp 的 model 指向 proxy/m3，
+# 或在 6.1 创建 app 时传 "model": "proxy/m3" 后再删）
 curl -s -X PATCH "$BASE/apps/$APP_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"model": "proxy"}'
-curl -s -X DELETE "$BASE/llm-configs/proxy" -H "Authorization: Bearer $TOKEN"
+  -d '{"model": "proxy/m3"}'
+curl -s -X DELETE "$BASE/providers/proxy/models/m3" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$BASE/providers/proxy" -H "Authorization: Bearer $TOKEN"
 ```
 
-**预期**：DELETE 返回 422 信封，`message` 列出引用方（`agent_app:<name>` / `subagent:<name>`）。
-未被引用的配置可正常删除（`code=200`，信封 `data=null`；随后 GET 返回 404 信封）。
+**预期**：两条 DELETE 均返回 422 信封，`message` 列出引用方（`agent_app:<name>` / `subagent:<name>`）。
+未被引用的可正常删除（`code=200`，信封 `data=null`；随后 GET 返回 404 信封）：
+删 provider 会级联软删其全部 model；删 model 只影响单行。
 
-> **语义注记**：编辑 LlmConfig（PATCH）**不会**把已发布 AgentApp 回退 draft（对比 6.5），
-> 但会刷新 `content_hash` 使编译指纹漂移，下次预热/编译自动用新配置重建运行时。
+> **语义注记**：编辑 Provider/ModelConfig（PATCH）**不会**把已发布 AgentApp 回退 draft（对比 6.5），
+> 但会使模型指纹漂移，下次预热/编译自动用新配置重建运行时。
 
 ---
 
@@ -813,8 +843,8 @@ curl -s -X POST "$BASE/apps" \
 **预期**：HTTP 201 且 `code=201`，信封 `data` 为 `AgentAppRead`：记下 `data.id`（后续记为 `$APP_ID`），
 `data.status="draft"`、`data.engine="deepagents"`、`data.version=1`、`data.published_hash=null`。
 
-> 可额外传 `"model": "proxy"`（LlmConfig 引用名，见 5.5 节）指定专用模型配置；
-> 不传则用 `default` 配置。
+> 可额外传 `"model": "proxy/m3"`（`provider/model` 引用，见 5.5 节）指定专用模型配置；
+> 不传则用 `default/default`。
 
 ```bash
 export APP_ID=<上一步信封 data 中返回的 id>
@@ -847,8 +877,8 @@ curl -s -X POST "$BASE/apps/$BAD_APP_ID/publish" \
 
 同类可验证的发布失败：`skill_names` 引用不存在的 skill、`subagent_names` 引用不存在的 subagent，
 分别返回 422 信封，`message` 为 `referenced skill 'xxx' does not exist` / `referenced subagent 'xxx' does not exist`。
-应用或子代理的 `model` 引用不存在/被禁用的 LlmConfig（如把 `model` PATCH 成 `ghost-config`）
-也返回 422 信封，`message` 列出缺失/禁用的配置名。
+应用或子代理的 `model` 引用不存在/被禁用的 `provider/model` 对（如把 `model` PATCH 成 `ghost/none`）
+也返回 422 信封，`message` 列出缺失/禁用的引用。
 
 （可用 `DELETE $BASE/apps/$BAD_APP_ID` 清理该脏数据应用。）
 

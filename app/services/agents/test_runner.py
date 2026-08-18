@@ -23,7 +23,7 @@ from app.models.agent_assets import SubAgentConfig
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents.assembly import compile_standalone_subagent, resolve_tools
 from app.services.agents.mcp_manager import build_tool_catalog, get_mcp_tools
-from app.services.llm.llm_store import build_chat_model, load_llm_config
+from app.services.llm.llm_store import build_chat_model, load_model_config
 
 
 def _message_text(message: AIMessage) -> str:
@@ -52,11 +52,11 @@ async def run_subagent_once(session: Session, *, name: str, prompt: str) -> SubA
     Returns:
         SubAgentTestResult with the final AIMessage text, the number of model
         turns consumed (AIMessage count), wall-clock duration and the upstream
-        model name of the resolved LlmConfig.
+        model id of the resolved model config.
 
     Raises:
-        ValueError: When no SubAgentConfig exists under ``name`` or its LLM
-            config reference cannot be resolved.
+        ValueError: When no SubAgentConfig exists under ``name`` or its model
+            reference cannot be resolved.
         Exception: Re-raised after error counting and structured logging.
     """
     cfg = _load_config(session, name)
@@ -66,12 +66,12 @@ async def run_subagent_once(session: Session, *, name: str, prompt: str) -> SubA
         raise ValueError(f"subagent config not found: {name}")
 
     try:
-        llm_cfg = load_llm_config(session, cfg.model)
+        provider_cfg, model_cfg = load_model_config(session, cfg.model)
     except ValueError:
         agent_test_runs_total.labels(status="error").inc()
-        logger.exception("subagent_test_llm_config_unresolvable", name=name)
+        logger.exception("subagent_test_model_unresolvable", name=name)
         raise
-    model_name = llm_cfg.model_name
+    model_name = model_cfg.model_id
     started = time.perf_counter()
     try:
         # The catalog validates MCP server health and mirrors what the API
@@ -81,7 +81,7 @@ async def run_subagent_once(session: Session, *, name: str, prompt: str) -> SubA
         mcp_tools = await get_mcp_tools(session)
         tool_index = {tool.name: tool for tool in [*builtin_tools, *mcp_tools]}
         tools = resolve_tools(cfg.allowed_tools, tool_index)  # None = full catalog
-        model = build_chat_model(llm_cfg)
+        model = build_chat_model(provider_cfg, model_cfg)
         graph = compile_standalone_subagent(cfg, tools=tools, model=model, checkpointer=None)
         # Tracing parity with the chat runtime (_build_config): the Langfuse
         # callback is attached only when tracing is enabled.

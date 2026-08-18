@@ -19,7 +19,9 @@ import sqlmodel  # noqa: F401
 
 from alembic import op
 
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME
+# Inlined: the retired ``LlmConfig`` model (and its constant) no longer
+# exists in ``app.models``; migrations must stay importable from scratch.
+DEFAULT_LLM_CONFIG_NAME = "default"
 
 # revision identifiers, used by Alembic.
 revision: str = "f3a1b7c9d204"  # pragma: allowlist secret

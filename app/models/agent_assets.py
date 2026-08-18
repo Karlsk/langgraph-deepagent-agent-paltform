@@ -12,7 +12,6 @@ from sqlmodel import Field
 from app.models.base import BaseModel
 
 DEFAULT_AGENT_APP_ID: str = "system-default"
-DEFAULT_LLM_CONFIG_NAME: str = "default"
 
 
 class SubAgentConfig(BaseModel, table=True):
@@ -127,42 +126,6 @@ class McpServerConfig(BaseModel, table=True):
     env: dict = Field(default_factory=dict, sa_column=Column(JSON))
     url: Optional[str] = Field(default=None)
     headers: dict = Field(default_factory=dict, sa_column=Column(JSON))
-    enabled: bool = Field(default=True)
-    description: str = Field(default="")
-    content_hash: str
-    created_by: Optional[str] = Field(default=None)
-
-
-class LlmConfig(BaseModel, table=True):
-    """LLM connection configuration referenced by agent asset ``model`` fields.
-
-    ``AgentApp.model`` / ``SubAgentConfig.model`` store the *reference name*
-    of a row in this table (NULL resolves to ``DEFAULT_LLM_CONFIG_NAME``).
-    The api_key is stored in plaintext by explicit product decision; the API
-    layer never projects it back — read schemas only expose a masked form.
-
-    Attributes:
-        name: Globally unique LLM config name, primary key
-        model_name: Upstream model identifier sent to the provider (e.g. MiniMax-M3)
-        api_key: Provider API key (plaintext; never echoed by the API layer)
-        base_url: Optional OpenAI-compatible endpoint (None = SDK env fallback)
-        temperature: Optional sampling temperature override
-        max_tokens: Optional completion token budget override
-        enabled: Whether this config may be resolved at runtime
-        description: Human-readable description of the config
-        content_hash: Hash over every effective field including api_key
-        (key rotation must change the hash), used for publish/versioning
-        created_by: Audit-only creator identifier
-    """
-
-    __tablename__ = "llm_config"  # pyright: ignore[reportAssignmentType]
-
-    name: str = Field(primary_key=True)
-    model_name: str
-    api_key: str
-    base_url: Optional[str] = Field(default=None)
-    temperature: Optional[float] = Field(default=None)
-    max_tokens: Optional[int] = Field(default=None)
     enabled: bool = Field(default=True)
     description: str = Field(default="")
     content_hash: str

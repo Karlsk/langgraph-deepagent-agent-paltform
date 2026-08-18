@@ -59,16 +59,16 @@ from app.core.metrics import llm_inference_duration_seconds, subagent_task_durat
 from app.core.observability import langfuse_callback_handler
 from app.models.agent_assets import (
     DEFAULT_AGENT_APP_ID,
-    DEFAULT_LLM_CONFIG_NAME,
     AgentApp,
-    LlmConfig,
     SkillAsset,
     SubAgentConfig,
 )
+from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.schemas import Message
 from app.services.agents import assembly
 from app.services.agents.bootstrap import ensure_default_agent_app
 from app.services.agents.mcp_manager import load_mcp_servers
+from app.services.llm.llm_store import compute_model_config_hash, parse_model_ref
 from app.services.memory import memory_service
 from app.utils import dump_messages, extract_text_content
 
@@ -160,7 +160,7 @@ class AgentAppRuntime(ABC):
         """Model label for metrics: the resolved real model name.
 
         The label must carry the upstream model identifier of the bound
-        LlmConfig row (resolved at construction time), never the config
+        model config row (resolved at construction time), never the config
         reference name; degradation/missing paths fall back to the
         configured default model.
         """
@@ -408,7 +408,7 @@ class DeepAgentsAppRuntime(AgentAppRuntime):
             graph: Compiled graph from ``assembly.get_or_compile``.
             checkpointer: Checkpointer attached to the graph (may be None).
             resolved_model_name: Real upstream model name of the resolved
-                app-level LlmConfig row (metrics label source; None falls
+                app-level model config (metrics label source; None falls
                 back to ``settings.DEFAULT_LLM_MODEL``).
         """
         self.app_cfg = app_cfg
@@ -518,7 +518,7 @@ class WorkflowAppRuntime(AgentAppRuntime):
         Args:
             app_cfg: The AgentApp row of engine="workflow".
             resolved_model_name: Real upstream model name of the resolved
-                app-level LlmConfig row (metrics label source; may be None).
+                app-level model config (metrics label source; may be None).
         """
         self.app_cfg = app_cfg
         self.resolved_model_name = resolved_model_name
@@ -621,15 +621,15 @@ async def _load_mcp_fingerprint(session: Session) -> str:
     return "|".join(sorted(f"{server.name}:{server.content_hash}" for server in servers))
 
 
-async def _load_llm_fingerprint(
+async def _load_model_fingerprint(
     session: Session, app_cfg: AgentApp, subagent_cfgs: Sequence[SubAgentConfig]
 ) -> tuple[str, str]:
-    """Fingerprint the LlmConfig rows referenced by the app and its subagents.
+    """Fingerprint the provider/model pairs referenced by the app and its subagents.
 
-    Every NULL ``model`` reference resolves to the default config, so the
-    name set always contains it. All referenced rows are fetched with a
-    single IN query; a missing or disabled reference fails fast so a broken
-    LLM configuration never reaches the compile path.
+    Every NULL ``model`` reference resolves to the default pair, so the
+    reference set always contains it. A missing, deleted or disabled pair
+    fails fast so a broken model configuration never reaches the compile
+    path.
 
     Args:
         session: SQLModel database session.
@@ -637,30 +637,53 @@ async def _load_llm_fingerprint(
         subagent_cfgs: Bound SubAgentConfig rows.
 
     Returns:
-        A tuple of ``name:content_hash`` pairs of the referenced configs
-        (sorted and pipe-joined, same shape as ``_load_mcp_fingerprint``)
-        and the resolved real upstream model name of the app-level config
-        row (``app_cfg.model`` reference or the default config).
+        A tuple of ``ref:content_hash`` pairs of the referenced model
+        configs (sorted and pipe-joined, same shape as
+        ``_load_mcp_fingerprint``) and the resolved upstream model id of the
+        app-level pair (``app_cfg.model`` reference or the default pair).
 
     Raises:
-        ValueError: When any referenced config is missing or disabled.
+        ValueError: When any referenced provider/model pair is missing,
+            deleted, disabled or malformed.
     """
-    names = {app_cfg.model or DEFAULT_LLM_CONFIG_NAME}
-    names.update(cfg.model or DEFAULT_LLM_CONFIG_NAME for cfg in subagent_cfgs)
+    refs = {app_cfg.model or DEFAULT_MODEL_REF}
+    refs.update(cfg.model or DEFAULT_MODEL_REF for cfg in subagent_cfgs)
 
-    statement = select(LlmConfig).where(col(LlmConfig.name).in_(names))
-    rows = session.exec(statement).all()
-    by_name = {row.name: row for row in rows}
+    pairs: dict[str, tuple[Provider, ModelConfig]] = {}
+    broken: list[str] = []
+    for ref in sorted(refs):
+        try:
+            provider_name, model_name = parse_model_ref(ref)
+        except ValueError:
+            broken.append(ref)
+            continue
+        provider = session.exec(
+            select(Provider).where(col(Provider.name) == provider_name, col(Provider.deleted) == False)  # noqa: E712
+        ).first()
+        model = (
+            session.exec(
+                select(ModelConfig).where(
+                    col(ModelConfig.provider_id) == provider.id,
+                    col(ModelConfig.name) == model_name,
+                    col(ModelConfig.deleted) == False,  # noqa: E712
+                )
+            ).first()
+            if provider is not None
+            else None
+        )
+        if provider is None or model is None or not provider.enabled or not model.enabled:
+            broken.append(ref)
+            continue
+        pairs[ref] = (provider, model)
 
-    broken = sorted(name for name in names if by_name.get(name) is None or not by_name[name].enabled)
     if broken:
         raise ValueError(
-            f"agent app {app_cfg.name!r} references missing or disabled llm config(s): {', '.join(broken)}"
+            f"agent app {app_cfg.name!r} references missing or disabled model config(s): {', '.join(broken)}"
         )
 
-    fingerprint = "|".join(sorted(f"{row.name}:{row.content_hash}" for row in by_name.values()))
-    app_config_row = by_name[app_cfg.model or DEFAULT_LLM_CONFIG_NAME]
-    return fingerprint, app_config_row.model_name
+    fingerprint = "|".join(sorted(f"{ref}:{compute_model_config_hash(provider, model)}" for ref, (provider, model) in pairs.items()))
+    app_model = pairs[app_cfg.model or DEFAULT_MODEL_REF][1]
+    return fingerprint, app_model.model_id
 
 
 async def _build_checkpointer() -> BaseCheckpointSaver | None:
@@ -700,7 +723,7 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
     Raises:
         ValueError: When the app is missing, not published, its engine is
             unknown (anything other than ``deepagents``/``workflow``), or a
-            referenced LlmConfig row is missing/disabled.
+            referenced model config is missing/disabled.
     """
     app_cfg = await _resolve_agent_app(session, agent_app_id)
     if app_cfg.status != "published":
@@ -709,8 +732,8 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
     subagent_cfgs = _load_subagents(session, app_cfg.subagent_names)
     skill_hashes = await _load_skill_hashes(session, app_cfg.skill_names)
     mcp_fingerprint = await _load_mcp_fingerprint(session)
-    llm_fingerprint, resolved_model_name = await _load_llm_fingerprint(session, app_cfg, subagent_cfgs)
-    fingerprint = assembly.compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, llm_fingerprint)
+    model_fingerprint, resolved_model_name = await _load_model_fingerprint(session, app_cfg, subagent_cfgs)
+    fingerprint = assembly.compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint)
 
     cached = _runtime_cache.get((app_cfg.id, fingerprint))
     if cached is not None:
@@ -733,7 +756,7 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
             subagent_cfgs=subagent_cfgs,
             skill_hashes=skill_hashes,
             mcp_fingerprint=mcp_fingerprint,
-            llm_fingerprint=llm_fingerprint,
+            model_fingerprint=model_fingerprint,
             user_id=_COMPILE_USER_ID,
             session=session,
             checkpointer=checkpointer,

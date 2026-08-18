@@ -18,15 +18,17 @@ LLM configuration is split into two independent chains:
   circular fallback and evals keep using `LLMRegistry`, whose `ChatOpenAI` instances read
   `OPENAI_API_KEY` and fall back to the `OPENAI_BASE_URL` / `OPENAI_API_BASE` environment
   variables for the endpoint. Model names stay the hard-coded registry list below.
-- **Agent asset chain (DB-driven)**: every AgentApp/SubAgent `model` field is an
-  **`LlmConfig` reference name** (NULL resolves to `default`). Rows live in the
-  `llm_config` table and are managed through the `/agent-apps/llm-configs` CRUD API;
-  `llm_store.load_llm_config` + `llm_store.build_chat_model` resolve a row into a fresh
-  `ChatOpenAI` instance at assembly/test-run time. Any OpenAI-compatible endpoint and
-  model name can be configured per config (e.g. a MiniMax-M3 proxy) without code changes.
-  The `default` config is seeded once at bootstrap from `OPENAI_API_KEY` /
-  `OPENAI_BASE_URL` / `DEFAULT_LLM_MODEL` / `DEFAULT_LLM_TEMPERATURE` / `MAX_TOKENS`
-  (insert-if-missing only — editing env vars afterwards does not overwrite the stored row).
+- **Agent asset chain (DB-driven)**: every AgentApp/SubAgent `model` field is a
+  **`provider/model` reference** (NULL resolves to `default/default`). Provider rows
+  (credentials, endpoint, type) and model rows (model_id, context_size, extra_params)
+  live in the `provider` / `model_config` tables and are managed through the
+  `/providers` CRUD API; `llm_store.load_model_config` + `llm_store.build_chat_model`
+  resolve a reference into a fresh `ChatOpenAI` instance at assembly/test-run time. Any
+  OpenAI-compatible endpoint and model name can be configured per provider/model pair
+  (e.g. a MiniMax-M3 proxy) without code changes. The `default` provider/model pair is
+  seeded once at bootstrap from `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `DEFAULT_LLM_MODEL`
+  / `DEFAULT_LLM_TEMPERATURE` (insert-if-missing only — editing env vars afterwards does
+  not overwrite the stored rows).
 
 API responses never expose `api_key` plaintext; reads return `api_key_masked` (`****` + last four characters).
 
@@ -44,7 +46,7 @@ Models are defined in `LLMRegistry.LLMS` in order of preference:
 | `gpt-5`        | gpt-5        | Full model, production-tuned sampling. |
 
 Set `DEFAULT_LLM_MODEL` in your `.env` to choose the starting model (it also seeds the
-`default` LlmConfig for the agent asset chain at first bootstrap).
+`default` model's `model_id` for the agent asset chain at first bootstrap).
 
 To add or change models, edit `LLMRegistry.LLMS` in `app/services/llm/registry.py`.
 

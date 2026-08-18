@@ -25,7 +25,8 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app.core.config import settings
 from app.core.metrics import agent_graph_cache_hits_total
-from app.models.agent_assets import AgentApp, LlmConfig, SubAgentConfig
+from app.models.agent_assets import AgentApp, SubAgentConfig
+from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.services.agents import assembly
 
 pytestmark = pytest.mark.unit
@@ -175,31 +176,37 @@ def _parent_model(final_text: str = "all done") -> ScriptedChatModel:
     return ScriptedChatModel(responses=[AIMessage(content=final_text)])
 
 
-def _make_llm_config(**overrides: Any) -> LlmConfig:
-    """Build an LlmConfig row for publish-validation tests."""
-    defaults: dict[str, Any] = {
+def _make_pair(**provider_overrides: Any) -> tuple[Provider, ModelConfig]:
+    """Build an enabled provider/model pair for publish-validation tests."""
+    provider_defaults: dict[str, Any] = {
         "name": "default",
-        "model_name": "MiniMax-M3",
-        "api_key": "sk-test",
-        "content_hash": "h-default",
+        "type": "OPENAI_COMPATIBLE",
+        "auth_config": {"api_key": "sk-test"},
     }
-    defaults.update(overrides)
-    return LlmConfig(**defaults)
+    provider_defaults.update(provider_overrides)
+    provider = Provider(**provider_defaults)
+    provider.id = 1
+    model = ModelConfig(provider_id=provider.id, name="default", model_id="MiniMax-M3")
+    return provider, model
 
 
-def _default_llm_configs() -> dict[str, LlmConfig]:
-    return {"default": _make_llm_config()}
+def _default_model_catalog() -> dict[str, tuple[Provider, ModelConfig]]:
+    return {DEFAULT_MODEL_REF: _make_pair()}
 
 
 def _patch_llm_seams(monkeypatch: pytest.MonkeyPatch, models: dict[str, Any]) -> None:
-    """Redirect the DB-backed resolution seam: reference name -> scripted model."""
+    """Redirect the DB-backed resolution seam: reference -> scripted model."""
 
-    def fake_load(session: Any, reference: str | None) -> LlmConfig:
-        name = reference or "default"
-        return _make_llm_config(name=name, model_name=name)
+    def fake_load(session: Any, reference: str | None) -> tuple[Provider, ModelConfig]:
+        ref = reference or DEFAULT_MODEL_REF
+        provider_name, _, model_name = ref.partition("/")
+        provider = Provider(name=provider_name, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-test"})
+        provider.id = 1
+        model = ModelConfig(provider_id=provider.id, name=model_name or provider_name, model_id=model_name or provider_name)
+        return provider, model
 
-    monkeypatch.setattr(assembly, "load_llm_config", fake_load)
-    monkeypatch.setattr(assembly, "build_chat_model", lambda cfg: models[cfg.model_name])
+    monkeypatch.setattr(assembly, "load_model_config", fake_load)
+    monkeypatch.setattr(assembly, "build_chat_model", lambda provider, model: models[model.model_id])
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +373,7 @@ def test_validate_publish_accepts_subset_of_catalog(mock_catalog: list[dict[str,
     """Whitelists contained in the catalog pass validation."""
     app_cfg = _make_app(allowed_tools=["echo"])
     sub_cfg = _make_subagent(allowed_tools=["upper"])
-    assembly.validate_publish(app_cfg, [sub_cfg], mock_catalog, _default_llm_configs())  # must not raise
+    assembly.validate_publish(app_cfg, [sub_cfg], mock_catalog, _default_model_catalog())  # must not raise
 
 
 def test_validate_publish_rejects_out_of_catalog_tools(mock_catalog: list[dict[str, Any]]) -> None:
@@ -374,26 +381,42 @@ def test_validate_publish_rejects_out_of_catalog_tools(mock_catalog: list[dict[s
     app_cfg = _make_app(allowed_tools=["echo", "ghost"])
     sub_cfg = _make_subagent(allowed_tools=["phantom"])
     with pytest.raises(ValueError, match="ghost") as exc_info:
-        assembly.validate_publish(app_cfg, [sub_cfg], mock_catalog, _default_llm_configs())
+        assembly.validate_publish(app_cfg, [sub_cfg], mock_catalog, _default_model_catalog())
     assert "phantom" in str(exc_info.value)
 
 
-def test_validate_publish_none_model_requires_default_config(mock_catalog: list[dict[str, Any]]) -> None:
-    """A NULL model reference resolves to the default config and must exist."""
+def test_validate_publish_none_model_requires_default_pair(mock_catalog: list[dict[str, Any]]) -> None:
+    """A NULL model reference resolves to the default pair and must exist."""
     app_cfg = _make_app(model=None)
     with pytest.raises(ValueError, match="default"):
         assembly.validate_publish(app_cfg, [], mock_catalog, {})
 
 
-def test_validate_publish_rejects_missing_and_disabled_llm_refs(mock_catalog: list[dict[str, Any]]) -> None:
-    """Missing and disabled LlmConfig references are aggregated into one error."""
-    app_cfg = _make_app(model="missing")
-    sub_cfg = _make_subagent(model="frozen")
-    configs = {"default": _make_llm_config(), "frozen": _make_llm_config(name="frozen", enabled=False)}
-    with pytest.raises(ValueError, match="missing") as exc_info:
-        assembly.validate_publish(app_cfg, [sub_cfg], mock_catalog, configs)
-    assert "frozen" in str(exc_info.value)
+def test_validate_publish_rejects_missing_and_disabled_model_refs(mock_catalog: list[dict[str, Any]]) -> None:
+    """Missing and disabled model references are aggregated into one error."""
+    app_cfg = _make_app(model="nowhere/gone")
+    sub_cfg = _make_subagent(model="frozen/locked")
+    frozen_provider = Provider(name="frozen", type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-test"})
+    frozen_provider.id = 2
+    frozen_model = ModelConfig(provider_id=frozen_provider.id, name="locked", model_id="m", enabled=False)
+    catalog = {DEFAULT_MODEL_REF: _make_pair(), "frozen/locked": (frozen_provider, frozen_model)}
+    with pytest.raises(ValueError, match="nowhere/gone") as exc_info:
+        assembly.validate_publish(app_cfg, [sub_cfg], mock_catalog, catalog)
+    assert "frozen/locked" in str(exc_info.value)
     assert "disabled" in str(exc_info.value)
+
+
+def test_validate_publish_rejects_disabled_provider(mock_catalog: list[dict[str, Any]]) -> None:
+    """A reference whose provider is disabled is reported on the provider."""
+    app_cfg = _make_app(model="offline/any")
+    offline_provider = Provider(
+        name="offline", type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-test"}, enabled=False
+    )
+    offline_provider.id = 3
+    offline_model = ModelConfig(provider_id=offline_provider.id, name="any", model_id="m")
+    catalog = {DEFAULT_MODEL_REF: _make_pair(), "offline/any": (offline_provider, offline_model)}
+    with pytest.raises(ValueError, match="provider 'offline' is disabled"):
+        assembly.validate_publish(app_cfg, [], mock_catalog, catalog)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +430,7 @@ def _fingerprint_inputs(**overrides: Any) -> dict[str, Any]:
         "subagent_cfgs": [_make_subagent()],
         "skill_hashes": {"greet": "hash-a"},
         "mcp_fingerprint": "srv:hash-1",
-        "llm_fingerprint": "default:hash-1",
+        "model_fingerprint": "default/default:hash-1",
     }
     defaults.update(overrides)
     return defaults
@@ -441,7 +464,7 @@ def test_compute_fingerprint_is_subagent_order_insensitive() -> None:
         {"subagent_cfgs": [_make_subagent(system_prompt="new sub prompt")]},
         {"skill_hashes": {"greet": "hash-b"}},
         {"mcp_fingerprint": "srv:hash-2"},
-        {"llm_fingerprint": "default:hash-2"},
+        {"model_fingerprint": "default/default:hash-2"},
     ],
 )
 def test_compute_fingerprint_changes_with_sensitive_fields(mutation: dict[str, Any]) -> None:

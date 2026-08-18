@@ -1,58 +1,85 @@
-"""DB-backed LLM configuration resolution for the agent asset chain.
+"""DB-backed model config resolution for the agent asset chain.
 
-This module is the resolution seam between persisted ``LlmConfig`` rows and
-the LangChain chat models used by ``assembly`` / ``test_runner``. The legacy
-``LLMRegistry`` stays untouched: it continues to serve the system-level call
-sites (session naming, skill drafts, LLMService circular fallback, evals),
-while every AgentApp/SubAgent ``model`` field now references a ``LlmConfig``
-name (NULL resolves to ``DEFAULT_LLM_CONFIG_NAME``).
+This module is the resolution seam between persisted ``Provider`` /
+``ModelConfig`` rows and the LangChain chat models used by ``assembly`` /
+``test_runner``. The legacy ``LLMRegistry`` stays untouched: it continues to
+serve the system-level call sites (session naming, skill drafts, LLMService
+circular fallback, evals), while every AgentApp/SubAgent ``model`` field now
+references a model config as ``"<provider name>/<model name>"`` (NULL
+resolves to ``DEFAULT_MODEL_REF``).
 
-Security note: ``api_key`` values are stored in plaintext by product
-decision, but they must never appear in logs or API responses — structured
-log events here only carry the config name / model_name / base_url.
+Security note: ``auth_config`` values (including ``api_key``) are stored in
+plaintext by product decision, but they must never appear in logs or API
+responses — structured log events here only carry provider/model names and
+the base_url.
 """
 
 import hashlib
 import json
-from typing import Any
 
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, LlmConfig
+from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 
-# Every effective field (including api_key) feeds the content hash so key
-# rotation / endpoint changes always drift the compile fingerprint.
-_HASH_FIELDS = ("model_name", "api_key", "base_url", "temperature", "max_tokens", "enabled", "description")
+# Every effective field (including auth_config secrets) feeds the content
+# hash so key rotation / endpoint changes always drift the compile
+# fingerprint.
+_PROVIDER_HASH_FIELDS = ("type", "base_url", "auth_config", "enabled")
+_MODEL_HASH_FIELDS = ("name", "model_id", "context_size", "extra_params", "enabled")
 
 
-def compute_llm_config_hash(cfg: LlmConfig) -> str:
-    """Compute the content hash over every effective field of a config.
+def parse_model_ref(reference: str) -> tuple[str, str]:
+    """Split a ``provider/model`` reference into its two name segments.
 
     Args:
-        cfg: The (possibly unpersisted) LLM configuration row.
+        reference: Model reference string.
+
+    Returns:
+        Tuple of (provider name, model name).
+
+    Raises:
+        ValueError: When the reference lacks exactly one non-empty segment
+            on each side of the first slash.
+    """
+    provider_name, sep, model_name = reference.partition("/")
+    if not sep or not provider_name or not model_name:
+        raise ValueError(f"invalid model reference '{reference}': expected '<provider>/<model>'")
+    return provider_name, model_name
+
+
+def compute_model_config_hash(provider: Provider, model: ModelConfig) -> str:
+    """Compute the content hash over every effective field of a model config.
+
+    Args:
+        provider: The owning provider row (endpoint + auth material).
+        model: The model config row.
 
     Returns:
         Hex sha256 over the canonical (sorted-keys, compact) JSON payload.
     """
-    payload = {field: getattr(cfg, field) for field in _HASH_FIELDS}
+    payload = {
+        **{f"provider.{field}": getattr(provider, field) for field in _PROVIDER_HASH_FIELDS},
+        **{f"model.{field}": getattr(model, field) for field in _MODEL_HASH_FIELDS},
+    }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def build_chat_model(cfg: LlmConfig) -> ChatOpenAI:
-    """Build a fresh ChatOpenAI client from a persisted LlmConfig row.
+def build_chat_model(provider: Provider, model: ModelConfig) -> ChatOpenAI:
+    """Build a fresh ChatOpenAI client from a resolved provider/model pair.
 
-    Optional fields (base_url/temperature/max_tokens) are only passed when
-    set, so a None ``base_url`` keeps the SDK's environment fallback chain
-    intact. Parameter mapping decisions:
+    Every provider type currently resolves through the OpenAI-compatible
+    path (``type`` only distinguishes the auth_config shape and the UI).
+    An empty ``base_url`` keeps the SDK's environment fallback chain intact.
+    Parameter mapping decisions:
 
-    - ``cfg.max_tokens`` is forwarded as ``max_completion_tokens`` — OpenAI's
-      unified token-budget parameter; the reasoning model family rejects the
-      legacy ``max_tokens``.
+    - ``extra_params["max_tokens"]`` is forwarded as
+      ``max_completion_tokens`` — OpenAI's unified token-budget parameter;
+      the reasoning model family rejects the legacy ``max_tokens``.
     - ``max_retries`` is restored from ``settings.MAX_LLM_CALL_RETRIES`` so
       transient provider errors retry again (partial compensation for the
       tenacity wrapper the legacy chat path used).
@@ -61,50 +88,87 @@ def build_chat_model(cfg: LlmConfig) -> ChatOpenAI:
     covers the hot path.
 
     Args:
-        cfg: The resolved LLM configuration row.
+        provider: The resolved provider row (endpoint + auth material).
+        model: The resolved model config row.
 
     Returns:
         A newly constructed ChatOpenAI instance.
     """
-    kwargs: dict[str, Any] = {
-        "model": cfg.model_name,
-        "api_key": SecretStr(cfg.api_key),
+    extra = model.extra_params or {}
+    kwargs: dict[str, object] = {
+        "model": model.model_id,
+        "api_key": SecretStr(str(provider.auth_config.get("api_key", ""))),
         "max_retries": settings.MAX_LLM_CALL_RETRIES,
     }
-    if cfg.base_url is not None:
-        kwargs["base_url"] = cfg.base_url
-    if cfg.temperature is not None:
-        kwargs["temperature"] = cfg.temperature
-    if cfg.max_tokens is not None:
-        kwargs["max_completion_tokens"] = cfg.max_tokens
+    if provider.base_url:
+        kwargs["base_url"] = provider.base_url
+    if extra.get("temperature") is not None:
+        kwargs["temperature"] = extra["temperature"]
+    if extra.get("max_tokens") is not None:
+        kwargs["max_completion_tokens"] = extra["max_tokens"]
 
-    logger.debug("llm_chat_model_built", name=cfg.name, model_name=cfg.model_name, base_url=cfg.base_url)
-    return ChatOpenAI(**kwargs)
+    logger.debug(
+        "llm_chat_model_built",
+        provider=provider.name,
+        model=model.name,
+        model_id=model.model_id,
+        base_url=provider.base_url,
+    )
+    return ChatOpenAI(**kwargs)  # pyright: ignore[reportArgumentType]
 
 
-def load_llm_config(session: Session, name: str | None) -> LlmConfig:
-    """Resolve an LlmConfig reference name to its persisted row.
+def _available_refs(session: Session) -> str:
+    """List every enabled, non-deleted ``provider/model`` reference."""
+    providers = {
+        row.id: row.name
+        for row in session.exec(select(Provider).where(col(Provider.deleted) == False)).all()  # noqa: E712
+    }
+    models = session.exec(select(ModelConfig).where(col(ModelConfig.deleted) == False)).all()  # noqa: E712
+    refs = sorted(
+        f"{providers[row.provider_id]}/{row.name}"
+        for row in models
+        if row.enabled and row.provider_id in providers
+    )
+    return ", ".join(refs)
 
-    ``None`` resolves to ``DEFAULT_LLM_CONFIG_NAME``. No lazy seeding: the
-    bootstrap path guarantees the default row exists, so a missing or
-    disabled row is a configuration error surfaced fail-fast.
+
+def load_model_config(session: Session, reference: str | None) -> tuple[Provider, ModelConfig]:
+    """Resolve a ``provider/model`` reference to its persisted rows.
+
+    ``None`` resolves to ``DEFAULT_MODEL_REF``. No lazy seeding: the
+    bootstrap path guarantees the default provider/model pair exists, so a
+    missing or disabled pair is a configuration error surfaced fail-fast.
 
     Args:
         session: SQLModel database session.
-        name: LlmConfig reference name (None = default config).
+        reference: Model reference (``provider/model``; None = default pair).
 
     Returns:
-        The enabled LlmConfig row.
+        The enabled (provider, model config) row pair.
 
     Raises:
-        ValueError: When the row is missing or disabled; the message lists
-            every enabled config name (registry-style listing).
+        ValueError: When the reference is malformed or the pair is missing,
+            soft-deleted or disabled; the message lists every available
+            reference (registry-style listing).
     """
-    config_name = name or DEFAULT_LLM_CONFIG_NAME
-    cfg = session.get(LlmConfig, config_name)
-    if cfg is not None and cfg.enabled:
-        return cfg
+    ref = reference or DEFAULT_MODEL_REF
+    provider_name, model_name = parse_model_ref(ref)
 
-    rows = session.exec(select(LlmConfig)).all()
-    available = ", ".join(sorted(row.name for row in rows if row.enabled))
-    raise ValueError(f"llm config '{config_name}' not found or disabled. available configs: {available}")
+    provider = session.exec(
+        select(Provider).where(col(Provider.name) == provider_name, col(Provider.deleted) == False)  # noqa: E712
+    ).first()
+    model = (
+        session.exec(
+            select(ModelConfig).where(
+                col(ModelConfig.provider_id) == provider.id,
+                col(ModelConfig.name) == model_name,
+                col(ModelConfig.deleted) == False,  # noqa: E712
+            )
+        ).first()
+        if provider is not None
+        else None
+    )
+    if provider is None or model is None or not provider.enabled or not model.enabled:
+        available = _available_refs(session)
+        raise ValueError(f"model config '{ref}' not found or disabled. available models: {available}")
+    return provider, model

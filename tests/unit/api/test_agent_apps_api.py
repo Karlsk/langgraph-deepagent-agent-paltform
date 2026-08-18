@@ -1,4 +1,4 @@
-"""Unit tests for the agent asset management API (subagents/skills/apps/MCP/LLM configs).
+"""Unit tests for the agent asset management API (subagents/skills/apps/MCP/providers).
 
 Zero real network / zero real LLM / zero real MCP: the DB layer runs on an
 in-memory SQLite session injected via dependency override, the auth
@@ -17,7 +17,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, create_engine
 from sqlmodel import Session as DBSession
@@ -30,14 +29,14 @@ from app.api.error_handlers import (
 )
 from app.api.v1 import agent_assets_common as common_module
 from app.api.v1 import apps as apps_module
-from app.api.v1 import llm_configs as llm_configs_module
 from app.api.v1 import mcp_servers as mcp_servers_module
 from app.api.v1 import skills as skills_module
 from app.api.v1 import subagents as subagents_module
 from app.api.v1 import auth as auth_module
 from app.core.config import settings
 from app.core.limiter import limiter
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, LlmConfig, McpServerConfig
+from app.models.agent_assets import McpServerConfig
+from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.models.session import Session as ChatSession
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents import skills_store
@@ -143,7 +142,6 @@ def client(db_session: DBSession, fake_chat_session: ChatSession) -> Generator[T
     app.include_router(skills_module.router)
     app.include_router(apps_module.router)
     app.include_router(mcp_servers_module.router)
-    app.include_router(llm_configs_module.router)
     app.dependency_overrides[auth_module.get_current_session] = lambda: fake_chat_session
     app.dependency_overrides[common_module.get_db_session] = lambda: db_session
     with TestClient(app) as test_client:
@@ -194,15 +192,18 @@ def _mcp_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
-def _llm_config_body(**overrides: Any) -> dict[str, Any]:
-    body: dict[str, Any] = {
-        "name": "proxy",
-        "model_name": "MiniMax-M3",
-        "api_key": "sk-secret-1234",
-        "base_url": "https://proxy.example.com/v1",
-    }
-    body.update(overrides)
-    return body
+def _seed_default_pair(db_session: DBSession) -> None:
+    """Seed the default provider/model pair that NULL model references resolve to."""
+    provider = Provider(
+        name="default",
+        type="OPENAI_COMPATIBLE",
+        auth_config={"api_key": "sk-test-default"},
+    )
+    db_session.add(provider)
+    db_session.commit()
+    db_session.refresh(provider)
+    db_session.add(ModelConfig(provider_id=provider.id, name="default", model_id="MiniMax-M3"))
+    db_session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -517,9 +518,9 @@ def test_patch_agent_app_explicit_null_collection_rejected(client: TestClient, f
     assert unwrap(client.get(f"/apps/{app_id}"))["version"] == 1
 
 
-def test_patch_published_app_content_edit_reverts_status_to_draft(client: TestClient) -> None:
+def test_patch_published_app_content_edit_reverts_status_to_draft(client: TestClient, db_session: DBSession) -> None:
     """Editing content fields of a published app demotes it back to draft."""
-    app_id = _seed_publishable_app(client)
+    app_id = _seed_publishable_app(client, db_session)
     assert unwrap(client.post(f"/apps/{app_id}/publish"))["status"] == "published"
 
     response = client.patch(f"/apps/{app_id}", json={"system_prompt": "You are edited."})
@@ -541,20 +542,20 @@ def test_delete_agent_app_removes_row(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _seed_publishable_app(client: TestClient, **app_overrides: Any) -> int:
-    """Create one skill + one subagent + default LLM config + one app; return app id."""
+def _seed_publishable_app(client: TestClient, db_session: DBSession, **app_overrides: Any) -> int:
+    """Create one skill + one subagent + default model pair + one app; return app id."""
     client.post("/skills", json=_skill_body())
     client.post("/subagents", json=_subagent_body())
-    client.post("/llm-configs", json=_llm_config_body(name=DEFAULT_LLM_CONFIG_NAME))
+    _seed_default_pair(db_session)
     body = _app_body(skill_names=["pdf-export"], subagent_names=["researcher"])
     body["allowed_tools"] = ["duckduckgo_results_json"]
     body.update(app_overrides)
     return int(unwrap(client.post("/apps", json=body), expected_code=201)["id"])
 
 
-def test_publish_success_sets_status_hash_and_version(client: TestClient) -> None:
+def test_publish_success_sets_status_hash_and_version(client: TestClient, db_session: DBSession) -> None:
     """Publish validates references + whitelist, then stamps hash/status/version."""
-    app_id = _seed_publishable_app(client)
+    app_id = _seed_publishable_app(client, db_session)
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 200
     payload = unwrap(response)
@@ -566,9 +567,9 @@ def test_publish_success_sets_status_hash_and_version(client: TestClient) -> Non
     assert [row["id"] for row in listed] == [app_id]
 
 
-def test_publish_unknown_tool_whitelist_rejected(client: TestClient) -> None:
+def test_publish_unknown_tool_whitelist_rejected(client: TestClient, db_session: DBSession) -> None:
     """allowed_tools outside the catalog are rejected with 422."""
-    app_id = _seed_publishable_app(client, allowed_tools=["ghost-tool"])
+    app_id = _seed_publishable_app(client, db_session, allowed_tools=["ghost-tool"])
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
     assert unwrap(client.get(f"/apps/{app_id}"))["status"] == "draft"
@@ -609,32 +610,37 @@ def test_publish_unknown_app_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_publish_missing_llm_config_reference_rejected(client: TestClient) -> None:
-    """An app referencing a nonexistent LLM config is rejected with 422."""
-    app_id = unwrap(client.post("/apps", json=_app_body(model="ghost-config")), expected_code=201)["id"]
+def test_publish_missing_model_reference_rejected(client: TestClient) -> None:
+    """An app referencing a nonexistent provider/model pair is rejected with 422."""
+    app_id = unwrap(client.post("/apps", json=_app_body(model="ghost/none")), expected_code=201)["id"]
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
     body = response.json()
     assert body["code"] == 422
-    assert "ghost-config" in body["message"]
+    assert "ghost/none" in body["message"]
     assert body["data"] is None
 
 
-def test_publish_missing_default_llm_config_rejected(client: TestClient) -> None:
-    """A NULL model reference needs the default config; its absence blocks publish."""
+def test_publish_missing_default_model_rejected(client: TestClient) -> None:
+    """A NULL model reference needs the default pair; its absence blocks publish."""
     app_id = unwrap(client.post("/apps", json=_app_body()), expected_code=201)["id"]
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
     body = response.json()
     assert body["code"] == 422
-    assert DEFAULT_LLM_CONFIG_NAME in body["message"]
+    assert DEFAULT_MODEL_REF in body["message"]
     assert body["data"] is None
 
 
-def test_publish_disabled_llm_config_reference_rejected(client: TestClient) -> None:
-    """A disabled referenced LLM config blocks publish with 422."""
-    client.post("/llm-configs", json=_llm_config_body(name="frozen", enabled=False))
-    app_id = unwrap(client.post("/apps", json=_app_body(model="frozen")), expected_code=201)["id"]
+def test_publish_disabled_model_reference_rejected(client: TestClient, db_session: DBSession) -> None:
+    """A disabled referenced model (or its provider) blocks publish with 422."""
+    provider = Provider(name="frozen", type="OLLAMA", auth_config={}, enabled=False)
+    db_session.add(provider)
+    db_session.commit()
+    db_session.refresh(provider)
+    db_session.add(ModelConfig(provider_id=provider.id, name="locked", model_id="frozen-model"))
+    db_session.commit()
+    app_id = unwrap(client.post("/apps", json=_app_body(model="frozen/locked")), expected_code=201)["id"]
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
     body = response.json()
@@ -643,223 +649,17 @@ def test_publish_disabled_llm_config_reference_rejected(client: TestClient) -> N
     assert body["data"] is None
 
 
-# ---------------------------------------------------------------------------
-# LLM config CRUD
-# ---------------------------------------------------------------------------
-
-
-def test_create_llm_config_returns_201_masked(client: TestClient) -> None:
-    """POST /llm-configs persists the row; api_key is never echoed back."""
-    response = client.post("/llm-configs", json=_llm_config_body())
-    assert response.status_code == 201
-    payload = unwrap(response, expected_code=201)
-    assert payload["name"] == "proxy"
-    assert payload["model_name"] == "MiniMax-M3"
-    assert payload["api_key_masked"] == "****1234"
-    assert "api_key" not in payload
-    assert payload["created_by"] == "ann"
-    assert payload["content_hash"]
-
-
-def test_create_llm_config_duplicate_name_rejected(client: TestClient) -> None:
-    """A second create with the same name is rejected with 422."""
-    assert client.post("/llm-configs", json=_llm_config_body()).status_code == 201
-    assert client.post("/llm-configs", json=_llm_config_body()).status_code == 422
-
-
-def test_create_llm_config_missing_required_fields_rejected(client: TestClient) -> None:
-    """name/model_name/api_key are mandatory (422 when missing)."""
-    assert client.post("/llm-configs", json={"name": "x", "model_name": "m"}).status_code == 422
-    assert client.post("/llm-configs", json={"name": "x", "api_key": "k"}).status_code == 422
-
-
-def test_list_llm_configs_masks_every_row(client: TestClient) -> None:
-    """GET /llm-configs lists masked projections only."""
-    client.post("/llm-configs", json=_llm_config_body())
-    client.post("/llm-configs", json=_llm_config_body(name="backup", api_key="sk-abcd"))
-    response = client.get("/llm-configs")
-    assert response.status_code == 200
-    rows = unwrap(response)
-    assert [row["name"] for row in rows] == ["backup", "proxy"]
-    assert all("api_key" not in row for row in rows)
-    # Short keys (<= 8 chars) never leak their tail.
-    assert {row["api_key_masked"] for row in rows} == {"****1234", "****"}
-
-
-def test_get_llm_config_returns_masked_row_or_404(client: TestClient) -> None:
-    """GET /llm-configs/{name} resolves masked rows and 404s unknown ones."""
-    client.post("/llm-configs", json=_llm_config_body())
-    found = client.get("/llm-configs/proxy")
-    assert found.status_code == 200
-    found_payload = unwrap(found)
-    assert "api_key" not in found_payload
-    assert found_payload["api_key_masked"] == "****1234"
-    assert client.get("/llm-configs/ghost").status_code == 404
-
-
-def test_patch_llm_config_updates_fields_and_refreshes_hash(client: TestClient) -> None:
-    """PATCH applies partial fields and recomputes the content hash."""
-    created = unwrap(client.post("/llm-configs", json=_llm_config_body()), expected_code=201)
-    response = client.patch("/llm-configs/proxy", json={"temperature": 0.9, "description": "tuned"})
-    assert response.status_code == 200
-    payload = unwrap(response)
-    assert payload["temperature"] == 0.9
-    assert payload["description"] == "tuned"
-    assert payload["content_hash"] != created["content_hash"]
-
-
-def test_patch_llm_config_omitted_api_key_keeps_stored_key(client: TestClient, db_session: DBSession) -> None:
-    """Omitting api_key on PATCH leaves the stored key untouched."""
-    client.post("/llm-configs", json=_llm_config_body())
-    response = client.patch("/llm-configs/proxy", json={"description": "no rotation"})
-    assert response.status_code == 200
-    row = db_session.get(LlmConfig, "proxy")
-    assert row is not None and row.api_key == "sk-secret-1234"
-
-    rotated = client.patch("/llm-configs/proxy", json={"api_key": "sk-rotated-9999"})
-    assert rotated.status_code == 200
-    assert unwrap(rotated)["api_key_masked"] == "****9999"
-    row = db_session.get(LlmConfig, "proxy")
-    assert row is not None and row.api_key == "sk-rotated-9999"
-
-
-def test_patch_llm_config_rejects_name_change_and_empty_payload(client: TestClient) -> None:
-    """PATCH with the immutable name field or an empty body is rejected (422)."""
-    client.post("/llm-configs", json=_llm_config_body())
-    assert client.patch("/llm-configs/proxy", json={"name": "other"}).status_code == 422
-    assert client.patch("/llm-configs/proxy", json={}).status_code == 422
-
-
-def test_patch_llm_config_unknown_name_404(client: TestClient) -> None:
-    """PATCH on a missing LLM config returns 404."""
-    assert client.patch("/llm-configs/ghost", json={"description": "x"}).status_code == 404
-
-
-def test_delete_llm_config_removes_row(client: TestClient) -> None:
-    """DELETE removes an unreferenced row; subsequent reads 404."""
-    client.post("/llm-configs", json=_llm_config_body())
-    assert client.delete("/llm-configs/proxy").status_code == 200
-    assert client.get("/llm-configs/proxy").status_code == 404
-    assert client.delete("/llm-configs/proxy").status_code == 404
-
-
-def test_delete_default_llm_config_forbidden(client: TestClient) -> None:
-    """The bootstrap-seeded default config can never be deleted (422)."""
-    client.post("/llm-configs", json=_llm_config_body(name=DEFAULT_LLM_CONFIG_NAME))
-    response = client.delete(f"/llm-configs/{DEFAULT_LLM_CONFIG_NAME}")
-    assert response.status_code == 422
-    assert client.get(f"/llm-configs/{DEFAULT_LLM_CONFIG_NAME}").status_code == 200
-
-
-def test_delete_llm_config_referenced_by_app_rejected(client: TestClient) -> None:
-    """A config referenced by an AgentApp.model field is delete-protected (422)."""
-    client.post("/llm-configs", json=_llm_config_body())
-    client.post("/apps", json=_app_body(model="proxy"))
-    response = client.delete("/llm-configs/proxy")
-    assert response.status_code == 422
-    body = response.json()
-    assert body["code"] == 422
-    assert "support-app" in body["message"]
-    assert body["data"] is None
-
-
-def test_delete_llm_config_referenced_by_subagent_rejected(client: TestClient) -> None:
-    """A config referenced by a SubAgentConfig.model field is delete-protected (422)."""
-    client.post("/llm-configs", json=_llm_config_body())
-    client.post("/subagents", json=_subagent_body(model="proxy"))
-    response = client.delete("/llm-configs/proxy")
-    assert response.status_code == 422
-    body = response.json()
-    assert body["code"] == 422
-    assert "researcher" in body["message"]
-    assert body["data"] is None
-
-
-def test_edit_llm_config_does_not_demote_published_app(client: TestClient) -> None:
-    """Editing an LLM config only drifts the fingerprint: published apps stay published."""
-    app_id = _seed_publishable_app(client)
-    assert unwrap(client.post(f"/apps/{app_id}/publish"))["status"] == "published"
-
-    edited = client.patch(f"/llm-configs/{DEFAULT_LLM_CONFIG_NAME}", json={"api_key": "sk-rotated-0000"})
-    assert edited.status_code == 200
-
-    app_payload = unwrap(client.get(f"/apps/{app_id}"))
-    assert app_payload["status"] == "published"  # no demotion, only fingerprint drift
-    assert unwrap(client.get("/apps/published")) != []
-
-
-@pytest.mark.parametrize(
-    "api_key,expected", [("a", "****"), ("abcd", "****"), ("12345678", "****"), ("123456789", "****6789")]
-)
-def test_mask_api_key_short_key_boundaries(api_key: str, expected: str) -> None:
-    """Keys of length <= 8 mask fully; length 9 keeps the last four chars."""
-    assert llm_configs_module._mask_api_key(api_key) == expected  # noqa: SLF001 — unit under test
-
-
-@pytest.mark.parametrize("field", ["model_name", "api_key", "enabled", "description"])
-def test_patch_llm_config_explicit_null_on_required_field_rejected(client: TestClient, field: str) -> None:
-    """Explicit JSON null on NOT NULL fields is rejected with 422 (omit instead)."""
-    client.post("/llm-configs", json=_llm_config_body())
-    response = client.patch("/llm-configs/proxy", json={field: None})
-    assert response.status_code == 422
-    body = response.json()
-    assert body["code"] == 422
-    assert "null is not allowed" in body["message"]
-    assert body["data"] is None
-
-
-@pytest.mark.parametrize("field", ["base_url", "temperature", "max_tokens"])
-def test_patch_llm_config_explicit_null_clears_optional_field(client: TestClient, field: str) -> None:
-    """Explicit JSON null keeps its clear-to-None semantics for optional fields."""
-    client.post("/llm-configs", json=_llm_config_body(temperature=0.7, max_tokens=512))
-    response = client.patch("/llm-configs/proxy", json={field: None})
-    assert response.status_code == 200
-    assert unwrap(response)[field] is None
-
-
-def test_create_llm_config_commit_race_returns_422(
-    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A unique-name race lost at commit time degrades to 422 (never 500)."""
-
-    def racing_commit() -> None:
-        raise IntegrityError("insert", {}, Exception("duplicate key"))
-
-    monkeypatch.setattr(db_session, "commit", racing_commit)
-    response = client.post("/llm-configs", json=_llm_config_body())
-    assert response.status_code == 422
-    body = response.json()
-    assert body["code"] == 422
-    assert "already exists" in body["message"]
-    assert body["data"] is None
-
-
-def test_create_llm_config_empty_base_url_normalized_to_none(client: TestClient) -> None:
-    """POST with base_url='' stores None (SDK env fallback chain stays intact)."""
-    response = client.post("/llm-configs", json=_llm_config_body(base_url=""))
-    assert response.status_code == 201
-    assert unwrap(response)["base_url"] is None
-
-
-def test_patch_llm_config_empty_base_url_normalized_to_none(client: TestClient) -> None:
-    """PATCH with base_url='' stores None, same as omitting the endpoint."""
-    client.post("/llm-configs", json=_llm_config_body())
-    response = client.patch("/llm-configs/proxy", json={"base_url": ""})
-    assert response.status_code == 200
-    assert unwrap(response)["base_url"] is None
-
-
 def test_delete_default_agent_app_forbidden(client: TestClient) -> None:
-    """The system default agent app is delete-protected (422), symmetric to llm-configs."""
+    """The system default agent app is delete-protected (422), symmetric to providers."""
     app_id = unwrap(client.post("/apps", json=_app_body(name="default")), expected_code=201)["id"]
     response = client.delete(f"/apps/{app_id}")
     assert response.status_code == 422
     assert client.get(f"/apps/{app_id}").status_code == 200
 
 
-def test_patch_default_agent_app_still_demotes_to_draft(client: TestClient) -> None:
+def test_patch_default_agent_app_still_demotes_to_draft(client: TestClient, db_session: DBSession) -> None:
     """PATCH on a published app keeps its draft-demotion semantics (unchanged)."""
-    client.post("/llm-configs", json=_llm_config_body(name=DEFAULT_LLM_CONFIG_NAME))
+    _seed_default_pair(db_session)
     app_id = unwrap(client.post("/apps", json=_app_body(name="default")), expected_code=201)["id"]
     assert unwrap(client.post(f"/apps/{app_id}/publish"))["status"] == "published"
     response = client.patch(f"/apps/{app_id}", json={"system_prompt": "edited"})
@@ -1216,16 +1016,3 @@ def test_list_mcp_servers_page_returns_page_result(client: TestClient) -> None:
 
     assert [row["name"] for row in payload["items"]] == ["fs-server"]
     assert payload["total"] == 1
-
-
-def test_list_llm_configs_page_masks_api_key(client: TestClient) -> None:
-    """GET /llm-configs/page returns masked projections inside a PageResult."""
-    client.post("/llm-configs", json=_llm_config_body())
-
-    payload = unwrap(client.get("/llm-configs/page"))
-
-    assert payload["total"] == 1
-    assert payload["pageSize"] == 10
-    row = payload["items"][0]
-    assert row["api_key_masked"] == "****1234"
-    assert "api_key" not in row

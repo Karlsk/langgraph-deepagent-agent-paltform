@@ -1,13 +1,17 @@
-"""Pydantic schemas for agent asset endpoints: sub-agents, skills, agent apps, MCP servers and LLM configs.
+"""Pydantic schemas for agent asset endpoints: sub-agents, skills, agent apps and MCP servers.
 
 Phase-1 scope: no per-user isolation, all assets are globally shared;
 ``created_by`` is kept for auditing only. Name fields follow the
 ``^[a-z0-9][a-z0-9_-]*$`` identifier pattern shared with the ORM layer.
+
+Asset ``model`` fields reference a model config as ``"<provider>/<model>"``
+(NULL resolves to ``default/default``); provider/model schemas live in
+``app.schemas.providers``.
 """
 
 from typing import Literal, Optional, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pydantic.fields import FieldInfo
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
@@ -453,107 +457,3 @@ class ToolCatalogEntry(BaseModel):
     name: str = Field(..., description="Tool name as registered with the engine")
     source: Literal["builtin", "mcp"] = Field(..., description="Origin of the tool")
     server: Optional[str] = Field(default=None, description="Owning MCP server name (mcp-sourced tools only)")
-
-
-# ---------------------------------------------------------------------------
-# LLM configs
-# ---------------------------------------------------------------------------
-
-
-class LlmConfigCreate(BaseModel):
-    """Request model for creating an LLM configuration.
-
-    Attributes:
-        name: Globally unique LLM config name (immutable after creation)
-        model_name: Upstream model identifier sent to the provider
-        api_key: Provider API key (stored as configured; never echoed back)
-        base_url: Optional OpenAI-compatible endpoint (None = SDK env fallback)
-        temperature: Optional sampling temperature override
-        max_tokens: Optional completion token budget override
-        enabled: Whether this config may be resolved at runtime
-        description: Human-readable description of the config
-    """
-
-    name: str = _name_field("Globally unique LLM config name")  # pyright: ignore[reportAssignmentType]
-    model_name: str = Field(..., min_length=1, description="Upstream model identifier sent to the provider")
-    api_key: str = Field(..., min_length=1, description="Provider API key (never echoed back by the API)")
-    base_url: Optional[str] = Field(
-        default=None, description="Optional OpenAI-compatible endpoint (None = SDK env fallback)"
-    )
-    temperature: Optional[float] = Field(
-        default=None, ge=0.0, le=2.0, description="Optional sampling temperature override"
-    )
-    max_tokens: Optional[int] = Field(default=None, ge=1, description="Optional completion token budget override")
-    enabled: bool = Field(default=True, description="Whether this config may be resolved at runtime")
-    description: str = Field(default="", description="Human-readable description of the config")
-
-    @field_validator("base_url", mode="after")
-    @classmethod
-    def normalize_empty_base_url(cls, value: Optional[str]) -> Optional[str]:
-        """Normalize an empty-string endpoint to None (SDK env fallback chain)."""
-        return None if value == "" else value
-
-
-class LlmConfigUpdate(BaseModel):
-    """Partial update model for an LLM config (PATCH semantics; name is immutable).
-
-    ``api_key`` omitted = the stored key is kept unchanged.
-
-    Attributes:
-        model_name: Updated upstream model identifier
-        api_key: Replacement provider API key (omit to keep the stored key)
-        base_url: Updated endpoint URL
-        temperature: Updated sampling temperature override
-        max_tokens: Updated completion token budget override
-        enabled: Updated active flag
-        description: Updated description
-    """
-
-    model_name: Optional[str] = Field(default=None, min_length=1, description="Updated upstream model identifier")
-    api_key: Optional[str] = Field(
-        default=None, min_length=1, description="Replacement provider API key (omit to keep the stored key)"
-    )
-    base_url: Optional[str] = Field(default=None, description="Updated endpoint URL")
-    temperature: Optional[float] = Field(
-        default=None, ge=0.0, le=2.0, description="Updated sampling temperature override"
-    )
-    max_tokens: Optional[int] = Field(default=None, ge=1, description="Updated completion token budget override")
-    enabled: Optional[bool] = Field(default=None, description="Updated active flag")
-    description: Optional[str] = Field(default=None, description="Updated description")
-
-    @field_validator("base_url", mode="after")
-    @classmethod
-    def normalize_empty_base_url(cls, value: Optional[str]) -> Optional[str]:
-        """Normalize an empty-string endpoint to None (SDK env fallback chain)."""
-        return None if value == "" else value
-
-
-class LlmConfigRead(BaseModel):
-    """Response model for an LLM configuration.
-
-    Physically excludes ``api_key``: only the masked projection
-    ``api_key_masked`` (``****`` + last four characters) is ever returned.
-
-    Attributes:
-        name: Globally unique LLM config name
-        model_name: Upstream model identifier sent to the provider
-        api_key_masked: Masked form of the stored API key
-        base_url: OpenAI-compatible endpoint (None = SDK env fallback)
-        temperature: Sampling temperature override
-        max_tokens: Completion token budget override
-        enabled: Whether this config may be resolved at runtime
-        description: Human-readable description of the config
-        content_hash: Hash of the effective content (used for publish/versioning)
-        created_by: Audit-only creator identifier
-    """
-
-    name: str = Field(..., description="Globally unique LLM config name")
-    model_name: str = Field(..., description="Upstream model identifier sent to the provider")
-    api_key_masked: str = Field(..., description="Masked form of the stored API key")
-    base_url: Optional[str] = Field(default=None, description="OpenAI-compatible endpoint")
-    temperature: Optional[float] = Field(default=None, description="Sampling temperature override")
-    max_tokens: Optional[int] = Field(default=None, description="Completion token budget override")
-    enabled: bool = Field(..., description="Whether this config may be resolved at runtime")
-    description: str = Field(default="", description="Human-readable description of the config")
-    content_hash: str = Field(..., description="Hash of the effective content")
-    created_by: Optional[str] = Field(default=None, description="Audit-only creator identifier")

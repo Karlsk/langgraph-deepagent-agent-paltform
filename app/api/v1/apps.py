@@ -23,12 +23,13 @@ from app.api.v1.agent_assets_common import (
     paginate_by_name,
 )
 from app.api.v1.auth import get_current_session
-from app.api.v1.llm_configs import _llm_fingerprint
 from app.api.v1.mcp_servers import _mcp_fingerprint
+from app.api.v1.providers import _model_fingerprint, build_model_catalog
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, AgentApp, LlmConfig, SkillAsset, SubAgentConfig
+from app.models.agent_assets import AgentApp, SkillAsset, SubAgentConfig
+from app.models.provider import DEFAULT_MODEL_REF
 from app.models.session import Session as ChatSession
 from app.schemas.agent_apps import AgentAppCreate, AgentAppRead, AgentAppUpdate
 from app.schemas.base import ApiResponse, PageResult
@@ -38,7 +39,7 @@ from app.services.agents.mcp_manager import build_tool_catalog
 router = APIRouter()
 
 # System default AgentApp name (bootstrap-seeded; delete-protected like the
-# default LlmConfig).
+# default provider/model pair).
 _DEFAULT_AGENT_APP_NAME = "default"
 
 
@@ -373,22 +374,20 @@ async def publish_agent_app(
             skill_hashes[skill_name] = asset.content_hash
 
         catalog = await build_tool_catalog(db)
-        llm_configs: dict[str, LlmConfig] = {
-            row.name: row for row in db.exec(select(LlmConfig).order_by(col(LlmConfig.name))).all()
-        }
+        model_catalog = build_model_catalog(db)
         try:
-            assembly.validate_publish(app_cfg, subagent_cfgs, catalog, llm_configs)
+            assembly.validate_publish(app_cfg, subagent_cfgs, catalog, model_catalog)
         except ValueError as exc:
             logger.warning("agent_app_publish_validation_failed", app_id=app_id, error=str(exc))
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        reference_names = {app_cfg.model or DEFAULT_LLM_CONFIG_NAME}
-        reference_names.update(cfg.model or DEFAULT_LLM_CONFIG_NAME for cfg in subagent_cfgs)
-        referenced = {name: llm_configs[name] for name in reference_names}
+        reference_names = {app_cfg.model or DEFAULT_MODEL_REF}
+        reference_names.update(cfg.model or DEFAULT_MODEL_REF for cfg in subagent_cfgs)
+        referenced = {name: model_catalog[name] for name in reference_names}
 
         app_cfg.status = "published"
         app_cfg.published_hash = assembly.compute_fingerprint(
-            app_cfg, subagent_cfgs, skill_hashes, _mcp_fingerprint(db), _llm_fingerprint(referenced)
+            app_cfg, subagent_cfgs, skill_hashes, _mcp_fingerprint(db), _model_fingerprint(referenced)
         )
         app_cfg.version += 1
         db.add(app_cfg)

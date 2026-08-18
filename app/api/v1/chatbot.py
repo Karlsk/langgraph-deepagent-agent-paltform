@@ -40,7 +40,7 @@ def _resolve_stream_model(runtime_obj: object) -> str:
     """Pick the metric label for one stream run.
 
     Prefers the runtime's ``resolved_model_name`` — the real upstream model
-    identifier of the bound LlmConfig row — over any reference name; falls
+    identifier of the bound model config — over any reference name; falls
     back to the configured default model when unresolved.
 
     Args:

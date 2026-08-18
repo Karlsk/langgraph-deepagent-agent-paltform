@@ -221,7 +221,8 @@ class Settings:
             "skill": ["60 per minute"],
             "agent_app": ["60 per minute"],
             "mcp_server": ["60 per minute"],
-            "llm_config": ["60 per minute"],
+            "provider": ["60 per minute"],
+            "model_config": ["60 per minute"],
             "tools_catalog": ["60 per minute"],
             "subagent_test": ["5 per minute"],
             "skill_generate": ["5 per minute"],
@@ -234,6 +235,10 @@ class Settings:
             value = parse_list_from_env(env_key)
             if value:
                 self.RATE_LIMIT_ENDPOINTS[endpoint] = value
+
+        # Provider connectivity probe configuration
+        self.PROVIDER_TEST_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TEST_TIMEOUT_SECONDS", "10"))
+        self.PROVIDER_HEALTH_DEGRADED_MS = int(os.getenv("PROVIDER_HEALTH_DEGRADED_MS", "5000"))
 
         # Evaluation Configuration
         self.EVALUATION_LLM = os.getenv("EVALUATION_LLM", "gpt-5")

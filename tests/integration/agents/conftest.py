@@ -43,14 +43,13 @@ from app.api.v1 import mcp_servers as mcp_servers_module
 from app.api.v1.api import api_router
 from app.core.config import settings
 from app.core.limiter import limiter
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, LlmConfig
+from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.models.user import User
 from app.services.agents import assembly
 from app.services.agents import mcp_manager
 from app.services.agents import runtime as runtime_module
 from app.services.agents import test_runner as test_runner_module
 from app.services.database import database_service
-from app.services.llm.llm_store import compute_llm_config_hash
 from app.services.memory import memory_service
 from app.utils.auth import create_access_token
 from tests.conftest import unwrap
@@ -171,8 +170,9 @@ def settings_isolation(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Genera
 def db_engine(monkeypatch: pytest.MonkeyPatch) -> Generator[Any, None, None]:
     """In-memory SQLite engine shared by every database seam of the app.
 
-    Seeds the ``default`` LlmConfig row: custom apps with ``model=None``
-    resolve through the DB-backed seam without the bootstrap path running.
+    Seeds the ``default/default`` provider/model pair: custom apps with
+    ``model=None`` resolve through the DB-backed seam without the bootstrap
+    path running.
     """
     engine = create_engine(
         "sqlite://",
@@ -183,14 +183,21 @@ def db_engine(monkeypatch: pytest.MonkeyPatch) -> Generator[Any, None, None]:
     from sqlmodel import Session as DBSession  # noqa: PLC0415 — fixture-local seam
 
     with DBSession(engine) as session:
-        default_llm = LlmConfig(
-            name=DEFAULT_LLM_CONFIG_NAME,
-            model_name=settings.DEFAULT_LLM_MODEL,
-            api_key="sk-test-default",
-            content_hash="",
+        provider = Provider(
+            name=DEFAULT_PROVIDER_NAME,
+            type="OPENAI_COMPATIBLE",
+            auth_config={"api_key": "sk-test-default"},
         )
-        default_llm.content_hash = compute_llm_config_hash(default_llm)
-        session.add(default_llm)
+        session.add(provider)
+        session.commit()
+        session.refresh(provider)
+        session.add(
+            ModelConfig(
+                provider_id=provider.id,
+                name=DEFAULT_MODEL_NAME,
+                model_id=settings.DEFAULT_LLM_MODEL,
+            )
+        )
         session.commit()
     monkeypatch.setattr(database_service, "engine", engine)
     monkeypatch.setattr(auth_module.db_service, "engine", engine)
@@ -236,12 +243,12 @@ def user_headers(user: User) -> dict[str, str]:
 def scripted_model(monkeypatch: pytest.MonkeyPatch) -> ScriptedChatModel:
     """Serve every chat-model construction from a scripted model (tests append responses).
 
-    The DB-backed resolution seam (``load_llm_config``) stays real; only the
+    The DB-backed resolution seam (``load_model_config``) stays real; only the
     ChatOpenAI construction point is redirected to the scripted substitute.
     """
     model = ScriptedChatModel(responses=[AIMessage(content="default-reply")])
-    monkeypatch.setattr(assembly, "build_chat_model", lambda cfg: model)
-    monkeypatch.setattr(test_runner_module, "build_chat_model", lambda cfg: model)
+    monkeypatch.setattr(assembly, "build_chat_model", lambda provider, model_cfg: model)
+    monkeypatch.setattr(test_runner_module, "build_chat_model", lambda provider, model_cfg: model)
     return model
 
 

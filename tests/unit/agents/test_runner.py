@@ -19,7 +19,8 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.core.config import settings
 from app.core.metrics import agent_test_runs_total, subagent_task_duration_seconds
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, LlmConfig, SubAgentConfig
+from app.models.agent_assets import SubAgentConfig
+from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.services.agents import test_runner
 
 pytestmark = pytest.mark.unit
@@ -82,17 +83,27 @@ def upper(text: str) -> str:
 
 @pytest.fixture
 def db_session() -> Generator[Session, None, None]:
-    """Provide an isolated in-memory SQLite session seeded with the default LlmConfig."""
+    """Provide an isolated in-memory SQLite session seeded with the default provider/model pair."""
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
-        default_llm = LlmConfig(
-            name=DEFAULT_LLM_CONFIG_NAME,
-            model_name=settings.DEFAULT_LLM_MODEL,
-            api_key="sk-test-default",
-            content_hash="h-default",
+        provider = Provider(
+            name=DEFAULT_PROVIDER_NAME,
+            type="OPENAI_COMPATIBLE",
+            auth_config={"api_key": "sk-test-default"},
+            created_by="test",
         )
-        session.add(default_llm)
+        session.add(provider)
+        session.commit()
+        session.refresh(provider)
+        session.add(
+            ModelConfig(
+                provider_id=provider.id,
+                name=DEFAULT_MODEL_NAME,
+                model_id=settings.DEFAULT_LLM_MODEL,
+                created_by="test",
+            )
+        )
         session.commit()
         yield session
 
@@ -140,31 +151,44 @@ def _seed_config(session: Session, **overrides: Any) -> SubAgentConfig:
 
 
 def _patch_registry(monkeypatch: pytest.MonkeyPatch, model: BaseChatModel) -> list[str]:
-    """Redirect the ChatOpenAI construction seam; record resolved config names."""
+    """Redirect the ChatOpenAI construction seam; record resolved references."""
     requested: list[str] = []
 
-    def fake_build(cfg: LlmConfig) -> BaseChatModel:
-        requested.append(cfg.name)
+    def fake_build(provider: Provider, model_cfg: ModelConfig) -> BaseChatModel:
+        requested.append(f"{provider.name}/{model_cfg.name}")
         return model
 
     monkeypatch.setattr(test_runner, "build_chat_model", fake_build)
     return requested
 
 
-def _seed_llm_config(session: Session, **overrides: Any) -> LlmConfig:
-    """Persist an extra LlmConfig row for explicit-reference tests."""
+def _seed_model_pair(session: Session, **overrides: Any) -> ModelConfig:
+    """Persist an extra provider/model pair for explicit-reference tests."""
     defaults: dict[str, Any] = {
-        "name": "minimax",
-        "model_name": "MiniMax-M3",
-        "api_key": "sk-test-mini",
-        "content_hash": "h-minimax",
+        "provider_name": "minimax",
+        "model_name": "m3",
+        "model_id": "MiniMax-M3",
     }
     defaults.update(overrides)
-    cfg = LlmConfig(**defaults)
-    session.add(cfg)
+    provider = Provider(
+        name=defaults["provider_name"],
+        type="OPENAI_COMPATIBLE",
+        auth_config={"api_key": "sk-test-mini"},
+        created_by="test",
+    )
+    session.add(provider)
     session.commit()
-    session.refresh(cfg)
-    return cfg
+    session.refresh(provider)
+    model_cfg = ModelConfig(
+        provider_id=provider.id,
+        name=defaults["model_name"],
+        model_id=defaults["model_id"],
+        created_by="test",
+    )
+    session.add(model_cfg)
+    session.commit()
+    session.refresh(model_cfg)
+    return model_cfg
 
 
 def _run_counter(status: str) -> float:
@@ -200,41 +224,41 @@ def test_run_subagent_once_success_path(db_session: Session, monkeypatch: pytest
     assert result.final_message == "done helping"
     assert result.turns == 1
     assert result.duration_seconds >= 0.0
-    assert result.model == settings.DEFAULT_LLM_MODEL  # cfg.model=None -> default config's model_name
-    assert requested == [DEFAULT_LLM_CONFIG_NAME]
+    assert result.model == settings.DEFAULT_LLM_MODEL  # cfg.model=None -> default pair's model_id
+    assert requested == [DEFAULT_MODEL_REF]
     assert _run_counter("success") == success_before + 1
     assert _duration_count("helper") == duration_before + 1
 
 
 # ---------------------------------------------------------------------------
-# LlmConfig reference resolution
+# provider/model reference resolution
 # ---------------------------------------------------------------------------
 
 
-def test_run_subagent_once_explicit_llm_reference_resolves_config(
+def test_run_subagent_once_explicit_reference_resolves_pair(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A non-NULL model field resolves the named LlmConfig; result.model is the model_name."""
-    _seed_config(db_session, model="minimax")
-    _seed_llm_config(db_session)
+    """A non-NULL model field resolves the provider/model pair; result.model is the model_id."""
+    _seed_config(db_session, model="minimax/m3")
+    _seed_model_pair(db_session)
     model = ScriptedChatModel(responses=[AIMessage(content="ok")])
     requested = _patch_registry(monkeypatch, model)
 
     result = asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="hi"))
 
     assert result.model == "MiniMax-M3"
-    assert requested == ["minimax"]
+    assert requested == ["minimax/m3"]
 
 
-def test_run_subagent_once_missing_llm_reference_raises_and_counts_error(
+def test_run_subagent_once_missing_reference_raises_and_counts_error(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unresolvable model reference raises ValueError and counts status=error."""
-    _seed_config(db_session, model="ghost-config")
+    _seed_config(db_session, model="ghost/none")
     _patch_registry(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="ok")]))
     error_before = _run_counter("error")
 
-    with pytest.raises(ValueError, match="ghost-config"):
+    with pytest.raises(ValueError, match="ghost/none"):
         asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="hi"))
 
     assert _run_counter("error") == error_before + 1

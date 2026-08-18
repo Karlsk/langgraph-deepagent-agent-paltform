@@ -22,13 +22,15 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import MemorySaver
 from prometheus_client import REGISTRY
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.config import settings
 from app.core.prompts import load_static_system_prompt
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, AgentApp, LlmConfig, SubAgentConfig
+from app.models.agent_assets import AgentApp, SubAgentConfig
+from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.schemas import Message
 from app.services.agents import assembly, bootstrap, runtime
+from app.services.llm.llm_store import compute_model_config_hash
 
 pytestmark = pytest.mark.unit
 
@@ -154,12 +156,18 @@ def _echo_call_message() -> AIMessage:
 def _patch_llm_seams(monkeypatch: pytest.MonkeyPatch, model: ScriptedChatModel) -> None:
     """Redirect the DB-backed resolution seam to the scripted model."""
 
-    def fake_load(session: Any, reference: str | None) -> LlmConfig:
-        name = reference or DEFAULT_LLM_CONFIG_NAME
-        return LlmConfig(name=name, model_name=name, api_key="sk-test", content_hash=f"h-{name}")
+    def fake_load(session: Any, reference: str | None) -> tuple[Provider, ModelConfig]:
+        ref = reference or DEFAULT_MODEL_REF
+        provider_name, _, model_name = ref.partition("/")
+        provider = Provider(name=provider_name, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-test"})
+        provider.id = 1
+        model_cfg = ModelConfig(
+            provider_id=provider.id, name=model_name or provider_name, model_id=model_name or provider_name
+        )
+        return provider, model_cfg
 
-    monkeypatch.setattr(assembly, "load_llm_config", fake_load)
-    monkeypatch.setattr(assembly, "build_chat_model", lambda cfg: model)
+    monkeypatch.setattr(assembly, "load_model_config", fake_load)
+    monkeypatch.setattr(assembly, "build_chat_model", lambda provider, model_cfg: model)
 
 
 def _compile_runtime(model: ScriptedChatModel, app_cfg: AgentApp, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -469,15 +477,15 @@ def _patch_get_runtime_seams(monkeypatch: pytest.MonkeyPatch, model: ScriptedCha
     async def fake_mcp_fingerprint(session: Any) -> str:
         return ""
 
-    async def fake_llm_fingerprint(session: Any, app_cfg: Any, subagent_cfgs: Any) -> tuple[str, str]:
-        return f"{DEFAULT_LLM_CONFIG_NAME}:h-default", "real-model-x"
+    async def fake_model_fingerprint(session: Any, app_cfg: Any, subagent_cfgs: Any) -> tuple[str, str]:
+        return f"{DEFAULT_MODEL_REF}:h-default", "real-model-x"
 
     async def fake_checkpointer() -> Any:
         return MemorySaver()
 
     monkeypatch.setattr(runtime, "_load_skill_hashes", fake_skill_hashes)
     monkeypatch.setattr(runtime, "_load_mcp_fingerprint", fake_mcp_fingerprint)
-    monkeypatch.setattr(runtime, "_load_llm_fingerprint", fake_llm_fingerprint)
+    monkeypatch.setattr(runtime, "_load_model_fingerprint", fake_model_fingerprint)
     monkeypatch.setattr(runtime, "_build_checkpointer", fake_checkpointer)
     _patch_llm_seams(monkeypatch, model)
 
@@ -648,24 +656,24 @@ def test_resolve_agent_app_reuses_existing_default(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.fixture
-def patched_llm_bootstrap(monkeypatch: pytest.MonkeyPatch) -> LlmConfig:
-    """Isolate the FakeDBSession bootstrap tests from the LlmConfig seeding.
+def patched_model_bootstrap(monkeypatch: pytest.MonkeyPatch) -> tuple[Provider, ModelConfig]:
+    """Isolate the FakeDBSession bootstrap tests from the provider/model seeding.
 
-    ``ensure_default_agent_app`` provisions the default LlmConfig first; the
-    fake session cannot serve that lookup, so the seam returns a canned row.
+    ``ensure_default_agent_app`` provisions the default provider/model pair
+    first; the fake session cannot serve that lookup, so the seam returns a
+    canned pair.
     """
-    default_llm = LlmConfig(
-        name=DEFAULT_LLM_CONFIG_NAME,
-        model_name=settings.DEFAULT_LLM_MODEL,
-        api_key="sk-seeded",
-        content_hash="h-seeded",
+    provider = Provider(
+        name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-seeded"}
     )
+    provider.id = 1
+    model = ModelConfig(provider_id=provider.id, name=DEFAULT_MODEL_NAME, model_id=settings.DEFAULT_LLM_MODEL)
 
-    async def fake_ensure(session: Any) -> LlmConfig:
-        return default_llm
+    async def fake_ensure(session: Any) -> tuple[Provider, ModelConfig]:
+        return provider, model
 
-    monkeypatch.setattr(bootstrap, "ensure_default_llm_config", fake_ensure)
-    return default_llm
+    monkeypatch.setattr(bootstrap, "ensure_default_provider_and_model", fake_ensure)
+    return provider, model
 
 
 class FakeExecResult:
@@ -729,7 +737,7 @@ class FakeDBSession:
 
 
 def test_bootstrap_creates_default_app_and_backfills(
-    mock_memory: dict[str, Any], patched_llm_bootstrap: LlmConfig
+    mock_memory: dict[str, Any], patched_model_bootstrap: tuple[Provider, ModelConfig]
 ) -> None:
     """First call creates the published default app and backfills sessions."""
     session = FakeDBSession(default_app=None)
@@ -741,9 +749,9 @@ def test_bootstrap_creates_default_app_and_backfills(
     assert app_cfg.allowed_tools is None
     assert app_cfg.id == 7
     assert app_cfg.published_hash and len(app_cfg.published_hash) == 64
-    # The llm fingerprint embeds the seeded default config content hash.
+    # The model fingerprint embeds the seeded default pair content hash.
     recomputed = assembly.compute_fingerprint(
-        app_cfg, [], {}, "", f"{DEFAULT_LLM_CONFIG_NAME}:{patched_llm_bootstrap.content_hash}"
+        app_cfg, [], {}, "", f"{DEFAULT_MODEL_REF}:{compute_model_config_hash(*patched_model_bootstrap)}"
     )
     assert app_cfg.published_hash == recomputed
     assert app_cfg.system_prompt  # static baseline template
@@ -754,7 +762,9 @@ def test_bootstrap_creates_default_app_and_backfills(
     assert len(update_statements) == 1
 
 
-def test_bootstrap_is_idempotent(mock_memory: dict[str, Any], patched_llm_bootstrap: LlmConfig) -> None:
+def test_bootstrap_is_idempotent(
+    mock_memory: dict[str, Any], patched_model_bootstrap: tuple[Provider, ModelConfig]
+) -> None:
     """A second call reuses the existing row and still runs the backfill."""
     existing = _make_app(name="default", status="published", published_hash="h" * 64)
     existing.id = 9
@@ -778,7 +788,9 @@ def test_static_system_prompt_strips_dynamic_segments() -> None:
     assert "# Current date and time" not in prompt
 
 
-def test_bootstrap_stores_static_template(mock_memory: dict[str, Any], patched_llm_bootstrap: LlmConfig) -> None:
+def test_bootstrap_stores_static_template(
+    mock_memory: dict[str, Any], patched_model_bootstrap: tuple[Provider, ModelConfig]
+) -> None:
     """The default app persists the static template, never frozen dynamics."""
     session = FakeDBSession(default_app=None)
     app_cfg = asyncio.run(bootstrap.ensure_default_agent_app(session))
@@ -789,7 +801,7 @@ def test_bootstrap_stores_static_template(mock_memory: dict[str, Any], patched_l
 
 
 def test_bootstrap_refreshes_frozen_legacy_prompt(
-    mock_memory: dict[str, Any], patched_llm_bootstrap: LlmConfig
+    mock_memory: dict[str, Any], patched_model_bootstrap: tuple[Provider, ModelConfig]
 ) -> None:
     """A legacy row holding a frozen rendered prompt is migrated in place."""
     frozen = (
@@ -811,7 +823,7 @@ def test_bootstrap_refreshes_frozen_legacy_prompt(
 
 
 def test_bootstrap_skips_update_when_prompt_current(
-    mock_memory: dict[str, Any], patched_llm_bootstrap: LlmConfig
+    mock_memory: dict[str, Any], patched_model_bootstrap: tuple[Provider, ModelConfig]
 ) -> None:
     """A row already on the static template is left untouched (no UPDATE)."""
     existing = _make_app(name="default", status="published", published_hash="e" * 64)
@@ -825,7 +837,7 @@ def test_bootstrap_skips_update_when_prompt_current(
 
 
 def test_bootstrap_recovers_from_concurrent_insert(
-    mock_memory: dict[str, Any], patched_llm_bootstrap: LlmConfig
+    mock_memory: dict[str, Any], patched_model_bootstrap: tuple[Provider, ModelConfig]
 ) -> None:
     """An IntegrityError on insert (multi-worker race) rolls back and re-queries."""
     winner = _make_app(name="default", status="published", published_hash="w" * 64)
@@ -846,15 +858,15 @@ def test_bootstrap_recovers_from_concurrent_insert(
     assert session.added and session.added[0] is not winner  # loser row discarded
 
 
-def test_bootstrap_tolerates_unseeded_default_llm_config(
+def test_bootstrap_tolerates_unseeded_default_provider(
     mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A skipped LlmConfig seed (empty API key) degrades the fingerprint to ''."""
+    """A skipped provider seed (empty API key) degrades the fingerprint to ''."""
 
-    async def skipped_ensure(session: Any) -> LlmConfig | None:
+    async def skipped_ensure(session: Any) -> tuple[Provider, ModelConfig] | None:
         return None
 
-    monkeypatch.setattr(bootstrap, "ensure_default_llm_config", skipped_ensure)
+    monkeypatch.setattr(bootstrap, "ensure_default_provider_and_model", skipped_ensure)
     session = FakeDBSession(default_app=None)
 
     app_cfg = asyncio.run(bootstrap.ensure_default_agent_app(session))
@@ -865,13 +877,13 @@ def test_bootstrap_tolerates_unseeded_default_llm_config(
 
 
 # ---------------------------------------------------------------------------
-# bootstrap.ensure_default_llm_config
+# bootstrap.ensure_default_provider_and_model
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def llm_bootstrap_session() -> Generator[Session, None, None]:
-    """In-memory SQLite session for the default LlmConfig bootstrap tests."""
+    """In-memory SQLite session for the default provider/model bootstrap tests."""
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
@@ -880,7 +892,7 @@ def llm_bootstrap_session() -> Generator[Session, None, None]:
 
 @pytest.fixture
 def llm_seed_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fix the environment seed sources of ensure_default_llm_config."""
+    """Fix the environment seed sources of ensure_default_provider_and_model."""
     monkeypatch.setattr(settings, "OPENAI_API_KEY", "sk-seed-key")
     monkeypatch.setattr(settings, "DEFAULT_LLM_MODEL", "MiniMax-M3")
     monkeypatch.setattr(settings, "DEFAULT_LLM_TEMPERATURE", 0.2)
@@ -888,81 +900,84 @@ def llm_seed_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.example.com/v1")
 
 
-def test_ensure_default_llm_config_seeds_from_environment(
+def test_ensure_default_provider_and_model_seeds_from_environment(
     llm_bootstrap_session: Session, llm_seed_settings: None
 ) -> None:
-    """First call inserts the default config from the environment seed sources."""
-    cfg = asyncio.run(bootstrap.ensure_default_llm_config(llm_bootstrap_session))
+    """First call inserts the default provider/model pair from the environment."""
+    pair = asyncio.run(bootstrap.ensure_default_provider_and_model(llm_bootstrap_session))
 
-    assert cfg is not None
-    assert cfg.name == DEFAULT_LLM_CONFIG_NAME
-    assert cfg.model_name == "MiniMax-M3"
-    assert cfg.api_key == "sk-seed-key"
-    assert cfg.base_url == "https://proxy.example.com/v1"
-    assert cfg.temperature == 0.2
-    # Never freeze the process-level token budget: None = provider default.
-    assert cfg.max_tokens is None
-    assert cfg.content_hash and len(cfg.content_hash) == 64
+    assert pair is not None
+    provider, model = pair
+    assert provider.name == DEFAULT_PROVIDER_NAME
+    assert provider.type == "OPENAI_COMPATIBLE"
+    assert provider.auth_config == {"api_key": "sk-seed-key"}
+    assert provider.base_url == "https://proxy.example.com/v1"
+    assert model.name == DEFAULT_MODEL_NAME
+    assert model.model_id == "MiniMax-M3"
+    assert model.extra_params == {"temperature": 0.2}
+    # Never freeze the process-level token budget: no max_tokens key at all.
+    assert "max_tokens" not in model.extra_params
 
 
-def test_ensure_default_llm_config_skips_seed_without_api_key(
+def test_ensure_default_provider_and_model_skips_seed_without_api_key(
     llm_bootstrap_session: Session, llm_seed_settings: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An empty OPENAI_API_KEY skips seeding entirely (retry next startup)."""
     monkeypatch.setattr(settings, "OPENAI_API_KEY", "")
 
-    cfg = asyncio.run(bootstrap.ensure_default_llm_config(llm_bootstrap_session))
+    pair = asyncio.run(bootstrap.ensure_default_provider_and_model(llm_bootstrap_session))
 
-    assert cfg is None
-    assert llm_bootstrap_session.get(LlmConfig, DEFAULT_LLM_CONFIG_NAME) is None
+    assert pair is None
+    assert llm_bootstrap_session.exec(select(Provider)).first() is None
 
 
-def test_ensure_default_llm_config_empty_key_keeps_existing_row(
+def test_ensure_default_provider_and_model_empty_key_keeps_existing_pair(
     llm_bootstrap_session: Session, llm_seed_settings: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The empty-key guard never touches a pre-existing row."""
+    """The empty-key guard never touches a pre-existing pair."""
     monkeypatch.setattr(settings, "OPENAI_API_KEY", "")
-    edited = LlmConfig(
-        name=DEFAULT_LLM_CONFIG_NAME, model_name="kept", api_key="sk-kept", content_hash="h-kept"
-    )
+    edited = Provider(name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-kept"})
     llm_bootstrap_session.add(edited)
     llm_bootstrap_session.commit()
+    llm_bootstrap_session.refresh(edited)
+    kept_model = ModelConfig(provider_id=edited.id, name=DEFAULT_MODEL_NAME, model_id="kept")
+    llm_bootstrap_session.add(kept_model)
+    llm_bootstrap_session.commit()
 
-    cfg = asyncio.run(bootstrap.ensure_default_llm_config(llm_bootstrap_session))
+    pair = asyncio.run(bootstrap.ensure_default_provider_and_model(llm_bootstrap_session))
 
-    assert cfg is not None and cfg.model_name == "kept"
+    assert pair is not None and pair[1].model_id == "kept"
 
 
-def test_ensure_default_llm_config_never_overwrites_existing(
+def test_ensure_default_provider_and_model_never_overwrites_existing(
     llm_bootstrap_session: Session, llm_seed_settings: None
 ) -> None:
-    """A pre-existing (admin-edited) row is returned untouched, never reseeded."""
-    edited = LlmConfig(
-        name=DEFAULT_LLM_CONFIG_NAME,
-        model_name="custom-model",
-        api_key="sk-admin-edited",
-        description="edited by admin",
-        content_hash="h-edited",
+    """A pre-existing (admin-edited) pair is returned untouched, never reseeded."""
+    edited = Provider(
+        name=DEFAULT_PROVIDER_NAME, type="OPENAI", auth_config={"api_key": "sk-admin-edited"}
     )
     llm_bootstrap_session.add(edited)
     llm_bootstrap_session.commit()
+    llm_bootstrap_session.refresh(edited)
+    custom_model = ModelConfig(provider_id=edited.id, name=DEFAULT_MODEL_NAME, model_id="custom-model")
+    llm_bootstrap_session.add(custom_model)
+    llm_bootstrap_session.commit()
 
-    cfg = asyncio.run(bootstrap.ensure_default_llm_config(llm_bootstrap_session))
+    pair = asyncio.run(bootstrap.ensure_default_provider_and_model(llm_bootstrap_session))
 
-    assert cfg.model_name == "custom-model"
-    assert cfg.api_key == "sk-admin-edited"
-    assert cfg.content_hash == "h-edited"  # untouched, not recomputed
+    assert pair is not None
+    provider, model = pair
+    assert provider.type == "OPENAI"
+    assert provider.auth_config == {"api_key": "sk-admin-edited"}
+    assert model.model_id == "custom-model"
 
 
-def test_ensure_default_llm_config_recovers_from_concurrent_insert(
+def test_ensure_default_provider_and_model_recovers_from_concurrent_insert(
     llm_bootstrap_session: Session, llm_seed_settings: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An IntegrityError on insert rolls back and adopts the concurrent winner."""
-    winner = LlmConfig(
-        name=DEFAULT_LLM_CONFIG_NAME,
-        model_name="winner-model",
-        api_key="sk-winner",
-        content_hash="h-winner",
+    winner = Provider(
+        name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-winner"}
     )
     call_state = {"failed": False}
     real_commit = llm_bootstrap_session.commit
@@ -970,23 +985,30 @@ def test_ensure_default_llm_config_recovers_from_concurrent_insert(
     def racing_commit() -> None:
         if not call_state["failed"]:
             call_state["failed"] = True
-            # The other worker won: their row appears before our retry.
+            # The other worker won: their pair appears before our retry.
             llm_bootstrap_session.rollback()
             llm_bootstrap_session.add(winner)
+            real_commit()
+            llm_bootstrap_session.refresh(winner)
+            llm_bootstrap_session.add(
+                ModelConfig(provider_id=winner.id, name=DEFAULT_MODEL_NAME, model_id="winner-model")
+            )
             real_commit()
             raise IntegrityError("insert", {}, Exception("duplicate key"))
         real_commit()
 
     monkeypatch.setattr(llm_bootstrap_session, "commit", racing_commit)
 
-    cfg = asyncio.run(bootstrap.ensure_default_llm_config(llm_bootstrap_session))
+    pair = asyncio.run(bootstrap.ensure_default_provider_and_model(llm_bootstrap_session))
 
-    assert cfg.name == DEFAULT_LLM_CONFIG_NAME
-    assert cfg.model_name == "winner-model"
+    assert pair is not None
+    provider, model = pair
+    assert provider.name == DEFAULT_PROVIDER_NAME
+    assert model.model_id == "winner-model"
 
 
 # ---------------------------------------------------------------------------
-# runtime._load_llm_fingerprint
+# runtime._load_model_fingerprint
 # ---------------------------------------------------------------------------
 
 
@@ -1002,60 +1024,89 @@ def _sub_cfg(name: str, model: str | None) -> SubAgentConfig:
     )
 
 
-def test_load_llm_fingerprint_collects_referenced_configs(llm_bootstrap_session: Session) -> None:
-    """The fingerprint covers app + subagent references (NULL -> default)."""
-    for row in [
-        LlmConfig(name=DEFAULT_LLM_CONFIG_NAME, model_name="m1", api_key="k1", content_hash="h-a"),
-        LlmConfig(name="minimax", model_name="m2", api_key="k2", content_hash="h-b"),
-    ]:
-        llm_bootstrap_session.add(row)
-    llm_bootstrap_session.commit()
+def _seed_pair(
+    session: Session, provider_name: str, model_name: str, model_id: str, **provider_overrides: Any
+) -> tuple[Provider, ModelConfig]:
+    """Persist one provider/model pair for fingerprint tests."""
+    provider = Provider(
+        name=provider_name, type="OPENAI_COMPATIBLE", auth_config={"api_key": "k"}, **provider_overrides
+    )
+    session.add(provider)
+    session.commit()
+    session.refresh(provider)
+    model = ModelConfig(provider_id=provider.id, name=model_name, model_id=model_id)
+    session.add(model)
+    session.commit()
+    session.refresh(model)
+    return provider, model
 
-    app_cfg = _make_app(model="minimax")
+
+def test_load_model_fingerprint_collects_referenced_pairs(llm_bootstrap_session: Session) -> None:
+    """The fingerprint covers app + subagent references (NULL -> default)."""
+    default_pair = _seed_pair(llm_bootstrap_session, DEFAULT_PROVIDER_NAME, DEFAULT_MODEL_NAME, "m1")
+    minimax_pair = _seed_pair(llm_bootstrap_session, "minimax", "m2", "m2-upstream")
+
+    app_cfg = _make_app(model="minimax/m2")
     fingerprint, resolved_model_name = asyncio.run(
-        runtime._load_llm_fingerprint(  # noqa: SLF001 — unit under test
+        runtime._load_model_fingerprint(  # noqa: SLF001 — unit under test
             llm_bootstrap_session, app_cfg, [_sub_cfg("helper", None)]
         )
     )
 
-    assert fingerprint == f"{DEFAULT_LLM_CONFIG_NAME}:h-a|minimax:h-b"
-    assert resolved_model_name == "m2"  # explicit reference resolves the real model
+    expected = "|".join(
+        sorted(
+            [
+                f"{DEFAULT_MODEL_REF}:{compute_model_config_hash(*default_pair)}",
+                f"minimax/m2:{compute_model_config_hash(*minimax_pair)}",
+            ]
+        )
+    )
+    assert fingerprint == expected
+    assert resolved_model_name == "m2-upstream"  # explicit reference resolves the real model id
 
 
-def test_load_llm_fingerprint_null_model_resolves_default_model_name(
+def test_load_model_fingerprint_null_model_resolves_default_model_id(
     llm_bootstrap_session: Session,
 ) -> None:
-    """A NULL app model reference resolves the default config's model_name."""
-    llm_bootstrap_session.add(
-        LlmConfig(name=DEFAULT_LLM_CONFIG_NAME, model_name="real-default", api_key="k", content_hash="h-a")
-    )
-    llm_bootstrap_session.commit()
+    """A NULL app model reference resolves the default pair's model_id."""
+    _seed_pair(llm_bootstrap_session, DEFAULT_PROVIDER_NAME, DEFAULT_MODEL_NAME, "real-default")
 
     fingerprint, resolved_model_name = asyncio.run(
-        runtime._load_llm_fingerprint(llm_bootstrap_session, _make_app(model=None), [])  # noqa: SLF001
+        runtime._load_model_fingerprint(llm_bootstrap_session, _make_app(model=None), [])  # noqa: SLF001
     )
 
-    assert fingerprint == f"{DEFAULT_LLM_CONFIG_NAME}:h-a"
+    assert fingerprint.startswith(f"{DEFAULT_MODEL_REF}:")
     assert resolved_model_name == "real-default"
 
 
-def test_load_llm_fingerprint_missing_reference_raises(llm_bootstrap_session: Session) -> None:
-    """A missing referenced config fails fast before compilation."""
-    app_cfg = _make_app(model="ghost")
-    with pytest.raises(ValueError, match="ghost"):
-        asyncio.run(runtime._load_llm_fingerprint(llm_bootstrap_session, app_cfg, []))  # noqa: SLF001
+def test_load_model_fingerprint_missing_reference_raises(llm_bootstrap_session: Session) -> None:
+    """A missing referenced pair fails fast before compilation."""
+    app_cfg = _make_app(model="ghost/none")
+    with pytest.raises(ValueError, match="ghost/none"):
+        asyncio.run(runtime._load_model_fingerprint(llm_bootstrap_session, app_cfg, []))  # noqa: SLF001
 
 
-def test_load_llm_fingerprint_disabled_reference_raises(llm_bootstrap_session: Session) -> None:
-    """A disabled referenced config fails fast before compilation."""
+def test_load_model_fingerprint_malformed_reference_raises(llm_bootstrap_session: Session) -> None:
+    """A reference without the provider/model shape fails fast."""
+    app_cfg = _make_app(model="no-slash")
+    with pytest.raises(ValueError, match="no-slash"):
+        asyncio.run(runtime._load_model_fingerprint(llm_bootstrap_session, app_cfg, []))  # noqa: SLF001
+
+
+def test_load_model_fingerprint_disabled_reference_raises(llm_bootstrap_session: Session) -> None:
+    """A disabled referenced model fails fast before compilation."""
+    provider = Provider(name="frozen", type="OPENAI_COMPATIBLE", auth_config={"api_key": "k"})
+    llm_bootstrap_session.add(provider)
+    llm_bootstrap_session.commit()
+    llm_bootstrap_session.refresh(provider)
     llm_bootstrap_session.add(
-        LlmConfig(name="frozen", model_name="m", api_key="k", enabled=False, content_hash="h-f")
+        ModelConfig(provider_id=provider.id, name="locked", model_id="m", enabled=False)
     )
     llm_bootstrap_session.commit()
 
-    app_cfg = _make_app(model="frozen")
-    with pytest.raises(ValueError, match="frozen"):
-        asyncio.run(runtime._load_llm_fingerprint(llm_bootstrap_session, app_cfg, []))  # noqa: SLF001
+    app_cfg = _make_app(model="frozen/locked")
+    with pytest.raises(ValueError, match="frozen/locked"):
+        asyncio.run(runtime._load_model_fingerprint(llm_bootstrap_session, app_cfg, []))  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

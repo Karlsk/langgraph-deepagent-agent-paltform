@@ -22,14 +22,14 @@ idempotently at startup:
 Multi-worker safety: the insert catches ``IntegrityError`` (unique-name race
 between concurrent workers), rolls back and re-queries the winning row.
 
-The system default ``LlmConfig`` row is seeded first by
-``ensure_default_llm_config`` (insert-if-missing only — a pre-existing row
-is never overwritten, protecting admin edits; the environment values are a
-seed source, not a live config). Without an ``OPENAI_API_KEY`` the seed is
-skipped entirely (warning logged; the next startup with a key seeds it),
-and the agent-app fingerprint degrades to an empty llm fingerprint. Agent
-asset ``model`` fields reference these rows, so the default config must
-exist before any fingerprint is computed.
+The system default provider/model pair is seeded first by
+``ensure_default_provider_and_model`` (insert-if-missing only — pre-existing
+rows are never overwritten, protecting admin edits; the environment values
+are a seed source, not a live config). Without an ``OPENAI_API_KEY`` the
+seed is skipped entirely (warning logged; the next startup with a key seeds
+it), and the agent-app fingerprint degrades to an empty model fingerprint.
+Agent asset ``model`` fields reference ``"<provider>/<model>"`` pairs, so
+the default pair must exist before any fingerprint is computed.
 """
 
 import os
@@ -42,74 +42,117 @@ from sqlmodel import Session, col, select, update
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.prompts import load_static_system_prompt
-from app.models.agent_assets import DEFAULT_AGENT_APP_ID, DEFAULT_LLM_CONFIG_NAME, AgentApp, LlmConfig
+from app.models.agent_assets import DEFAULT_AGENT_APP_ID, AgentApp
+from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.models.session import Session as ChatSession
 from app.services.agents import assembly
-from app.services.llm.llm_store import compute_llm_config_hash
+from app.services.llm.llm_store import compute_model_config_hash
 
 _DEFAULT_APP_NAME = "default"
 
 
-async def ensure_default_llm_config(session: Session) -> LlmConfig | None:
-    """Idempotently provision the ``name="default"`` LlmConfig from the env.
+async def ensure_default_provider_and_model(session: Session) -> tuple[Provider, ModelConfig] | None:
+    """Idempotently provision the default provider and model pair from the env.
 
-    Insert-if-missing only: a pre-existing row is returned untouched so
+    Insert-if-missing only: pre-existing rows are returned untouched so
     admin edits (PATCH/DELETE + recreate) survive restarts. Seed sources:
     ``settings.OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` env /
-    ``settings.DEFAULT_LLM_MODEL`` / ``settings.DEFAULT_LLM_TEMPERATURE``.
-    ``max_tokens`` is seeded as None on purpose: the process-level
-    ``settings.MAX_TOKENS`` budget must never freeze into a persisted row
-    (the provider default applies until an admin sets one). An empty
-    ``OPENAI_API_KEY`` skips the seed (warning logged) so the next startup
-    with a configured key provisions the row.
+    ``settings.DEFAULT_LLM_MODEL`` / ``settings.DEFAULT_LLM_TEMPERATURE``
+    (temperature lands in ``extra_params``; ``max_tokens`` is deliberately
+    omitted so the process-level ``settings.MAX_TOKENS`` budget never
+    freezes into a persisted row). An empty ``OPENAI_API_KEY`` skips the
+    seed (warning logged) so the next startup with a configured key
+    provisions the pair.
 
     Args:
         session: SQLModel database session.
 
     Returns:
-        The ``name="default"`` LlmConfig row (created or pre-existing), or
-        None when seeding was skipped because no API key is configured.
+        The default (provider, model config) row pair (created or
+        pre-existing), or None when seeding was skipped because no API key
+        is configured.
 
     Raises:
-        RuntimeError: When the row is still unavailable after the insert
+        RuntimeError: When the pair is still unavailable after the insert
             race recovery (should never happen).
     """
-    existing = session.get(LlmConfig, DEFAULT_LLM_CONFIG_NAME)
-    if existing is not None:
-        logger.debug("default_llm_config_existing", name=existing.name)
-        return existing
+    provider = session.exec(
+        select(Provider).where(col(Provider.name) == DEFAULT_PROVIDER_NAME, col(Provider.deleted) == False)  # noqa: E712
+    ).first()
 
-    if not settings.OPENAI_API_KEY:
-        logger.warning("default_llm_config_seed_skipped_no_api_key", name=DEFAULT_LLM_CONFIG_NAME)
-        return None
+    if provider is None:
+        if not settings.OPENAI_API_KEY:
+            logger.warning("default_provider_seed_skipped_no_api_key", name=DEFAULT_PROVIDER_NAME)
+            return None
 
-    default_cfg = LlmConfig(
-        name=DEFAULT_LLM_CONFIG_NAME,
-        model_name=settings.DEFAULT_LLM_MODEL,
-        api_key=settings.OPENAI_API_KEY,
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        temperature=settings.DEFAULT_LLM_TEMPERATURE,
-        max_tokens=None,
-        description="System default LLM config seeded from environment variables",
-        content_hash="",
-    )
-    default_cfg.content_hash = compute_llm_config_hash(default_cfg)
-    session.add(default_cfg)
-    try:
-        session.commit()
-        session.refresh(default_cfg)
-        logger.info("default_llm_config_created", name=default_cfg.name, model_name=default_cfg.model_name)
-    except IntegrityError:
-        # Concurrent worker won the unique-name race: roll back the loser
-        # row and adopt the already-persisted default config.
-        session.rollback()
-        default_cfg = session.get(LlmConfig, DEFAULT_LLM_CONFIG_NAME)
-        logger.info("default_llm_config_created_by_concurrent_worker", name=DEFAULT_LLM_CONFIG_NAME)
+        provider = Provider(
+            name=DEFAULT_PROVIDER_NAME,
+            type="OPENAI_COMPATIBLE",
+            base_url=os.getenv("OPENAI_BASE_URL") or "",
+            auth_config={"api_key": settings.OPENAI_API_KEY},
+            created_by="bootstrap",
+        )
+        session.add(provider)
+        try:
+            session.commit()
+            session.refresh(provider)
+            logger.info("default_provider_created", name=provider.name)
+        except IntegrityError:
+            # Concurrent worker won the unique-name race: roll back the loser
+            # row and adopt the already-persisted default provider.
+            session.rollback()
+            provider = session.exec(
+                select(Provider).where(col(Provider.name) == DEFAULT_PROVIDER_NAME, col(Provider.deleted) == False)  # noqa: E712
+            ).first()
+            logger.info("default_provider_created_by_concurrent_worker", name=DEFAULT_PROVIDER_NAME)
 
-    if default_cfg is None:
-        msg = "default llm config unavailable after bootstrap (insert lost and re-query found nothing)"
+    if provider is None:
+        msg = "default provider unavailable after bootstrap (insert lost and re-query found nothing)"
         raise RuntimeError(msg)
-    return default_cfg
+    if provider.id is None:
+        msg = "default provider row has no primary key after bootstrap"
+        raise RuntimeError(msg)
+
+    model = session.exec(
+        select(ModelConfig).where(
+            col(ModelConfig.provider_id) == provider.id,
+            col(ModelConfig.name) == DEFAULT_MODEL_NAME,
+            col(ModelConfig.deleted) == False,  # noqa: E712
+        )
+    ).first()
+
+    if model is None:
+        extra_params: dict[str, Any] = {}
+        if settings.DEFAULT_LLM_TEMPERATURE is not None:
+            extra_params["temperature"] = settings.DEFAULT_LLM_TEMPERATURE
+        model = ModelConfig(
+            provider_id=provider.id,
+            name=DEFAULT_MODEL_NAME,
+            model_id=settings.DEFAULT_LLM_MODEL,
+            extra_params=extra_params,
+            created_by="bootstrap",
+        )
+        session.add(model)
+        try:
+            session.commit()
+            session.refresh(model)
+            logger.info("default_model_created", ref=DEFAULT_MODEL_REF, model_id=model.model_id)
+        except IntegrityError:
+            # Concurrent worker won the unique (provider, name) race.
+            session.rollback()
+            model = session.exec(
+                select(ModelConfig).where(
+                    col(ModelConfig.provider_id) == provider.id,
+                    col(ModelConfig.name) == DEFAULT_MODEL_NAME,
+                    col(ModelConfig.deleted) == False,  # noqa: E712
+                )
+            ).first()
+            logger.info("default_model_created_by_concurrent_worker", ref=DEFAULT_MODEL_REF)
+
+    if model is None:
+        msg = "default model config unavailable after bootstrap (insert lost and re-query found nothing)"
+        raise RuntimeError(msg)
+    return provider, model
 
 
 def _backfill_legacy_sessions(session: Session, default_app: AgentApp) -> None:
@@ -143,11 +186,13 @@ async def ensure_default_agent_app(session: Session) -> AgentApp:
         The ``name="default"`` AgentApp row (created or pre-existing), with
         its persisted integer id populated.
     """
-    # The default LlmConfig must exist before any fingerprint is computed
-    # (the default app resolves model=None to the default config). A skipped
-    # seed (no API key yet) degrades the llm fingerprint to "".
-    default_llm = await ensure_default_llm_config(session)
-    llm_fingerprint = f"{default_llm.name}:{default_llm.content_hash}" if default_llm is not None else ""
+    # The default provider/model pair must exist before any fingerprint
+    # is computed (the default app resolves model=None to the default pair).
+    # A skipped seed (no API key yet) degrades the model fingerprint to "".
+    default_pair = await ensure_default_provider_and_model(session)
+    model_fingerprint = (
+        f"{DEFAULT_MODEL_REF}:{compute_model_config_hash(*default_pair)}" if default_pair is not None else ""
+    )
 
     default_app = session.exec(select(AgentApp).where(col(AgentApp.name) == _DEFAULT_APP_NAME)).first()
 
@@ -160,7 +205,7 @@ async def ensure_default_agent_app(session: Session) -> AgentApp:
             engine="deepagents",
             status="published",
         )
-        default_app.published_hash = assembly.compute_fingerprint(default_app, [], {}, "", llm_fingerprint)
+        default_app.published_hash = assembly.compute_fingerprint(default_app, [], {}, "", model_fingerprint)
         session.add(default_app)
         try:
             session.commit()
@@ -184,7 +229,7 @@ async def ensure_default_agent_app(session: Session) -> AgentApp:
         # Legacy row holds a prompt rendered (frozen) at first startup; migrate
         # it to the static template so dynamic segments are injected per turn.
         default_app.system_prompt = expected_prompt
-        default_app.published_hash = assembly.compute_fingerprint(default_app, [], {}, "", llm_fingerprint)
+        default_app.published_hash = assembly.compute_fingerprint(default_app, [], {}, "", model_fingerprint)
         session.commit()
         logger.info("default_agent_app_prompt_migrated", app_id=default_app.id)
 

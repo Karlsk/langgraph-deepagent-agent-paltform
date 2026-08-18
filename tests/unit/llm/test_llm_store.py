@@ -1,7 +1,8 @@
-"""Unit tests for the DB-backed LLM config resolution layer (``llm_store``).
+"""Unit tests for the DB-backed model config resolution layer (``llm_store``).
 
 Zero real network / zero real LLM: ``ChatOpenAI`` construction is captured by
-a recording factory, and configs live in an in-memory SQLite database.
+a recording factory, and provider/model rows live in an in-memory SQLite
+database.
 """
 
 from collections.abc import Generator
@@ -12,7 +13,7 @@ from pydantic import SecretStr
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.core.config import settings
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, LlmConfig
+from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.services.llm import llm_store
 
 pytestmark = pytest.mark.unit
@@ -27,28 +28,43 @@ def db_session() -> Generator[Session, None, None]:
         yield session
 
 
-def _make_config(**overrides: Any) -> LlmConfig:
-    """Build an LlmConfig row with sensible defaults for store tests."""
+def _make_provider(**overrides: Any) -> Provider:
+    """Build a Provider row with sensible defaults for store tests."""
     defaults: dict[str, Any] = {
-        "name": DEFAULT_LLM_CONFIG_NAME,
-        "model_name": "MiniMax-M3",
-        "api_key": "sk-secret-1234",
-        "base_url": None,
-        "temperature": None,
-        "max_tokens": None,
+        "name": DEFAULT_PROVIDER_NAME,
+        "type": "OPENAI_COMPATIBLE",
+        "base_url": "",
+        "auth_config": {"api_key": "sk-secret-1234"},
         "enabled": True,
-        "description": "",
-        "content_hash": "h-default",
     }
     defaults.update(overrides)
-    return LlmConfig(**defaults)
+    return Provider(**defaults)
 
 
-def _seed(session: Session, cfg: LlmConfig) -> LlmConfig:
-    session.add(cfg)
+def _make_model(**overrides: Any) -> ModelConfig:
+    """Build a ModelConfig row with sensible defaults for store tests."""
+    defaults: dict[str, Any] = {
+        "provider_id": 1,
+        "name": DEFAULT_MODEL_NAME,
+        "model_id": "MiniMax-M3",
+        "context_size": None,
+        "extra_params": {},
+        "enabled": True,
+    }
+    defaults.update(overrides)
+    return ModelConfig(**defaults)
+
+
+def _seed_pair(session: Session, provider: Provider, model: ModelConfig) -> tuple[Provider, ModelConfig]:
+    """Persist a provider row and one model config row bound to it."""
+    session.add(provider)
     session.commit()
-    session.refresh(cfg)
-    return cfg
+    session.refresh(provider)
+    model.provider_id = provider.id
+    session.add(model)
+    session.commit()
+    session.refresh(model)
+    return provider, model
 
 
 class _CapturingFactory:
@@ -65,16 +81,38 @@ class _CapturingFactory:
 
 
 # ---------------------------------------------------------------------------
+# parse_model_ref — reference syntax
+# ---------------------------------------------------------------------------
+
+
+def test_parse_model_ref_splits_on_first_slash() -> None:
+    """A well-formed reference splits into provider and model segments."""
+    assert llm_store.parse_model_ref("openai/gpt-4o") == ("openai", "gpt-4o")
+
+
+@pytest.mark.parametrize("bad", ["", "no-slash", "/model", "provider/"])
+def test_parse_model_ref_rejects_malformed(bad: str) -> None:
+    """Malformed references raise ValueError (empty/excess segments)."""
+    with pytest.raises(ValueError, match="invalid model reference"):
+        llm_store.parse_model_ref(bad)
+
+
+def test_parse_model_ref_keeps_extra_slashes_in_model_name() -> None:
+    """Only the first slash is a separator; the model name keeps the rest."""
+    assert llm_store.parse_model_ref("openai/gpt/4o") == ("openai", "gpt/4o")
+
+
+# ---------------------------------------------------------------------------
 # build_chat_model — parameter mapping
 # ---------------------------------------------------------------------------
 
 
-def test_build_chat_model_maps_model_and_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """model_name maps to ``model``; api_key is wrapped in SecretStr."""
+def test_build_chat_model_maps_model_id_and_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """model_id maps to ``model``; auth_config api_key is wrapped in SecretStr."""
     factory = _CapturingFactory()
     monkeypatch.setattr(llm_store, "ChatOpenAI", factory)
 
-    llm_store.build_chat_model(_make_config())
+    llm_store.build_chat_model(_make_provider(), _make_model())
 
     assert factory.kwargs is not None
     assert factory.kwargs["model"] == "MiniMax-M3"
@@ -82,12 +120,12 @@ def test_build_chat_model_maps_model_and_api_key(monkeypatch: pytest.MonkeyPatch
     assert factory.kwargs["api_key"].get_secret_value() == "sk-secret-1234"
 
 
-def test_build_chat_model_omits_none_optionals(monkeypatch: pytest.MonkeyPatch) -> None:
-    """None base_url/temperature/max_tokens are never passed (SDK env fallback)."""
+def test_build_chat_model_omits_unset_optionals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty base_url and empty extra_params are never passed (SDK env fallback)."""
     factory = _CapturingFactory()
     monkeypatch.setattr(llm_store, "ChatOpenAI", factory)
 
-    llm_store.build_chat_model(_make_config())
+    llm_store.build_chat_model(_make_provider(), _make_model())
 
     assert factory.kwargs is not None
     assert "base_url" not in factory.kwargs
@@ -101,8 +139,9 @@ def test_build_chat_model_passes_explicit_overrides(monkeypatch: pytest.MonkeyPa
     factory = _CapturingFactory()
     monkeypatch.setattr(llm_store, "ChatOpenAI", factory)
 
-    cfg = _make_config(base_url="https://proxy.example.com/v1", temperature=0.5, max_tokens=1024)
-    llm_store.build_chat_model(cfg)
+    provider = _make_provider(base_url="https://proxy.example.com/v1")
+    model = _make_model(extra_params={"temperature": 0.5, "max_tokens": 1024})
+    llm_store.build_chat_model(provider, model)
 
     assert factory.kwargs is not None
     assert factory.kwargs["base_url"] == "https://proxy.example.com/v1"
@@ -118,7 +157,7 @@ def test_build_chat_model_passes_max_retries_from_settings(monkeypatch: pytest.M
     monkeypatch.setattr(llm_store, "ChatOpenAI", factory)
     monkeypatch.setattr(settings, "MAX_LLM_CALL_RETRIES", 4)
 
-    llm_store.build_chat_model(_make_config())
+    llm_store.build_chat_model(_make_provider(), _make_model())
 
     assert factory.kwargs is not None
     assert factory.kwargs["max_retries"] == 4
@@ -135,91 +174,126 @@ def test_build_chat_model_returns_fresh_instances(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(llm_store, "ChatOpenAI", factory)
 
-    cfg = _make_config()
-    first = llm_store.build_chat_model(cfg)
-    second = llm_store.build_chat_model(cfg)
+    provider, model = _make_provider(), _make_model()
+    first = llm_store.build_chat_model(provider, model)
+    second = llm_store.build_chat_model(provider, model)
 
     assert first is not second
     assert len(created) == 2
 
 
 # ---------------------------------------------------------------------------
-# compute_llm_config_hash — content coverage
+# compute_model_config_hash — content coverage
 # ---------------------------------------------------------------------------
 
 
 def test_hash_is_stable_and_covers_api_key() -> None:
-    """Identical configs hash equally; rotating the api_key changes the hash."""
-    baseline = llm_store.compute_llm_config_hash(_make_config())
-    assert baseline == llm_store.compute_llm_config_hash(_make_config())
+    """Identical pairs hash equally; rotating the api_key changes the hash."""
+    baseline = llm_store.compute_model_config_hash(_make_provider(), _make_model())
+    assert baseline == llm_store.compute_model_config_hash(_make_provider(), _make_model())
     assert len(baseline) == 64
 
-    rotated = llm_store.compute_llm_config_hash(_make_config(api_key="sk-other-9876"))
+    rotated = llm_store.compute_model_config_hash(
+        _make_provider(auth_config={"api_key": "sk-other-9876"}), _make_model()
+    )
     assert rotated != baseline
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    "provider_mutation,model_mutation",
     [
-        {"model_name": "gpt-5"},
-        {"base_url": "https://proxy.example.com/v1"},
-        {"temperature": 0.9},
-        {"max_tokens": 4096},
-        {"enabled": False},
-        {"description": "rotated"},
+        ({"type": "OPENAI"}, {}),
+        ({"base_url": "https://proxy.example.com/v1"}, {}),
+        ({"enabled": False}, {}),
+        ({}, {"model_id": "gpt-5"}),
+        ({}, {"name": "renamed"}),
+        ({}, {"context_size": 128000}),
+        ({}, {"extra_params": {"temperature": 0.9}}),
+        ({}, {"enabled": False}),
     ],
 )
-def test_hash_changes_with_every_effective_field(mutation: dict[str, Any]) -> None:
-    """Every effective field mutation changes the content hash."""
-    baseline = llm_store.compute_llm_config_hash(_make_config())
-    mutated = llm_store.compute_llm_config_hash(_make_config(**mutation))
+def test_hash_changes_with_every_effective_field(
+    provider_mutation: dict[str, Any], model_mutation: dict[str, Any]
+) -> None:
+    """Every effective field mutation on either row changes the content hash."""
+    baseline = llm_store.compute_model_config_hash(_make_provider(), _make_model())
+    mutated = llm_store.compute_model_config_hash(
+        _make_provider(**provider_mutation), _make_model(**model_mutation)
+    )
     assert mutated != baseline
 
 
 # ---------------------------------------------------------------------------
-# load_llm_config — resolution semantics
+# load_model_config — resolution semantics
 # ---------------------------------------------------------------------------
 
 
-def test_load_llm_config_none_resolves_to_default(db_session: Session) -> None:
-    """A None reference resolves to the default config row."""
-    seeded = _seed(db_session, _make_config())
+def test_load_model_config_none_resolves_to_default_pair(db_session: Session) -> None:
+    """A None reference resolves to the default provider/model pair."""
+    _seed_pair(db_session, _make_provider(), _make_model())
 
-    resolved = llm_store.load_llm_config(db_session, None)
+    provider, model = llm_store.load_model_config(db_session, None)
 
-    assert resolved.name == DEFAULT_LLM_CONFIG_NAME
-    assert resolved.model_name == seeded.model_name
-
-
-def test_load_llm_config_resolves_explicit_name(db_session: Session) -> None:
-    """An explicit reference resolves the matching row."""
-    _seed(db_session, _make_config())
-    _seed(db_session, _make_config(name="minimax", model_name="MiniMax-M3", content_hash="h-minimax"))
-
-    resolved = llm_store.load_llm_config(db_session, "minimax")
-
-    assert resolved.name == "minimax"
+    assert provider.name == DEFAULT_PROVIDER_NAME
+    assert model.name == DEFAULT_MODEL_NAME
+    assert model.model_id == "MiniMax-M3"
 
 
-def test_load_llm_config_missing_raises_listing_available(db_session: Session) -> None:
-    """A missing reference raises ValueError listing the available config names."""
-    _seed(db_session, _make_config())
-    _seed(db_session, _make_config(name="minimax", content_hash="h-minimax"))
+def test_load_model_config_resolves_explicit_reference(db_session: Session) -> None:
+    """An explicit ``provider/model`` reference resolves the matching pair."""
+    _seed_pair(db_session, _make_provider(), _make_model())
+    other = Provider(name="minimax", type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-x"})
+    _seed_pair(db_session, other, _make_model(name="m3", model_id="MiniMax-M3"))
 
-    with pytest.raises(ValueError, match="ghost") as exc_info:
-        llm_store.load_llm_config(db_session, "ghost")
+    provider, model = llm_store.load_model_config(db_session, "minimax/m3")
+
+    assert provider.name == "minimax"
+    assert model.name == "m3"
+
+
+def test_load_model_config_missing_raises_listing_available(db_session: Session) -> None:
+    """A missing reference raises ValueError listing the available refs."""
+    _seed_pair(db_session, _make_provider(), _make_model())
+    other = Provider(name="minimax", type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-x"})
+    _seed_pair(db_session, other, _make_model(name="m3", model_id="MiniMax-M3"))
+
+    with pytest.raises(ValueError, match="ghost/none") as exc_info:
+        llm_store.load_model_config(db_session, "ghost/none")
 
     message = str(exc_info.value)
-    assert DEFAULT_LLM_CONFIG_NAME in message
-    assert "minimax" in message
+    assert DEFAULT_MODEL_REF in message
+    assert "minimax/m3" in message
 
 
-def test_load_llm_config_disabled_raises_and_lists_enabled_only(db_session: Session) -> None:
-    """A disabled config is unresolvable; the listing only shows enabled names."""
-    _seed(db_session, _make_config())
-    _seed(db_session, _make_config(name="frozen", enabled=False, content_hash="h-frozen"))
+def test_load_model_config_disabled_pair_raises_and_lists_enabled_only(db_session: Session) -> None:
+    """A disabled model is unresolvable; the listing only shows enabled refs."""
+    _seed_pair(db_session, _make_provider(), _make_model())
+    frozen = Provider(name="frozen", type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-x"})
+    _seed_pair(db_session, frozen, _make_model(name="locked", model_id="m", enabled=False))
 
-    with pytest.raises(ValueError, match="frozen") as exc_info:
-        llm_store.load_llm_config(db_session, "frozen")
+    with pytest.raises(ValueError, match="frozen/locked") as exc_info:
+        llm_store.load_model_config(db_session, "frozen/locked")
 
-    assert DEFAULT_LLM_CONFIG_NAME in str(exc_info.value)
+    assert DEFAULT_MODEL_REF in str(exc_info.value)
+    assert "frozen/locked" not in str(exc_info.value).split("available models: ")[1]
+
+
+def test_load_model_config_soft_deleted_pair_is_unresolvable(db_session: Session) -> None:
+    """A soft-deleted provider/model pair behaves like a missing reference."""
+    _seed_pair(db_session, _make_provider(), _make_model())
+    gone = Provider(name="gone", type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-x"})
+    _seed_pair(db_session, gone, _make_model(name="ghost", model_id="m"))
+    gone.deleted = True
+    db_session.add(gone)
+    db_session.commit()
+
+    with pytest.raises(ValueError, match="gone/ghost"):
+        llm_store.load_model_config(db_session, "gone/ghost")
+
+
+def test_load_model_config_malformed_reference_raises(db_session: Session) -> None:
+    """A reference without the provider/model shape fails fast."""
+    _seed_pair(db_session, _make_provider(), _make_model())
+
+    with pytest.raises(ValueError, match="invalid model reference"):
+        llm_store.load_model_config(db_session, "no-slash")

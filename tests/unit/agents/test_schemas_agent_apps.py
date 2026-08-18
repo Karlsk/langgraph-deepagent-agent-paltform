@@ -7,8 +7,6 @@ from app.schemas.agent_apps import (
     AgentAppCreate,
     AgentAppRead,
     AgentAppUpdate,
-    LlmConfigCreate,
-    LlmConfigUpdate,
     McpServerCreate,
     McpServerRead,
     McpServerUpdate,
@@ -24,6 +22,7 @@ from app.schemas.agent_apps import (
     SubAgentUpdate,
     ToolCatalogEntry,
 )
+from app.schemas.providers import ModelConfigCreate, ProviderCreate, ProviderUpdate
 
 pytestmark = pytest.mark.unit
 
@@ -316,38 +315,45 @@ def test_read_schemas_fields() -> None:
 
 
 # ---------------------------------------------------------------------------
-# LLM config schemas — temperature bounds & base_url normalization
+# Provider / model config schemas — auth validation & name pattern
 # ---------------------------------------------------------------------------
 
 
-def _llm_create_payload(**overrides: object) -> dict[str, object]:
-    payload: dict[str, object] = {"name": "proxy", "model_name": "m", "api_key": "sk-secret-1234"}
+def _provider_create_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "name": "proxy",
+        "type": "OPENAI_COMPATIBLE",
+        "auth_config": {"api_key": "sk-secret-1234"},
+    }
     payload.update(overrides)
     return payload
 
 
-@pytest.mark.parametrize("temperature", [0.0, 2.0, 1.3])
-def test_llm_config_temperature_within_bounds_accepted(temperature: float) -> None:
-    """Temperatures inside [0.0, 2.0] validate on both Create and Update."""
-    assert LlmConfigCreate(**_llm_create_payload(temperature=temperature)).temperature == temperature
-    assert LlmConfigUpdate(temperature=temperature).temperature == temperature
+def test_provider_create_requires_api_key_for_non_ollama() -> None:
+    """Non-OLLAMA providers without auth_config.api_key are rejected."""
+    with pytest.raises(ValidationError, match="api_key"):
+        ProviderCreate(**_provider_create_payload(auth_config={}))
+    with pytest.raises(ValidationError, match="api_key"):
+        ProviderCreate(**_provider_create_payload(auth_config={"api_key": ""}))
 
 
-@pytest.mark.parametrize("temperature", [-0.1, 2.1])
-def test_llm_config_temperature_outside_bounds_rejected(temperature: float) -> None:
-    """Temperatures outside [0.0, 2.0] are rejected on both Create and Update."""
+def test_provider_create_ollama_allows_missing_api_key() -> None:
+    """OLLAMA providers validate without any auth_config material."""
+    provider = ProviderCreate(name="local", type="OLLAMA")
+    assert provider.auth_config == {}
+
+
+def test_provider_create_name_rejects_slash() -> None:
+    """The shared name pattern keeps '/' out of provider/model names."""
     with pytest.raises(ValidationError):
-        LlmConfigCreate(**_llm_create_payload(temperature=temperature))
+        ProviderCreate(**_provider_create_payload(name="a/b"))
     with pytest.raises(ValidationError):
-        LlmConfigUpdate(temperature=temperature)
+        ModelConfigCreate(name="a/b", model_id="gpt-4o")
 
 
-def test_llm_config_create_empty_base_url_normalized_to_none() -> None:
-    """An empty-string base_url normalizes to None (SDK env fallback chain)."""
-    assert LlmConfigCreate(**_llm_create_payload(base_url="")).base_url is None
-
-
-def test_llm_config_update_empty_base_url_normalized_to_none() -> None:
-    """PATCH payloads keep the same empty-string normalization."""
-    assert LlmConfigUpdate(base_url="").base_url is None
-    assert LlmConfigUpdate(base_url=None).base_url is None  # explicit null stays clearable
+def test_provider_update_rejects_explicit_openai_type_without_api_key() -> None:
+    """An explicit type switch to a keyed family requires api_key too."""
+    with pytest.raises(ValidationError, match="api_key"):
+        ProviderUpdate(type="OPENAI", auth_config={})
+    # Omitting auth_config keeps the stored credentials: always allowed.
+    assert ProviderUpdate(type="OPENAI").auth_config is None

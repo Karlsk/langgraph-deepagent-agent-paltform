@@ -62,10 +62,11 @@ from app.core.config import settings
 from app.core.langgraph.tools import tools as builtin_tools
 from app.core.logging import logger
 from app.core.metrics import agent_graph_cache_hits_total, agent_graph_compile_duration_seconds
-from app.models.agent_assets import DEFAULT_LLM_CONFIG_NAME, AgentApp, LlmConfig, SubAgentConfig
+from app.models.agent_assets import AgentApp, SubAgentConfig
+from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.services.agents.mcp_manager import build_tool_catalog, get_mcp_tools
 from app.services.agents.skills_store import sync_user_skills
-from app.services.llm.llm_store import build_chat_model, load_llm_config
+from app.services.llm.llm_store import build_chat_model, load_model_config
 from app.services.memory import memory_service
 
 _COMPILE_CACHE_CAPACITY = 64
@@ -232,8 +233,8 @@ def build_subagent_spec(
 
     Inheritance is explicit: ``allowed_tools=None`` inherits the parent's
     resolved tools and ``model=None`` inherits the parent's model instance
-    (the same object). A non-NULL ``model`` is an LlmConfig reference name
-    resolved through ``resolve_model``.
+    (the same object). A non-NULL ``model`` is a ``"provider/model"``
+    reference resolved through ``resolve_model``.
     ``when_to_use`` maps to ``SubAgent["description"]`` (what the orchestrator
     sees when deciding whether to delegate). When ``max_turns`` is set, a
     ``TurnLimitMiddleware`` is attached via the spec's ``middleware`` field
@@ -243,7 +244,7 @@ def build_subagent_spec(
         cfg: The persisted sub-agent configuration row.
         parent_tools: Tools already resolved for the parent agent.
         parent_model: Model instance used by the parent agent.
-        resolve_model: Resolver mapping an LlmConfig reference name to a
+        resolve_model: Resolver mapping a ``"provider/model"`` reference to a
             chat model instance (supplied by ``compile_agent_app``).
         tool_index: Optional full name -> tool index used to resolve an
             explicit ``allowed_tools`` whitelist; defaults to the parent's
@@ -367,7 +368,7 @@ async def compile_agent_app(
 
     Raises:
         ValueError: When the tool whitelist references unknown tool names or
-            an LlmConfig reference cannot be resolved.
+            a model reference cannot be resolved.
     """
     await sync_user_skills(user_id, app_cfg.skill_names)
 
@@ -382,11 +383,11 @@ async def compile_agent_app(
     )
 
     tools = resolve_tools(app_cfg.allowed_tools, tool_index)
-    model = build_chat_model(load_llm_config(session, app_cfg.model))
+    model = build_chat_model(*load_model_config(session, app_cfg.model))
 
     def resolve_model(reference: str) -> BaseChatModel:
-        """Resolve a subagent LlmConfig reference against the live DB."""
-        return build_chat_model(load_llm_config(session, reference))
+        """Resolve a subagent model reference against the live DB."""
+        return build_chat_model(*load_model_config(session, reference))
 
     subagents = [
         build_subagent_spec(
@@ -427,27 +428,28 @@ def validate_publish(
     app_cfg: AgentApp,
     subagent_cfgs: Sequence[SubAgentConfig],
     catalog: Sequence[Mapping[str, Any]],
-    llm_configs: Mapping[str, LlmConfig],
+    model_catalog: Mapping[str, tuple[Provider, ModelConfig]],
 ) -> None:
-    """Validate tool whitelists and LlmConfig references before publishing.
+    """Validate tool whitelists and model references before publishing.
 
     Skill/subagent referential integrity is enforced by the caller at the DB
     layer; this function checks that every ``allowed_tools`` entry of the
     AgentApp and of each subagent exists in the current tool catalog, and
-    that every ``model`` reference (NULL resolves to the default config)
-    points at an existing, enabled LlmConfig row.
+    that every ``model`` reference (NULL resolves to the default pair)
+    points at an existing, enabled provider/model pair.
 
     Args:
         app_cfg: The AgentApp configuration row being published.
         subagent_cfgs: SubAgentConfig rows bound to the app.
         catalog: Tool catalog entries (mappings with a ``name`` key) as
             returned by ``build_tool_catalog``.
-        llm_configs: Mapping of LlmConfig name -> row for lookup; missing or
-            disabled references are reported as violations.
+        model_catalog: Mapping of ``"provider/model"`` reference ->
+            (provider, model config) pair for lookup; missing or disabled
+            references are reported as violations.
 
     Raises:
         ValueError: Listing every owner and unknown tool name, then every
-            invalid LlmConfig reference (aggregated per category).
+            invalid model reference (aggregated per category).
     """
     catalog_names = {entry["name"] for entry in catalog}
     violations: list[str] = []
@@ -464,20 +466,24 @@ def validate_publish(
     if violations:
         raise ValueError(f"allowed_tools not in tool catalog: {', '.join(violations)}")
 
-    llm_violations: list[str] = []
+    model_violations: list[str] = []
     model_refs: list[tuple[str, Optional[str]]] = [("agent_app:" + app_cfg.name, app_cfg.model)]
     model_refs.extend((f"subagent:{cfg.name}", cfg.model) for cfg in subagent_cfgs)
 
     for owner, reference in model_refs:
-        ref_name = reference or DEFAULT_LLM_CONFIG_NAME
-        llm_cfg = llm_configs.get(ref_name)
-        if llm_cfg is None:
-            llm_violations.append(f"{owner} -> llm config '{ref_name}' does not exist")
-        elif not llm_cfg.enabled:
-            llm_violations.append(f"{owner} -> llm config '{ref_name}' is disabled")
+        ref_name = reference or DEFAULT_MODEL_REF
+        pair = model_catalog.get(ref_name)
+        if pair is None:
+            model_violations.append(f"{owner} -> model '{ref_name}' does not exist")
+            continue
+        provider, model_cfg = pair
+        if not provider.enabled:
+            model_violations.append(f"{owner} -> provider '{provider.name}' is disabled")
+        if not model_cfg.enabled:
+            model_violations.append(f"{owner} -> model '{ref_name}' is disabled")
 
-    if llm_violations:
-        raise ValueError(f"llm config references invalid: {', '.join(llm_violations)}")
+    if model_violations:
+        raise ValueError(f"model references invalid: {', '.join(model_violations)}")
 
     logger.debug("agent_app_publish_tools_validated", app_name=app_cfg.name, owner_count=len(owners))
 
@@ -500,13 +506,13 @@ def compute_fingerprint(
     subagent_cfgs: Sequence[SubAgentConfig],
     skill_hashes: Mapping[str, str],
     mcp_fingerprint: str,
-    llm_fingerprint: str,
+    model_fingerprint: str,
 ) -> str:
     """Compute a stable sha256 fingerprint of everything that shapes the graph.
 
     ``model`` fields in the app/subagent projections stay reference names;
-    the effective LLM configuration content is covered by ``llm_fingerprint``
-    (``name:content_hash`` pairs) so key/base_url/model_name edits drift the
+    the effective model configuration content is covered by ``model_fingerprint``
+    (``ref:content_hash`` pairs) so auth/base_url/model_id edits drift the
     fingerprint and force a recompile without demoting published apps.
 
     Args:
@@ -514,7 +520,7 @@ def compute_fingerprint(
         subagent_cfgs: Bound SubAgentConfig rows.
         skill_hashes: Mapping of skill name -> content hash.
         mcp_fingerprint: Fingerprint of the enabled MCP server configuration.
-        llm_fingerprint: Fingerprint of the referenced LlmConfig contents.
+        model_fingerprint: Fingerprint of the referenced model config contents.
 
     Returns:
         Hex sha256 over the canonical (sorted-keys, compact) JSON payload.
@@ -525,7 +531,7 @@ def compute_fingerprint(
         "subagents": [_project(cfg, _SUBAGENT_FIELDS) for cfg in sorted(subagent_cfgs, key=lambda cfg: cfg.name)],
         "skill_hashes": dict(sorted(skill_hashes.items())),
         "mcp_fingerprint": mcp_fingerprint,
-        "llm_fingerprint": llm_fingerprint,
+        "model_fingerprint": model_fingerprint,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -542,7 +548,7 @@ async def get_or_compile(
     subagent_cfgs: Sequence[SubAgentConfig],
     skill_hashes: Mapping[str, str],
     mcp_fingerprint: str,
-    llm_fingerprint: str,
+    model_fingerprint: str,
     user_id: str,
     session: Session,
     checkpointer: Checkpointer | None = None,
@@ -562,7 +568,7 @@ async def get_or_compile(
         subagent_cfgs: Bound SubAgentConfig rows.
         skill_hashes: Mapping of skill name -> content hash (fingerprint input).
         mcp_fingerprint: MCP configuration fingerprint (fingerprint input).
-        llm_fingerprint: LlmConfig content fingerprint (fingerprint input).
+        model_fingerprint: Model config content fingerprint (fingerprint input).
         user_id: User whose skill directory backs the skills backend.
         session: SQLModel database session (for the MCP tool catalog).
         checkpointer: Checkpointer to attach to freshly compiled graphs.
@@ -570,7 +576,7 @@ async def get_or_compile(
     Returns:
         The compiled deep agent graph (cached or newly compiled).
     """
-    fingerprint = compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, llm_fingerprint)
+    fingerprint = compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint)
 
     cached = _compile_cache.get(fingerprint)
     if cached is not None:

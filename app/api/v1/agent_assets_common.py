@@ -11,7 +11,7 @@ failures return 500 after ``logger.exception``.
 
 import hashlib
 import json
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from typing import Any, TypeVar
 
 from fastapi import HTTPException, Request
@@ -112,6 +112,7 @@ def paginate_by_name(
     page_size: int,
     keyword: str | None,
     order_by: Any,
+    extra_where: Sequence[Any] | None = None,
 ) -> PageResult[Any]:
     """Run a name-filtered, ordered, server-side paginated list query.
 
@@ -122,6 +123,8 @@ def paginate_by_name(
         page_size: Rows per page (validated by the endpoint's Query bounds).
         keyword: Optional case-insensitive substring matched against ``name``.
         order_by: SQLAlchemy order expression preserving the module's sort.
+        extra_where: Optional additional filter expressions applied to both
+            the row query and the total count (e.g. soft-delete markers).
 
     Returns:
         PageResult carrying the page rows, the filtered total and the echoed
@@ -134,6 +137,9 @@ def paginate_by_name(
         pattern = f"%{keyword}%"
         stmt = stmt.where(name_col.ilike(pattern))
         count_stmt = count_stmt.where(name_col.ilike(pattern))
+    if extra_where:
+        stmt = stmt.where(*extra_where)
+        count_stmt = count_stmt.where(*extra_where)
     total = int(db.exec(count_stmt).one())
     rows = db.exec(stmt.order_by(order_by).offset((page - 1) * page_size).limit(page_size)).all()
     return PageResult(items=list(rows), total=total, page=page, page_size=page_size)

@@ -27,20 +27,21 @@ cp .env.example .env.development
 
 LLM configuration is split into two chains: **system-level calls** (session naming, skill
 drafts, `LLMService` fallback, evals) read these environment variables directly, while the
-**agent asset chain** (AgentApp/SubAgent chat) resolves models from DB-stored `LlmConfig`
-rows managed via the `/agent-apps/llm-configs` API. The variables below act as the
-one-time seed for the bootstrap-created `default` LlmConfig (insert-if-missing only —
-changing them later does not overwrite the stored row; PATCH the row instead. `MAX_TOKENS`
-is the exception: it is deliberately NOT seeded into the row, see its table row below).
+**agent asset chain** (AgentApp/SubAgent chat) resolves `provider/model` references from
+DB-stored `Provider` / `ModelConfig` rows managed via the `/providers` API. The variables
+below act as the one-time seed for the bootstrap-created `default` provider/model pair
+(insert-if-missing only — changing them later does not overwrite the stored rows; PATCH
+the rows instead. `MAX_TOKENS` is the exception: it is deliberately NOT seeded into the
+model row, see its table row below).
 See [LLM Service](llm-service.md) for details.
 
 | Variable | Default | Required | Description |
 | --- | --- | --- | --- |
-| `OPENAI_API_KEY` | — | Yes | OpenAI API key (system-level calls + `default` LlmConfig seed) |
-| `OPENAI_BASE_URL` | — | No | Custom OpenAI-compatible endpoint; seeds the `default` LlmConfig's `base_url`, and system-level calls fall back to it via the SDK env chain |
-| `DEFAULT_LLM_MODEL` | `gpt-5-mini` | No | Starting model — see [LLM Service](llm-service.md) for fallback order; also seeds the `default` LlmConfig's `model_name` |
-| `DEFAULT_LLM_TEMPERATURE` | `0.2` | No | Temperature for chat completions; also seeds the `default` LlmConfig's `temperature` |
-| `MAX_TOKENS` | `2000` | No | Token budget for system-level LLM calls (sent as `max_completion_tokens`) and for message-history trimming; deliberately NOT seeded into the `default` LlmConfig's `max_tokens` (the row stays empty and the provider default applies) — to cap the agent chain, PATCH `/agent-apps/llm-configs/default` with an explicit `max_tokens` |
+| `OPENAI_API_KEY` | — | Yes | OpenAI API key (system-level calls + `default` provider `auth_config.api_key` seed) |
+| `OPENAI_BASE_URL` | — | No | Custom OpenAI-compatible endpoint; seeds the `default` provider's `base_url`, and system-level calls fall back to it via the SDK env chain |
+| `DEFAULT_LLM_MODEL` | `gpt-5-mini` | No | Starting model — see [LLM Service](llm-service.md) for fallback order; also seeds the `default` model's `model_id` |
+| `DEFAULT_LLM_TEMPERATURE` | `0.2` | No | Temperature for chat completions; also seeds the `default` model's `extra_params.temperature` |
+| `MAX_TOKENS` | `2000` | No | Token budget for system-level LLM calls (sent as `max_completion_tokens`) and for message-history trimming; deliberately NOT seeded into the `default` model's `extra_params` (the row stays empty and the provider default applies) — to cap the agent chain, PATCH `/providers/default/models/default` with an explicit `extra_params.max_tokens` |
 | `MAX_LLM_CALL_RETRIES` | `3` | No | Retries per model before switching to fallback |
 | `LLM_TOTAL_TIMEOUT` | `60` | No | Max seconds for the entire fallback loop |
 | `SESSION_NAMING_ENABLED` | `true` | No | Auto-generate a session title from the user's first message using an LLM background task |
@@ -119,9 +120,11 @@ When `VALKEY_HOST` is set, the app uses Valkey/Redis for memory search caching a
 | `RATE_LIMIT_REGISTER` | `10 per hour` | POST /auth/register |
 
 Asset management endpoints (`/agent-apps/subagents`, `/skills`, `/apps`, `/mcp-servers`,
-`/llm-configs`, `/tools/catalog`) default to `60 per minute` each; subagent test runs and
+`/providers`, `/tools/catalog`) default to `60 per minute` each; subagent test runs and
 skill draft generation default to `5 per minute`. Every limit is overridable via the
-matching `RATE_LIMIT_*` environment variable (e.g. `RATE_LIMIT_LLM_CONFIG`).
+matching `RATE_LIMIT_*` environment variable (e.g. `RATE_LIMIT_PROVIDER`,
+`RATE_LIMIT_MODEL_CONFIG`). The on-demand connectivity probe (`POST /providers/{name}/test`)
+records DEGRADED when a successful probe exceeds `PROVIDER_HEALTH_DEGRADED_MS` (default `5000`).
 
 When Valkey is configured, rate limiting is shared across all app instances. Without it, limits are per-process.
 
