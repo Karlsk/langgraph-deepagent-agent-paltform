@@ -37,6 +37,28 @@ services:
     networks:
       - monitoring
 
+  # One-shot Alembic migration. Exits after `alembic upgrade head`; the app
+  # service waits for this via `service_completed_successfully` so its lifespan
+  # bootstrap (which queries provider/model_config tables) never races against
+  # a schema-less database. Idempotent: re-running on an up-to-date head is a
+  # no-op. `restart: "no"` keeps it from looping forever on a broken schema.
+  migrate:
+    build:
+      context: .
+      args:
+        APP_ENV: ${APP_ENV:-development}
+    command: ["/app/.venv/bin/alembic", "upgrade", "head"]
+    env_file:
+      - .env.${APP_ENV:-development}
+    environment:
+      - APP_ENV=${APP_ENV:-development}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - monitoring
+
   # Single API service with dynamic environment
   app:
     build:
@@ -56,6 +78,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 30s

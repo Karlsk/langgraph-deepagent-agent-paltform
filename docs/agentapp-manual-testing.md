@@ -263,21 +263,27 @@ make stack-up ENV=development
 - db 反复重启：检查 `POSTGRES_*` 变量是否与已有数据卷 `postgres-data` 中旧库的初始化参数冲突
   （首次启动后修改 POSTGRES_USER/DB 不会重建已有卷，需 `docker volume rm` 清理，见第 9 节）。
 
-### 1.3 执行数据库迁移（必须手动，不会自动执行）
+### 1.3 数据库迁移（`make docker-up` 已内置自动执行）
 
-**目的**：创建全部数据表。
+**目的**：在 app 启动前创建/升级全部数据表。
 
-> **核实结论**：`scripts/docker-entrypoint.sh` **不会自动跑迁移**（脚本内注释明确写着
-> "Run migrations if necessary with `make docker-migrate`"），`app/main.py` 启动流程中也没有
-> `create_all`/alembic 调用。**首次启动必须先迁移，否则所有读写数据库的端点都会 500。**
+> **核实结论**：`docker-compose.yml` 新增了 `migrate` 一次性服务（`restart: "no"`），
+> 在 `db` 容器 healthy 后跑 `alembic upgrade head`，随后才启动 `app`
+> （依赖条件 `service_completed_successfully`）。
+> **`make docker-up` / `make stack-up` 现在是一条龙命令**：db → migrate → app，
+> 不需要也不应该再手动跑迁移。`scripts/docker-entrypoint.sh` 与 `app/main.py` 启动流程中
+> 都没有 `create_all`/alembic 调用，所有 DDL/DML 都通过 `migrate` 一次性容器驱动。
+
+如果只为了检查迁移历史或手动 downgrade，仍可使用：
 
 ```bash
-make docker-migrate ENV=development     # 在 app 容器内执行 /app/.venv/bin/alembic upgrade head
-make docker-migrate-history ENV=development   # （可选）查看迁移历史确认到 head
+make docker-migrate-history ENV=development   # 查看迁移历史确认到 head
+make docker-migrate-downgrade ENV=development  # 回滚一次
 ```
 
-**预期**：alembic 依次执行迁移脚本（含 `b25d38b0cd7c_initial_schema`、`e4f1a8c2b9d3_agent_assets`、
-`f3a1b7c9d204_llm_config`、`a3f7e9b1c852_provider_models`），无报错退出。
+**预期**：`make docker-up` 后 `docker compose ps` 应能看到 `migrate` 容器 Exit 0、`app` 容器
+running；`alembic upgrade head` 依次执行 `b25d38b0cd7c_initial_schema`、
+`e4f1a8c2b9d3_agent_assets`、`f3a1b7c9d204_llm_config`、`a3f7e9b1c852_provider_models`，无报错退出。
 
 > 存量库升级说明：`a3f7e9b1c852_provider_models` 建 `provider` / `model_config` / `provider_health`
 > 三表，把每行存量 llm_config 拆为 provider + model_config，并把 `agent_app.model` /

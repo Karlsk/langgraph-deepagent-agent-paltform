@@ -122,11 +122,23 @@ docker-build:
 
 docker-up:
 	$(call load_env_file)
-	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build db app
+	# --pull never: skip ALL registry access; rely entirely on the local image
+	# cache. The app service is always rebuilt locally via --build.
+	# If a prebuilt image is genuinely missing locally, run `docker pull <image>`
+	# first (e.g. `docker pull pgvector/pgvector:pg17`).
+	# The `migrate` one-shot service runs `alembic upgrade head` before app
+	# starts, so bootstrap never races against a schema-less database.
+	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build --pull never db migrate app
 
 docker-down:
 	$(call load_env_file)
 	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) down
+
+# Destructive: stops containers AND removes their named/anonymous volumes.
+# All DB data, cache volumes, and any persisted state are wiped.
+docker-destroy:
+	$(call load_env_file)
+	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) down -v
 
 docker-logs:
 	$(call load_env_file)
@@ -153,11 +165,19 @@ docker-migrate-history:
 # ---------------------------------------------------------------------------
 stack-up:
 	$(call load_env_file)
-	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d
+	# --pull never: skip ALL registry access; rely entirely on the local image
+	# cache. Manually `docker pull <image>` first if a service image is missing.
+	# `migrate` runs `alembic upgrade head` before the app starts.
+	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --pull never db migrate app prometheus grafana cadvisor valkey
 
 stack-down:
 	$(call load_env_file)
 	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) down
+
+# Destructive: stops the entire stack AND removes all associated volumes.
+stack-destroy:
+	$(call load_env_file)
+	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) down -v
 
 stack-logs:
 	$(call load_env_file)
@@ -234,6 +254,7 @@ help:
 	@echo "  docker-build         Build Docker image"
 	@echo "  docker-up            Start API + DB containers"
 	@echo "  docker-down          Stop containers"
+	@echo "  docker-destroy       Stop containers AND remove volumes (destructive)"
 	@echo "  docker-logs          Tail container logs"
 	@echo "  docker-migrate       Run migrations inside the app container"
 	@echo "  docker-migrate-downgrade  Roll back last migration (in container)"
@@ -242,6 +263,7 @@ help:
 	@echo "Docker (full stack — includes Prometheus + Grafana):"
 	@echo "  stack-up             Start entire stack"
 	@echo "  stack-down           Stop entire stack"
+	@echo "  stack-destroy        Stop entire stack AND remove volumes (destructive)"
 	@echo "  stack-logs           Tail all service logs"
 	@echo ""
 	@echo "Frontend (agent-web):"
@@ -260,8 +282,8 @@ help:
         eval eval-quick eval-no-report \
         lint format typecheck check pre-commit pre-commit-update \
         test test-unit test-integration test-cov \
-        docker-build docker-up docker-down docker-logs docker-migrate \
+        docker-build docker-up docker-down docker-destroy docker-logs docker-migrate \
         docker-migrate-downgrade docker-migrate-history \
-        stack-up stack-down stack-logs \
+        stack-up stack-down stack-destroy stack-logs \
         web-install web-dev web-dev-docker web-build web-clean \
         clean help
