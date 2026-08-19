@@ -292,24 +292,17 @@ def test_full_lifecycle_soft_delete_then_hard_delete_then_recreate(
     names_after_soft = [row["name"] for row in unwrap(client.get(f"{API}/providers/deleted", headers=headers))]
     assert "lifecycle" in names_after_soft
 
-    # 3. Hard delete the soft-deleted row. Hard-delete fires only on the
-    # active row by design (it must pass the same guards as soft delete);
-    # since the soft-delete here satisfies the default-protection + reference
-    # guards, the hard delete clears the tombstone so the unique slot frees.
-    # The integration path under test is the unique-slot freeing behavior,
-    # so we hard-delete an active provider that previously occupied the slot.
+    # 3. Hard delete the soft-deleted (tombstoned) row: the escape hatch must
+    # reach the tombstone so the unique-name slot frees. The hard path falls
+    # back to the trash row when no active row remains.
     response = _hard_delete(client, headers, "lifecycle")
-    # Once soft-deleted, ``_get_provider`` cannot find the row by name, so
-    # the hard-delete endpoint returns 404 — this matches the design:
-    # hard-delete targets active rows; soft-then-hard is an operator-driven
-    # two-step. To exercise the escape hatch closed-loop we instead delete
-    # a brand-new active row and re-soft-delete it; the hard path has
-    # already been covered by ``test_hard_delete_unblocks_same_name_recreate``.
-    assert response.status_code == 404, response.text
+    assert response.status_code == 200, response.text
 
-    # 4. Re-create the provider (the soft tombstone still occupies the
-    # unique slot, so the recreate is blocked — 422).
-    blocked = client.post(
+    # 4. Trash list no longer shows it; recreate succeeds (201).
+    names_after_hard = [row["name"] for row in unwrap(client.get(f"{API}/providers/deleted", headers=headers))]
+    assert "lifecycle" not in names_after_hard
+
+    recreated = client.post(
         f"{API}/providers",
         json={
             "name": "lifecycle",
@@ -320,19 +313,71 @@ def test_full_lifecycle_soft_delete_then_hard_delete_then_recreate(
         },
         headers=headers,
     )
-    assert blocked.status_code == 422, blocked.text
+    assert recreated.status_code == 201, recreated.text
 
-    # 5. Trash list still shows the tombstone; the live list excludes it.
-    names_in_trash = [row["name"] for row in unwrap(client.get(f"{API}/providers/deleted", headers=headers))]
-    assert "lifecycle" in names_in_trash
-    live = unwrap(client.get(f"{API}/providers", headers=headers))
-    assert "lifecycle" not in [row["name"] for row in live]
-
-    # 6. The raw row count is exactly 1 (the tombstone); no duplicates.
+    # 5. The raw row count is exactly 1 (the fresh active row); tombstone gone.
     with DBSession(db_engine) as session:
         rows = session.exec(select(Provider).where(col(Provider.name) == "lifecycle")).all()
-        assert len(rows) == 1, f"expected 1 tombstone, got {len(rows)}"
-        assert rows[0].deleted is True
+        assert len(rows) == 1, f"expected 1 active row, got {len(rows)}"
+        assert rows[0].deleted is False
+        # Cascade purged the soft-deleted model rows as well.
+        assert session.exec(select(ModelConfig).where(col(ModelConfig.provider_id) == rows[0].id)).all() == []
+
+
+def test_hard_delete_tombstoned_provider_requires_confirm_header(
+    client: TestClient,
+    user_headers: dict[str, str],
+) -> None:
+    """Hard-deleting a tombstone still demands the confirm header (422 without it)."""
+    headers = _management_headers(client, user_headers)
+    _create_provider(client, headers, name="tomb-confirm")
+    response = client.delete(f"{API}/providers/tomb-confirm", headers=headers)
+    assert response.status_code == 200, response.text
+
+    missing_header = client.request(
+        "DELETE",
+        f"{API}/providers/tomb-confirm",
+        params={"hard": "true"},
+        headers=headers,
+    )
+    assert missing_header.status_code == 422, missing_header.text
+
+    # With the header the tombstone purges.
+    purged = _hard_delete(client, headers, "tomb-confirm")
+    assert purged.status_code == 200, purged.text
+    trash = [row["name"] for row in unwrap(client.get(f"{API}/providers/deleted", headers=headers))]
+    assert "tomb-confirm" not in trash
+
+
+def test_hard_delete_model_under_soft_deleted_provider(
+    client: TestClient,
+    db_engine: Any,
+    user_headers: dict[str, str],
+) -> None:
+    """Model-level escape hatch reaches tombstoned models under a tombstoned provider.
+
+    The trash detail view lists models of a soft-deleted provider; hard-deleting
+    one of those models must physically purge the row (not 404).
+    """
+    headers = _management_headers(client, user_headers)
+    _create_provider(client, headers, name="tomb-models")
+    _create_model(client, headers, provider_name="tomb-models", model_name="m-tomb")
+
+    response = client.delete(f"{API}/providers/tomb-models", headers=headers)
+    assert response.status_code == 200, response.text
+
+    hard_model = client.request(
+        "DELETE",
+        f"{API}/providers/tomb-models/models/m-tomb",
+        params={"hard": "true"},
+        headers={**headers, **HARD_DELETE_HEADER},
+    )
+    assert hard_model.status_code == 200, hard_model.text
+
+    with DBSession(db_engine) as session:
+        provider_row = session.exec(select(Provider).where(col(Provider.name) == "tomb-models")).one()
+        models = session.exec(select(ModelConfig).where(col(ModelConfig.provider_id) == provider_row.id)).all()
+        assert models == [], "tombstoned model row must be physically purged"
 
 
 def test_full_lifecycle_hard_delete_frees_unique_slot(

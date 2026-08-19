@@ -648,6 +648,10 @@ async def delete_provider(
     operator must explicitly opt in to the irreversible action. All hard
     deletes fire the audit-only ``provider_hard_deleted`` warning event.
 
+    When no active row remains, the hard branch falls back to the tombstoned
+    row: the trash view is the primary consumer of this path (clear a
+    tombstone to free the unique name slot).
+
     Guards (default protection + reference check) fire before either branch
     is dispatched; even ``?hard=true`` cannot escape them.
 
@@ -668,6 +672,11 @@ async def delete_provider(
     """
     try:
         provider = _get_provider(db, name)
+        if provider is None and hard:
+            # Escape-hatch fallback: when only the tombstoned row remains, it
+            # is the delete target (soft -> trash -> hard closed loop). The
+            # default soft path never resolves to a tombstone (zero regression).
+            provider = get_deleted_provider(db, name)
         if provider is None:
             raise HTTPException(status_code=404, detail=f"provider '{name}' not found")
         if name == DEFAULT_PROVIDER_NAME:
@@ -1051,6 +1060,9 @@ async def delete_provider_model(
     field is rejected with 422. Hard delete requires the
     ``X-Confirm-Hard-Delete: true`` confirmation header.
 
+    When no active provider/model row remains, the hard branch falls back to
+    the tombstoned rows so the trash detail view can purge them.
+
     Args:
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
@@ -1069,6 +1081,10 @@ async def delete_provider_model(
     """
     try:
         provider = _get_provider(db, name)
+        if provider is None and hard:
+            # Escape-hatch fallback: with only the tombstoned provider left,
+            # the hard path resolves it from the trash (trash detail view).
+            provider = get_deleted_provider(db, name)
         if provider is None:
             raise HTTPException(status_code=404, detail=f"provider '{name}' not found")
         model_cfg = db.exec(
@@ -1078,6 +1094,17 @@ async def delete_provider_model(
                 col(ModelConfig.deleted) == False,  # noqa: E712
             )
         ).first()
+        if model_cfg is None and hard:
+            # Escape-hatch fallback: the trash detail view hard-deletes models
+            # that live under a tombstoned provider, so the hard path resolves
+            # the model from the tombstones when no active row remains.
+            model_cfg = db.exec(
+                select(ModelConfig).where(
+                    col(ModelConfig.provider_id) == provider.id,
+                    col(ModelConfig.name) == model,
+                    col(ModelConfig.deleted) == True,  # noqa: E712
+                )
+            ).first()
         if model_cfg is None:
             raise HTTPException(status_code=404, detail=f"model '{name}/{model}' not found")
 
