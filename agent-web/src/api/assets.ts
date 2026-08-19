@@ -10,7 +10,7 @@
  * - 所有端点需登录态（get_current_session），token 注入由 request.ts
  *   拦截器统一处理（当前为 TODO 占位）。
  */
-import { get } from '@/utils/request'
+import { del, get, patch, post } from '@/utils/request'
 import type { PageQuery, PageResult } from '@/types'
 
 /** SubAgent 资产行（对应后端 SubAgentRead） */
@@ -113,6 +113,76 @@ export function listSkills(): Promise<SkillRow[]> {
 /** 分页列表：GET /skills/page */
 export function listSkillsPage(query: PageQuery = {}): Promise<PageResult<SkillRow>> {
   return get<PageResult<SkillRow>>('/skills/page', { params: toParams(query) })
+}
+
+/** Skill 创建 payload（POST /skills） */
+export interface SkillCreatePayload {
+  name: string
+  description: string
+  body: string
+}
+
+/** Skill 部分更新 payload（PATCH /skills/{name}，name 不可改） */
+export interface SkillPatchPayload {
+  description?: string
+  body?: string
+}
+
+/** Skill 正文读取契约（GET /skills/{name}/content） */
+export interface SkillContentRead {
+  name: string
+  content: string
+}
+
+/** 单条元数据：GET /skills/{name} */
+export function getSkill(name: string): Promise<SkillRow> {
+  return get<SkillRow>(`/skills/${encodeURIComponent(name)}`)
+}
+
+/** 单条正文：GET /skills/{name}/content */
+export function getSkillContent(name: string): Promise<SkillContentRead> {
+  return get<SkillContentRead>(`/skills/${encodeURIComponent(name)}/content`)
+}
+
+/** 创建技能：POST /skills */
+export function createSkill(payload: SkillCreatePayload): Promise<SkillRow> {
+  return post<SkillRow>('/skills', payload)
+}
+
+/** 局部更新（description / body，name 不可改）：PATCH /skills/{name} */
+export function patchSkill(name: string, payload: SkillPatchPayload): Promise<SkillRow> {
+  return patch<SkillRow>(`/skills/${encodeURIComponent(name)}`, payload)
+}
+
+/** 物理删除（无回收站/墓碑视图）：DELETE /skills/{name} */
+export function deleteSkill(name: string): Promise<null> {
+  return del<null>(`/skills/${encodeURIComponent(name)}`)
+}
+
+/**
+ * LLM 草稿生成 payload（POST /skills/generate）。
+ * 与后端 SkillGenerateRequest 对齐：description 必填，hint 可选。
+ */
+export interface SkillGeneratePayload {
+  description: string
+  hint?: string
+}
+
+/** LLM 草稿生成响应契约：仅返回 draft 字符串 */
+export interface SkillGenerateResponse {
+  draft: string
+}
+
+/**
+ * LLM 草稿生成（仅生成，不落库）：POST /skills/generate。
+ * 父组件拿到 `draft` 后应让用户在编辑弹窗里继续微调，再走 createSkill 落库。
+ *
+ * 超时配置：300s（LLM 调用默认 15s 会超时，后端确认可成功；其它端点保持默认 15s 不变）。
+ */
+export function generateSkill(payload: SkillGeneratePayload): Promise<SkillGenerateResponse> {
+  return post<SkillGenerateResponse>('/skills/generate', payload, {
+    timeout: 300_000,
+  })
 }
 
 // ---------------------------------------------------------------------------

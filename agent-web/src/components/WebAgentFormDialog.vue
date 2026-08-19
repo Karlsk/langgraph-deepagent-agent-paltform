@@ -79,7 +79,16 @@ function setSubmitting(value: boolean): void {
   submitting.value = value
 }
 
-defineExpose({ open, close, setSubmitting })
+/**
+ * 向父组件暴露当前表单数据引用（reactive 对象），
+ * 便于外部在 open() 之后对字段做受控 patch，如把 LLM 生成的草稿写入 body。
+ * 直接返回 reactive 引用，避免每字段都加一对 emit 样板代码。
+ */
+function getForm(): Record<string, unknown> {
+  return formModel
+}
+
+defineExpose({ open, close, setSubmitting, getForm })
 </script>
 
 <template>
