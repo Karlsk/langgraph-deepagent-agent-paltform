@@ -1,50 +1,68 @@
 <script setup lang="ts">
 /**
- * 登录页（task-024 两栏式）：
- * 左品牌 + 右卡片；含字段图标 + "去注册"入口 + 错误回显。
+ * 注册页（task-024）：
+ * 左品牌 + 右卡片两栏式；4 字段表单（email / username / password /
+ * confirmPassword）+ 客户端密码强度预校验 + confirmPassword 一致性校验。
  *
- * 流程：
- * 1. /auth/login（form 表单） → 用户 token；
- * 2. /auth/session（Bearer 用户 token） → 会话 token；
- * 3. 写入 authStorage 并跳转到 redirect（默认 /llm）。
- *
- * 错误处理：401（密码错误）等由统一请求层全局拦截器提示；
- * 401 触发跳转的情况下，request.ts 拦截器会跳过登录页本身（避免反复跳）。
+ * 提交流程：
+ * 1. ElForm validate（Element Plus 内置规则：email 格式 + 必填）
+ * 2. validatePasswordStrength 前端预校验（避免 422 往返）
+ * 3. POST /auth/register
+ * 4. 成功 → 跳 /login?redirect=...（手动登录，不调 createSession）
+ * 5. 失败 → notifyError + 停留
  */
-import { computed, reactive, ref } from 'vue'
+import { reactive, ref } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
-import { Lock, User } from '@element-plus/icons-vue'
-import { useRoute, useRouter } from 'vue-router'
+import { Lock, Message, User } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
 
-import { login as loginAction } from '@/composables/useAuth'
+import { register } from '@/api/auth'
 import { useRedirectTarget } from '@/composables/useRedirectTarget'
 import { notifyError, notifySuccess } from '@/utils/notify'
+import { validatePasswordStrength } from '@/utils/password'
 
-const route = useRoute()
 const router = useRouter()
-const { redirect: redirectTarget, redirectQuery } = useRedirectTarget()
+const { redirectQuery } = useRedirectTarget()
 
 const formRef = ref<FormInstance>()
 const submitting = ref(false)
 
 const form = reactive({
   email: '',
+  username: '',
   password: '',
+  confirmPassword: '',
 })
+
+/** 二次密码确认：与 password 字段一致（自定义 validator，提交时由 ElForm 调用） */
+const validateConfirmPassword = (
+  _rule: unknown,
+  value: string,
+  callback: (error?: Error) => void,
+): void => {
+  if (value === '' || value === form.password) {
+    callback()
+  } else {
+    callback(new Error('两次输入的密码不一致'))
+  }
+}
 
 const rules: FormRules = {
   email: [
     { required: true, message: '请输入邮箱', trigger: 'blur' },
     { type: 'email', message: '邮箱格式不正确', trigger: 'blur' },
   ],
-  password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
+  username: [
+    { max: 50, message: '用户名不能超过 50 字符', trigger: 'blur' },
+  ],
+  password: [
+    { required: true, message: '请输入密码', trigger: 'blur' },
+  ],
+  confirmPassword: [
+    { required: true, message: '请再次输入密码', trigger: 'blur' },
+    { validator: validateConfirmPassword, trigger: 'blur' },
+  ],
 }
-
-/** 会话过期提示：守卫触发 /login?reason=expired 时显示 */
-const reasonMessage = computed((): string => {
-  const reason = route.query.reason
-  return reason === 'expired' ? '会话已失效，请重新登录' : ''
-})
 
 async function handleSubmit(): Promise<void> {
   if (!formRef.value) return
@@ -53,14 +71,24 @@ async function handleSubmit(): Promise<void> {
   } catch {
     return
   }
+  // 前端密码强度预校验：避免 422 往返；同时响应"密码至少 8 位"等友好文案
+  const pwErr = validatePasswordStrength(form.password)
+  if (pwErr !== null) {
+    notifyError(pwErr)
+    return
+  }
   submitting.value = true
   try {
-    await loginAction(form.email, form.password)
-    notifySuccess('登录成功')
-    await router.replace(redirectTarget.value)
+    await register({
+      email: form.email,
+      password: form.password,
+      username: form.username || null,
+    })
+    notifySuccess('注册成功，请登录')
+    await router.replace({ name: 'login', query: redirectQuery.value })
   } catch (error: unknown) {
     const message =
-      error instanceof Error && error.message ? error.message : '登录失败'
+      error instanceof Error && error.message ? error.message : '注册失败'
     notifyError(message)
   } finally {
     submitting.value = false
@@ -81,13 +109,12 @@ async function handleSubmit(): Promise<void> {
       </div>
     </aside>
 
-    <!-- 右栏：登录卡片 -->
+    <!-- 右栏：注册表单卡片 -->
     <main class="auth-page__main">
-      <section class="auth-card" aria-labelledby="auth-login-title">
+      <section class="auth-card" aria-labelledby="auth-register-title">
         <header class="auth-card__header">
-          <h2 id="auth-login-title" class="auth-card__title">Agent Web 登录</h2>
-          <p class="auth-card__desc">登录后会话 token 注入所有受保护资源请求。</p>
-          <p v-if="reasonMessage" class="auth-card__notice">{{ reasonMessage }}</p>
+          <h2 id="auth-register-title" class="auth-card__title">Agent Web 注册</h2>
+          <p class="auth-card__desc">注册账号以访问完整功能。</p>
         </header>
 
         <el-form
@@ -103,6 +130,16 @@ async function handleSubmit(): Promise<void> {
               v-model="form.email"
               type="email"
               placeholder="请输入邮箱"
+              autocomplete="email"
+            >
+              <template #prefix><el-icon><Message /></el-icon></template>
+            </el-input>
+          </el-form-item>
+          <el-form-item label="用户名（可选）" prop="username">
+            <el-input
+              v-model="form.username"
+              placeholder="请输入用户名（可选）"
+              maxlength="50"
               autocomplete="username"
             >
               <template #prefix><el-icon><User /></el-icon></template>
@@ -114,7 +151,19 @@ async function handleSubmit(): Promise<void> {
               type="password"
               placeholder="请输入密码"
               show-password
-              autocomplete="current-password"
+              autocomplete="new-password"
+              @keyup.enter="handleSubmit"
+            >
+              <template #prefix><el-icon><Lock /></el-icon></template>
+            </el-input>
+          </el-form-item>
+          <el-form-item label="确认密码" prop="confirmPassword">
+            <el-input
+              v-model="form.confirmPassword"
+              type="password"
+              placeholder="请再次输入密码"
+              show-password
+              autocomplete="new-password"
               @keyup.enter="handleSubmit"
             >
               <template #prefix><el-icon><Lock /></el-icon></template>
@@ -127,15 +176,15 @@ async function handleSubmit(): Promise<void> {
               native-type="submit"
               @click="handleSubmit"
             >
-              登录
+              注册
             </el-button>
           </el-form-item>
         </el-form>
 
         <div class="auth-card__footer">
-          还没有账号？
-          <router-link :to="{ name: 'register', query: redirectQuery }">
-            立即注册
+          已有账号？
+          <router-link :to="{ name: 'login', query: redirectQuery }">
+            立即登录
           </router-link>
         </div>
       </section>
@@ -241,7 +290,7 @@ async function handleSubmit(): Promise<void> {
   font-size: 13px;
 }
 .auth-card__notice {
-  margin: 4px 0 0 0;
+  margin-top: 4px;
   font-size: 13px;
   color: var(--color-warning-600);
 }
@@ -285,7 +334,7 @@ async function handleSubmit(): Promise<void> {
   font-size: 13px;
 }
 
-/* 响应式：< 768px 单栏 */
+/* 响应式：< 768px 单栏，左栏收缩到顶部 */
 @media (max-width: 767.98px) {
   .auth-page {
     grid-template-columns: 1fr;

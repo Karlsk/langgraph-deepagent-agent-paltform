@@ -30,6 +30,7 @@ describe('控制台导航路由', () => {
       { name: 'llm', path: '/llm' },
       { name: 'login', path: '/login' },
       { name: 'mcp', path: '/mcp' },
+      { name: 'register', path: '/register' },
       { name: 'skill', path: '/skill' },
     ])
   })
@@ -62,5 +63,23 @@ describe('认证路由守卫', () => {
     hasSessionMock.mockReturnValue(true)
     await router.push({ name: 'agent' })
     expect(router.currentRoute.value.name).toBe('agent')
+  })
+
+  it('未登录访问 /register → 正常放行（不走重定向）', async () => {
+    hasSessionMock.mockReturnValue(false)
+    await router.push({ name: 'register' })
+    expect(router.currentRoute.value.name).toBe('register')
+  })
+
+  it('已登录访问 /register?redirect=/agent → 重定向到 /agent', async () => {
+    hasSessionMock.mockReturnValue(true)
+    await router.push({ name: 'register', query: { redirect: '/agent' } })
+    expect(router.currentRoute.value.name).toBe('agent')
+  })
+
+  it('已登录访问 /register → 重定向到默认 /llm', async () => {
+    hasSessionMock.mockReturnValue(true)
+    await router.push({ name: 'register' })
+    expect(router.currentRoute.value.name).toBe('llm')
   })
 })

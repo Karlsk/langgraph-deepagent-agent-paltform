@@ -59,3 +59,21 @@ export function login(email: string, password: string): Promise<TokenResponse> {
 export function createSession(): Promise<SessionResponse> {
   return post<SessionResponse>('/auth/session')
 }
+
+/**
+ * 用户注册：JSON body，对齐后端 `UserCreate` 契约（task-024）。
+ *
+ * - 后端 `POST /auth/register` 返回 `UserResponse`（含嵌套 token，但本任务不消费 token，
+ *   由用户后续手动登录拿会话 token）；
+ * - `password` 在前端经 `validatePasswordStrength` 预校验后发送，避免 422 往返；
+ * - `username` 可选；前端传 null / undefined 时不补充字段（保持接口契约）。
+ */
+export interface RegisterPayload {
+  email: string
+  password: string
+  username?: string | null
+}
+
+export function register(payload: RegisterPayload): Promise<UserResponse> {
+  return post<UserResponse>('/auth/register', payload)
+}

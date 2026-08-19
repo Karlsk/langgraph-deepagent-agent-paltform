@@ -45,7 +45,8 @@ async function handleLogout(): Promise<void> {
 </script>
 
 <template>
-  <el-container class="app-shell">
+  <router-view v-if="route.meta.hideShell" />
+  <el-container v-else class="app-shell">
     <el-aside class="app-sidebar" :width="collapsed ? '64px' : '232px'">
       <div class="app-brand">
         <span class="app-brand__mark" aria-hidden="true">A</span>

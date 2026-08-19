@@ -1,16 +1,18 @@
 /**
- * 应用路由表（任务 #23 新增认证守卫 + /login）。
+ * 应用路由表（任务 #23 新增认证守卫 + /login；task-024 新增 /register 与 hideShell 元数据）。
  *
- * - `/login`：登录页，无需守卫；
+ * - `/login` / `/register`：公共路由（hideShell），无需受保护守卫；
  * - 其他路由：`beforeEach` 守卫检查 `useAuth().sessionToken`，未登录时跳转
  *   `/login?redirect=<原路径>`；
- * - 已登录但访问 `/login` 时，重定向到 redirect 参数或默认 `/llm`（避免重复登录）。
+ * - 已登录但访问 `/login` 或 `/register` 时，重定向到 redirect 参数或默认
+ *   `DEFAULT_REDIRECT`（避免重复登录/注册）。
  *
  * 注意：useAuth 是模块单例，导航守卫中调用 hasSession() 不会引入循环。
  */
 import { createRouter, createWebHistory } from 'vue-router'
 
 import { hasSession } from '@/composables/useAuth'
+import { DEFAULT_REDIRECT } from '@/composables/useRedirectTarget'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -20,7 +22,13 @@ const router = createRouter({
       path: '/login',
       name: 'login',
       component: () => import('@/views/auth/Login.vue'),
-      meta: { title: '登录' },
+      meta: { title: '登录', hideShell: true },
+    },
+    {
+      path: '/register',
+      name: 'register',
+      component: () => import('@/views/auth/Register.vue'),
+      meta: { title: '注册', hideShell: true },
     },
     {
       path: '/chat',
@@ -56,12 +64,13 @@ const router = createRouter({
 })
 
 router.beforeEach((to) => {
-  // 登录页与公共根路径：不强制鉴权
-  if (to.name === 'login') {
-    // 已登录用户访问 /login：直接重定向到目标或默认 /llm
+  // 公共路由：登录页 + 注册页（均 hideShell）
+  if (to.name === 'login' || to.name === 'register') {
+    // 已登录用户访问：直接重定向到目标或默认 DEFAULT_REDIRECT
     if (hasSession()) {
-      const redirect = (to.query.redirect as string | undefined) ?? '/llm'
-      return redirect
+      const raw = to.query.redirect
+      const redirect = typeof raw === 'string' && raw.length > 0 ? raw : DEFAULT_REDIRECT
+      return { path: redirect }
     }
     return true
   }
