@@ -129,9 +129,7 @@ def test_runtime_cache_hit_and_fingerprint_reassembly(
     assert runtime_1 is runtime_2  # identical fingerprint -> cache hit
 
     # Changing the MCP server configuration changes the fingerprint.
-    patched = client.patch(
-        f"{API}/mcp-servers/it-server", json={"url": "https://mcp.example.com/v2"}, headers=headers
-    )
+    patched = client.patch(f"{API}/mcp-servers/it-server", json={"url": "https://mcp.example.com/v2"}, headers=headers)
     assert patched.status_code == 200, patched.text
 
     with DBSession(db_engine) as db_session:

@@ -23,7 +23,7 @@ from sqlmodel import Session, col, select
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
+from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider, ProviderHealth
 
 # Every effective field (including auth_config secrets) feeds the content
 # hash so key rotation / endpoint changes always drift the compile
@@ -125,9 +125,7 @@ def _available_refs(session: Session) -> str:
     }
     models = session.exec(select(ModelConfig).where(col(ModelConfig.deleted) == False)).all()  # noqa: E712
     refs = sorted(
-        f"{providers[row.provider_id]}/{row.name}"
-        for row in models
-        if row.enabled and row.provider_id in providers
+        f"{providers[row.provider_id]}/{row.name}" for row in models if row.enabled and row.provider_id in providers
     )
     return ", ".join(refs)
 
@@ -172,3 +170,81 @@ def load_model_config(session: Session, reference: str | None) -> tuple[Provider
         available = _available_refs(session)
         raise ValueError(f"model config '{ref}' not found or disabled. available models: {available}")
     return provider, model
+
+
+# ---------------------------------------------------------------------------
+# Hard-delete escape hatch + trash read helpers
+# ---------------------------------------------------------------------------
+
+
+def hard_delete_provider(db: Session, provider: Provider) -> dict[str, int]:
+    """Physically delete a provider row plus every owned model_config and the health row.
+
+    All deletes happen in one transaction. Callers MUST have already verified
+    that the provider is allowed to be deleted (default protection + reference
+    check); this helper does not repeat those guards.
+
+    Args:
+        db: SQLModel database session.
+        provider: The provider row to delete (already validated).
+
+    Returns:
+        Counts of the rows actually removed: ``{"models": int, "health": int}``
+        where ``health`` is 1 if a health row existed and 0 otherwise. The
+        counts feed the audit log event emitted by the caller.
+    """
+    models = list(db.exec(select(ModelConfig).where(col(ModelConfig.provider_id) == provider.id)).all())
+    for model in models:
+        db.delete(model)
+    health = db.exec(select(ProviderHealth).where(col(ProviderHealth.provider_id) == provider.id)).first()
+    if health is not None:
+        db.delete(health)
+    db.delete(provider)
+    db.commit()
+    return {"models": len(models), "health": 1 if health is not None else 0}
+
+
+def list_deleted_providers(db: Session) -> list[Provider]:
+    """List every soft-deleted provider row ordered by ``updated_at`` desc.
+
+    The freshest tombstone comes first so operators can triage the most
+    recent soft-delete first.
+    """
+    return list(
+        db.exec(
+            select(Provider)
+            .where(col(Provider.deleted) == True)  # noqa: E712 — SQLAlchemy == False restriction
+            .order_by(col(Provider.updated_at).desc())
+        ).all()
+    )
+
+
+def get_deleted_provider(db: Session, name: str) -> Provider | None:
+    """Return the soft-deleted provider named ``name``, or ``None`` when absent.
+
+    Under the unique-name constraint there is at most one row per name;
+    ``ORDER BY updated_at DESC LIMIT 1`` is a defensive safety net.
+    """
+    return db.exec(
+        select(Provider)
+        .where(col(Provider.name) == name, col(Provider.deleted) == True)  # noqa: E712
+        .order_by(col(Provider.updated_at).desc())
+        .limit(1)
+    ).first()
+
+
+def list_models_under_deleted_provider(db: Session, name: str) -> list[ModelConfig] | None:
+    """Return every model config of the soft-deleted provider named ``name``.
+
+    Returns ``None`` when no soft-deleted provider with that name exists so the
+    caller can emit a 404. The list preserves the original ``name`` ordering so
+    the trash view is stable.
+    """
+    provider = get_deleted_provider(db, name)
+    if provider is None or provider.id is None:
+        return None
+    return list(
+        db.exec(
+            select(ModelConfig).where(col(ModelConfig.provider_id) == provider.id).order_by(col(ModelConfig.name))
+        ).all()
+    )

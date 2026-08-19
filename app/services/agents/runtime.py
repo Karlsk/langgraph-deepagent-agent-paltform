@@ -230,7 +230,9 @@ class AgentAppRuntime(ABC):
         )
         return str(interrupt_value)
 
-    def _fire_memory_add(self, messages: Sequence[BaseMessage], user_id: Optional[str], config: RunnableConfig) -> None:
+    def _fire_memory_add(
+        self, messages: Sequence[BaseMessage], user_id: Optional[str], config: RunnableConfig
+    ) -> None:
         """Fire-and-forget long-term memory write-back (successful runs only).
 
         The task is anchored in the module-level ``_pending_tasks`` set so it
@@ -238,7 +240,9 @@ class AgentAppRuntime(ABC):
         logs any exception instead of dropping it silently.
         """
         openai_msgs = cast(list[dict], convert_to_openai_messages(list(messages)))
-        task = asyncio.create_task(memory_service.add(user_id, openai_msgs, cast(Optional[dict], config.get("metadata"))))
+        task = asyncio.create_task(
+            memory_service.add(user_id, openai_msgs, cast(Optional[dict], config.get("metadata")))
+        )
         _pending_tasks.add(task)
 
         def _on_done(done: asyncio.Task[Any]) -> None:
@@ -681,7 +685,9 @@ async def _load_model_fingerprint(
             f"agent app {app_cfg.name!r} references missing or disabled model config(s): {', '.join(broken)}"
         )
 
-    fingerprint = "|".join(sorted(f"{ref}:{compute_model_config_hash(provider, model)}" for ref, (provider, model) in pairs.items()))
+    fingerprint = "|".join(
+        sorted(f"{ref}:{compute_model_config_hash(provider, model)}" for ref, (provider, model) in pairs.items())
+    )
     app_model = pairs[app_cfg.model or DEFAULT_MODEL_REF][1]
     return fingerprint, app_model.model_id
 
@@ -733,7 +739,9 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
     skill_hashes = await _load_skill_hashes(session, app_cfg.skill_names)
     mcp_fingerprint = await _load_mcp_fingerprint(session)
     model_fingerprint, resolved_model_name = await _load_model_fingerprint(session, app_cfg, subagent_cfgs)
-    fingerprint = assembly.compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint)
+    fingerprint = assembly.compute_fingerprint(
+        app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint
+    )
 
     cached = _runtime_cache.get((app_cfg.id, fingerprint))
     if cached is not None:

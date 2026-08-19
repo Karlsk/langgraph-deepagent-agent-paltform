@@ -257,9 +257,7 @@ def test_patch_provider_updates_fields(client: TestClient) -> None:
     assert payload["enabled"] is False
 
 
-def test_patch_provider_omitted_auth_config_keeps_stored_key(
-    client: TestClient, db_session: DBSession
-) -> None:
+def test_patch_provider_omitted_auth_config_keeps_stored_key(client: TestClient, db_session: DBSession) -> None:
     """Omitting auth_config on PATCH leaves the stored credentials untouched."""
     client.post("/providers", json=_provider_body())
     response = client.patch("/providers/proxy", json={"enabled": False})
@@ -729,3 +727,324 @@ def test_delete_model_referenced_by_subagent_rejected(client: TestClient, db_ses
     response = client.delete("/providers/proxy/models/m3")
     assert response.status_code == 422
     assert "researcher" in response.json()["message"]
+
+
+# ---------------------------------------------------------------------------
+# Hard-delete escape hatch (TC1-3)
+# ---------------------------------------------------------------------------
+
+HARD_DELETE_HEADER = {"X-Confirm-Hard-Delete": "true"}
+
+
+def test_delete_provider_hard_query_param_physically_removes_row(client: TestClient, db_session: DBSession) -> None:
+    """DELETE /providers/{name}?hard=true + confirm header physically removes the row."""
+    _seed_provider(db_session)
+    provider_id = db_session.exec(select(Provider).where(Provider.name == "proxy")).first().id
+
+    response = client.delete("/providers/proxy?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 200
+
+    db_session.expire_all()
+    stored = db_session.exec(select(Provider).where(Provider.name == "proxy")).first()
+    assert stored is None
+    assert db_session.get(Provider, provider_id) is None
+
+
+def test_delete_provider_hard_cascade_purges_models_and_health(client: TestClient, db_session: DBSession) -> None:
+    """Hard-delete cascades through ModelConfig rows and drops the ProviderHealth row."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider)
+    db_session.add(ProviderHealth(provider_id=provider.id, status="UP"))
+    db_session.commit()
+
+    response = client.delete("/providers/proxy?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 200
+
+    db_session.expire_all()
+    assert db_session.exec(select(Provider).where(Provider.name == "proxy")).first() is None
+    assert db_session.exec(select(ModelConfig).where(ModelConfig.provider_id == provider.id)).first() is None
+    assert db_session.exec(select(ProviderHealth).where(ProviderHealth.provider_id == provider.id)).first() is None
+
+
+def test_delete_provider_hard_unblocks_same_name_recreate(client: TestClient, db_session: DBSession) -> None:
+    """After hard delete the same name can be recreated (closes the tombstone trap)."""
+    _seed_provider(db_session)
+    first = client.delete("/providers/proxy?hard=true", headers=HARD_DELETE_HEADER)
+    assert first.status_code == 200
+
+    recreate = client.post("/providers", json=_provider_body())
+    assert recreate.status_code == 201
+    assert unwrap(recreate, expected_code=201)["name"] == "proxy"
+
+
+def test_delete_provider_hard_requires_confirm_header(client: TestClient, db_session: DBSession) -> None:
+    """hard=true without X-Confirm-Hard-Delete header is rejected with 422."""
+    _seed_provider(db_session)
+    response = client.delete("/providers/proxy?hard=true")
+    assert response.status_code == 422
+    assert "X-Confirm-Hard-Delete" in response.json()["message"]
+
+    db_session.expire_all()
+    assert db_session.exec(select(Provider).where(Provider.name == "proxy")).first() is not None
+
+
+def test_delete_provider_hard_invalid_header_rejected(client: TestClient, db_session: DBSession) -> None:
+    """hard=true with X-Confirm-Hard-Delete != 'true' is rejected with 422."""
+    _seed_provider(db_session)
+    response = client.delete("/providers/proxy?hard=true", headers={"X-Confirm-Hard-Delete": "false"})
+    assert response.status_code == 422
+    assert "X-Confirm-Hard-Delete" in response.json()["message"]
+
+    db_session.expire_all()
+    assert db_session.exec(select(Provider).where(Provider.name == "proxy")).first() is not None
+
+
+def test_delete_provider_hard_default_still_forbidden(client: TestClient, db_session: DBSession) -> None:
+    """Even the hard path is blocked on the bootstrap-seeded default provider."""
+    _seed_default_pair(db_session)
+    response = client.delete("/providers/default?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 422
+    assert DEFAULT_MODEL_REF in response.json()["message"] or "default" in response.json()["message"]
+
+
+def test_delete_provider_hard_referenced_by_app_still_forbidden(client: TestClient, db_session: DBSession) -> None:
+    """Reference protection fires before the hard branch (no escape hatch for references)."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider)
+    db_session.add(AgentApp(name="support-app", system_prompt="x", model="proxy/m3"))
+    db_session.commit()
+
+    response = client.delete("/providers/proxy?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 422
+    assert "support-app" in response.json()["message"]
+
+    db_session.expire_all()
+    assert db_session.exec(select(Provider).where(Provider.name == "proxy")).first() is not None
+
+
+def test_delete_provider_soft_with_no_param_unchanged(client: TestClient, db_session: DBSession) -> None:
+    """Backward compat: DELETE without ?hard keeps the soft-delete contract."""
+    _seed_provider(db_session)
+    response = client.delete("/providers/proxy")
+    assert response.status_code == 200
+
+    db_session.expire_all()
+    stored = db_session.exec(select(Provider).where(Provider.name == "proxy")).first()
+    assert stored is not None and stored.deleted is True
+
+
+def test_delete_provider_hard_emits_audit_log(
+    client: TestClient, db_session: DBSession, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hard-delete emits the audit-only provider_hard_deleted warning event."""
+    _seed_provider(db_session)
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        response = client.delete("/providers/proxy?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 200
+    event_names = [record.message for record in caplog.records]
+    assert any("provider_hard_deleted" in str(name) for name in event_names)
+
+
+def test_delete_provider_hard_404_when_missing(client: TestClient) -> None:
+    """hard=true on a missing provider still returns 404."""
+    response = client.delete("/providers/ghost?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 404
+
+
+def test_hard_delete_provider_helper_signature_frozen() -> None:
+    """Contract: hard_delete_provider accepts (db, provider) and returns a counts dict."""
+    import inspect
+    import typing
+
+    from app.services.llm.llm_store import hard_delete_provider
+
+    sig = inspect.signature(hard_delete_provider)
+    params = list(sig.parameters.keys())
+    assert params == ["db", "provider"]
+    # Accept either plain ``dict`` or parameterized ``dict[K, V]`` annotations.
+    return_annotation = sig.return_annotation
+    origin = typing.get_origin(return_annotation)
+    assert origin is dict or return_annotation is dict, f"return must be dict-like, got {return_annotation}"
+
+
+def test_delete_model_hard_query_param_physically_removes_row(client: TestClient, db_session: DBSession) -> None:
+    """DELETE /providers/{name}/models/{model}?hard=true + header purges the row."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider, name="m3")
+    _seed_model(db_session, provider, name="zeta")
+    response = client.delete("/providers/proxy/models/m3?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 200
+
+    db_session.expire_all()
+    assert db_session.exec(select(ModelConfig).where(ModelConfig.name == "m3")).first() is None
+    # Sibling model is preserved.
+    assert db_session.exec(select(ModelConfig).where(ModelConfig.name == "zeta")).first() is not None
+
+
+def test_delete_model_hard_requires_confirm_header(client: TestClient, db_session: DBSession) -> None:
+    """hard=true without header is rejected (model is not purged)."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider)
+    response = client.delete("/providers/proxy/models/m3?hard=true")
+    assert response.status_code == 422
+    assert "X-Confirm-Hard-Delete" in response.json()["message"]
+
+    db_session.expire_all()
+    assert db_session.exec(select(ModelConfig).where(ModelConfig.name == "m3")).first() is not None
+
+
+def test_delete_model_hard_default_still_forbidden(client: TestClient, db_session: DBSession) -> None:
+    """Even the hard path is blocked on the bootstrap-seeded default model."""
+    _seed_default_pair(db_session)
+    response = client.delete("/providers/default/models/default?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 422
+    assert DEFAULT_MODEL_REF in response.json()["message"]
+
+
+def test_delete_model_hard_referenced_still_forbidden(client: TestClient, db_session: DBSession) -> None:
+    """Reference protection fires before the hard branch (no escape hatch)."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider)
+    db_session.add(AgentApp(name="support-app", system_prompt="x", model="proxy/m3"))
+    db_session.commit()
+
+    response = client.delete("/providers/proxy/models/m3?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 422
+    assert "support-app" in response.json()["message"]
+
+    db_session.expire_all()
+    assert db_session.exec(select(ModelConfig).where(ModelConfig.name == "m3")).first() is not None
+
+
+def test_delete_model_hard_unblocks_same_name_recreate(client: TestClient, db_session: DBSession) -> None:
+    """After hard-delete a model of the same (provider, name) can be recreated."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider)
+    first = client.delete("/providers/proxy/models/m3?hard=true", headers=HARD_DELETE_HEADER)
+    assert first.status_code == 200
+
+    recreate = client.post("/providers/proxy/models", json=_model_body(model_id="new-id"))
+    assert recreate.status_code == 201
+
+
+def test_delete_model_hard_emits_audit_log(
+    client: TestClient, db_session: DBSession, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hard-delete on a model emits the audit-only model_config_hard_deleted warning event."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider)
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        response = client.delete("/providers/proxy/models/m3?hard=true", headers=HARD_DELETE_HEADER)
+    assert response.status_code == 200
+    event_names = [record.message for record in caplog.records]
+    assert any("model_config_hard_deleted" in str(name) for name in event_names)
+
+
+# ---------------------------------------------------------------------------
+# Trash endpoints (TC7-9) — list soft-deleted providers and their models
+# ---------------------------------------------------------------------------
+
+
+def test_list_deleted_providers_empty(client: TestClient) -> None:
+    """No soft-deleted providers → data is [] (never 404 for an empty list)."""
+    response = client.get("/providers/deleted")
+    assert response.status_code == 200
+    assert unwrap(response) == []
+
+
+def test_list_deleted_providers_returns_only_soft_deleted(client: TestClient, db_session: DBSession) -> None:
+    """Trash list filters out live rows and exposes the masked projection of soft-deleted rows."""
+    _seed_provider(db_session, name="proxy")
+    _seed_provider(db_session, name="backup")
+    assert client.delete("/providers/proxy").status_code == 200
+
+    rows = unwrap(client.get("/providers/deleted"))
+    assert [row["name"] for row in rows] == ["proxy"]
+    assert rows[0]["deleted"] is True
+
+
+def test_list_deleted_providers_ordered_by_updated_desc(client: TestClient, db_session: DBSession) -> None:
+    """Newer soft-delete comes first (operators triage the freshest tombstone first)."""
+    _seed_provider(db_session, name="first")
+    _seed_provider(db_session, name="second")
+    assert client.delete("/providers/first").status_code == 200
+    assert client.delete("/providers/second").status_code == 200
+
+    rows = unwrap(client.get("/providers/deleted"))
+    assert [row["name"] for row in rows] == ["second", "first"]
+
+
+def test_list_deleted_providers_masks_auth_config(client: TestClient, db_session: DBSession) -> None:
+    """Trash rows never leak raw auth secrets (extra security on soft-deleted rows)."""
+    _seed_provider(db_session)
+    assert client.delete("/providers/proxy").status_code == 200
+
+    rows = unwrap(client.get("/providers/deleted"))
+    assert len(rows) == 1
+    assert "auth_config" not in rows[0]
+    assert rows[0]["api_key_masked"] == "****1234"
+
+
+def test_get_deleted_provider_by_name_returns_soft_deleted(client: TestClient, db_session: DBSession) -> None:
+    """GET /providers/deleted/{name} returns the soft-deleted row (masked projection)."""
+    _seed_provider(db_session)
+    assert client.delete("/providers/proxy").status_code == 200
+
+    payload = unwrap(client.get("/providers/deleted/proxy"))
+    assert payload["name"] == "proxy"
+    assert payload["deleted"] is True
+    assert "auth_config" not in payload
+
+
+def test_get_deleted_provider_by_name_returns_404_when_active(client: TestClient) -> None:
+    """Active rows are not visible to the trash view (consistency with trash list)."""
+    response = client.get("/providers/deleted/proxy")
+    assert response.status_code == 404
+
+
+def test_get_deleted_provider_by_name_returns_404_when_unknown(client: TestClient) -> None:
+    """Unknown names → 404 (no provider row exists at all)."""
+    response = client.get("/providers/deleted/ghost")
+    assert response.status_code == 404
+
+
+def test_list_deleted_models_under_soft_deleted_provider(client: TestClient, db_session: DBSession) -> None:
+    """Even a soft-deleted provider's models are still readable via the trash endpoint."""
+    provider = _seed_provider(db_session)
+    _seed_model(db_session, provider, name="m3")
+    _seed_model(db_session, provider, name="zeta")
+    assert client.delete("/providers/proxy").status_code == 200
+
+    rows = unwrap(client.get("/providers/deleted/proxy/models"))
+    names = sorted(row["name"] for row in rows)
+    assert names == ["m3", "zeta"]
+    assert all(row["deleted"] is True for row in rows)
+
+
+def test_list_deleted_models_returns_404_when_provider_active(client: TestClient) -> None:
+    """Trash models view is only for tombstoned providers — active provider 404s."""
+    response = client.get("/providers/deleted/proxy/models")
+    assert response.status_code == 404
+
+
+def test_trash_endpoints_emit_info_log(
+    client: TestClient, db_session: DBSession, caplog: pytest.LogCaptureFixture
+) -> None:
+    """All three trash endpoints emit an info-level event for observability."""
+    _seed_provider(db_session)
+    assert client.delete("/providers/proxy").status_code == 200
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert client.get("/providers/deleted").status_code == 200
+        assert client.get("/providers/deleted/proxy").status_code == 200
+        assert client.get("/providers/deleted/proxy/models").status_code == 200
+
+    event_names = [record.message for record in caplog.records]
+    assert any("provider_trash_listed" in str(name) for name in event_names)
+    assert any("provider_trash_read" in str(name) for name in event_names)
+    assert any("model_trash_listed" in str(name) for name in event_names)

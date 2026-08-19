@@ -217,9 +217,7 @@ def test_hash_changes_with_every_effective_field(
 ) -> None:
     """Every effective field mutation on either row changes the content hash."""
     baseline = llm_store.compute_model_config_hash(_make_provider(), _make_model())
-    mutated = llm_store.compute_model_config_hash(
-        _make_provider(**provider_mutation), _make_model(**model_mutation)
-    )
+    mutated = llm_store.compute_model_config_hash(_make_provider(**provider_mutation), _make_model(**model_mutation))
     assert mutated != baseline
 
 

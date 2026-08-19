@@ -492,7 +492,16 @@ def validate_publish(
 # Fingerprint & compile cache
 # ---------------------------------------------------------------------------
 
-_APP_FIELDS = ("name", "system_prompt", "allowed_tools", "model", "skill_names", "subagent_names", "interrupt_on", "engine")
+_APP_FIELDS = (
+    "name",
+    "system_prompt",
+    "allowed_tools",
+    "model",
+    "skill_names",
+    "subagent_names",
+    "interrupt_on",
+    "engine",
+)
 _SUBAGENT_FIELDS = ("name", "description", "when_to_use", "system_prompt", "allowed_tools", "model", "max_turns")
 
 

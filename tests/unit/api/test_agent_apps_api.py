@@ -588,18 +588,14 @@ def test_publish_subagent_unknown_tool_rejected(client: TestClient) -> None:
 
 def test_publish_missing_skill_reference_rejected(client: TestClient) -> None:
     """Referencing a nonexistent skill is rejected with 422."""
-    app_id = unwrap(client.post("/apps", json=_app_body(skill_names=["ghost-skill"])), expected_code=201)[
-        "id"
-    ]
+    app_id = unwrap(client.post("/apps", json=_app_body(skill_names=["ghost-skill"])), expected_code=201)["id"]
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
 
 
 def test_publish_missing_subagent_reference_rejected(client: TestClient) -> None:
     """Referencing a nonexistent subagent is rejected with 422."""
-    app_id = unwrap(client.post("/apps", json=_app_body(subagent_names=["ghost-sub"])), expected_code=201)[
-        "id"
-    ]
+    app_id = unwrap(client.post("/apps", json=_app_body(subagent_names=["ghost-sub"])), expected_code=201)["id"]
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
 
@@ -889,9 +885,7 @@ def test_patch_mcp_server_transport_switch_requires_matching_fields(client: Test
     missing_url = client.patch("/mcp-servers/fs-server", json={"transport": "http"})
     assert missing_url.status_code == 422
 
-    switched = client.patch(
-        "/mcp-servers/fs-server", json={"transport": "http", "url": "https://mcp.example/sse"}
-    )
+    switched = client.patch("/mcp-servers/fs-server", json={"transport": "http", "url": "https://mcp.example/sse"})
     assert switched.status_code == 200
     assert unwrap(switched)["transport"] == "http"
 

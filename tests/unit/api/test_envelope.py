@@ -79,9 +79,7 @@ def client() -> Generator[tuple[TestClient, str], None, None]:
 
     @app.get("/protected")
     async def protected() -> None:
-        raise HTTPException(
-            status_code=401, detail="Not authenticated", headers={"WWW-Authenticate": "Bearer"}
-        )
+        raise HTTPException(status_code=401, detail="Not authenticated", headers={"WWW-Authenticate": "Bearer"})
 
     @app.get("/boom")
     async def boom() -> None:

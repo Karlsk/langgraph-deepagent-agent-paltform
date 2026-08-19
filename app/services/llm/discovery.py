@@ -41,9 +41,7 @@ async def discover_remote_models(provider: Provider) -> list[RemoteModelInfo]:
             surfaces it as an HTTP 502).
     """
     if provider.type in UNSUPPORTED_TYPES:
-        raise ValueError(
-            f"provider type '{provider.type}' does not support auto-discovery"
-        )
+        raise ValueError(f"provider type '{provider.type}' does not support auto-discovery")
 
     api_key = provider.auth_config.get("api_key") if provider.auth_config else None
     client = AsyncOpenAI(

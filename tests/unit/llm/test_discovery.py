@@ -113,9 +113,7 @@ def test_discover_returns_empty_when_upstream_empty(monkeypatch: pytest.MonkeyPa
     """An empty upstream list is projected to an empty RemoteModelInfo list."""
     FakeAsyncOpenAI.outcome = "up"
     FakeAsyncOpenAI.canned_models = []
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
     result = asyncio.run(discover_remote_models(_make_provider()))
 
@@ -129,9 +127,7 @@ def test_discover_projects_each_model_id_and_owned_by(monkeypatch: pytest.Monkey
         FakeModel("deepseek-v4-flash", owned_by="deepseek"),
         FakeModel("deepseek-v4-pro", owned_by="deepseek"),
     ]
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
     result = asyncio.run(discover_remote_models(_make_provider(name="deepseek")))
 
@@ -144,9 +140,7 @@ def test_discover_passes_api_key_and_base_url(monkeypatch: pytest.MonkeyPatch) -
     """The constructed client receives the provider's auth + base_url verbatim."""
     FakeAsyncOpenAI.outcome = "up"
     FakeAsyncOpenAI.canned_models = []
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
     asyncio.run(
         discover_remote_models(
@@ -164,13 +158,9 @@ def test_discover_falls_back_to_no_key_when_auth_config_empty(monkeypatch: pytes
     """A missing api_key falls back to the 'no-key' placeholder (OLLAMA-style)."""
     FakeAsyncOpenAI.outcome = "up"
     FakeAsyncOpenAI.models = []
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
-    asyncio.run(
-        discover_remote_models(_make_provider(type="OLLAMA", auth_config={}))
-    )
+    asyncio.run(discover_remote_models(_make_provider(type="OLLAMA", auth_config={})))
 
     assert FakeAsyncOpenAI.last is not None
     assert FakeAsyncOpenAI.last.kwargs["api_key"] == "no-key"
@@ -190,9 +180,7 @@ def test_discover_rejects_anthropic_with_value_error() -> None:
 def test_discover_propagates_upstream_connection_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Upstream connection errors bubble up so the endpoint can map them to 502."""
     FakeAsyncOpenAI.outcome = "down"
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
     with pytest.raises(ConnectionError, match="fake upstream failure"):
         asyncio.run(discover_remote_models(_make_provider()))
@@ -207,9 +195,7 @@ def test_discover_closes_client_on_success(monkeypatch: pytest.MonkeyPatch) -> N
     """close() runs even when iteration completes without error."""
     FakeAsyncOpenAI.outcome = "up"
     FakeAsyncOpenAI.canned_models = [FakeModel("gpt-4o", owned_by="openai")]
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
     asyncio.run(discover_remote_models(_make_provider()))
 
@@ -220,9 +206,7 @@ def test_discover_closes_client_on_success(monkeypatch: pytest.MonkeyPatch) -> N
 def test_discover_closes_client_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """close() still runs when iteration raises, so connections never leak."""
     FakeAsyncOpenAI.outcome = "down"
-    monkeypatch.setattr(
-        "app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI
-    )
+    monkeypatch.setattr("app.services.llm.discovery.AsyncOpenAI", FakeAsyncOpenAI)
 
     with pytest.raises(ConnectionError):
         asyncio.run(discover_remote_models(_make_provider()))

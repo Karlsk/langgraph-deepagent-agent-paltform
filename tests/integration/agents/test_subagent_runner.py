@@ -57,9 +57,7 @@ def test_subagent_one_shot_test_run_is_isolated(
     assert created_payload["max_turns"] is None
 
     scripted_model.responses = [AIMessage(content="one-shot summary")]
-    result = client.post(
-        f"{API}/subagents/summarizer/test", json={"prompt": "summarize this"}, headers=headers
-    )
+    result = client.post(f"{API}/subagents/summarizer/test", json={"prompt": "summarize this"}, headers=headers)
     assert result.status_code == 200, result.text
     payload = unwrap(result)
     assert payload["final_message"] == "one-shot summary"
@@ -115,9 +113,7 @@ def test_skill_delete_cascades_user_copies(
     assert os.path.isfile(os.path.join(user_copy_dir, "SKILL.md"))
 
     # Unbind the skill from the app (delete rejects dangling references), then delete.
-    assert (
-        client.patch(f"{API}/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
-    )
+    assert client.patch(f"{API}/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
     deleted = client.delete(f"{API}/skills/doomed-skill", headers=headers)
     assert deleted.status_code == 200, deleted.text
 

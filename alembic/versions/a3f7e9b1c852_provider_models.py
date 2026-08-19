@@ -133,7 +133,9 @@ def upgrade() -> None:
     # Data migration: each retired llm_config row becomes one provider row
     # (type OPENAI_COMPATIBLE, api_key folded into auth_config).
     legacy = conn.execute(
-        sa.text("SELECT created_at, name, model_name, api_key, base_url, temperature, max_tokens, enabled, created_by FROM llm_config")
+        sa.text(
+            "SELECT created_at, name, model_name, api_key, base_url, temperature, max_tokens, enabled, created_by FROM llm_config"
+        )
     ).fetchall()
     provider_ids: dict[str, int] = {}
     for row in legacy:
@@ -240,6 +242,7 @@ def downgrade() -> None:
         sa.Column("created_by", sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.PrimaryKeyConstraint("name"),
     )
+
     def _as_dict(value: Any) -> dict[str, Any]:
         """Coerce a JSON column value to a dict across dialects.
 

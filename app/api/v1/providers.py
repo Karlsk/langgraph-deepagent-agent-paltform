@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from openai import AsyncOpenAI
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -61,7 +61,17 @@ from app.schemas.providers import (
     RemoteModelInfo,
 )
 from app.services.llm.discovery import discover_remote_models
-from app.services.llm.llm_store import compute_model_config_hash
+from app.services.llm.llm_store import (
+    compute_model_config_hash,
+    get_deleted_provider,
+    hard_delete_provider,
+    list_deleted_providers,
+    list_models_under_deleted_provider,
+)
+
+# Header literal required to confirm an irreversible hard delete (escape hatch).
+HARD_DELETE_CONFIRM_HEADER = "X-Confirm-Hard-Delete"
+HARD_DELETE_CONFIRM_VALUE = "true"
 
 router = APIRouter()
 
@@ -150,6 +160,29 @@ def _model_read(model: ModelConfig, provider_name: str) -> dict[str, Any]:
     }
 
 
+def _provider_trash_read(provider: Provider) -> dict[str, Any]:
+    """Project a Provider row for the trash view (auth secrets masked further).
+
+    Soft-deleted rows carry an extra risk: they sit in the DB until they are
+    hard-deleted. To prevent any leak through the trash list, this projection
+    physically excludes the raw ``auth_config`` payload and only exposes
+    ``api_key_masked``.
+    """
+    api_key = provider.auth_config.get("api_key") if provider.auth_config else None
+    return {
+        "id": provider.id,
+        "name": provider.name,
+        "type": provider.type,
+        "base_url": provider.base_url,
+        "api_key_masked": _mask_api_key(api_key) if isinstance(api_key, str) and api_key else "",
+        "enabled": provider.enabled,
+        "deleted": True,
+        "created_by": provider.created_by,
+        "created_at": _iso(provider.created_at),
+        "updated_at": _iso(provider.updated_at),
+    }
+
+
 def _get_provider(db: DBSession, name: str) -> Provider | None:
     """Fetch a live (non-deleted) provider by unique name."""
     return db.exec(select(Provider).where(col(Provider.name) == name, col(Provider.deleted) == False)).first()  # noqa: E712
@@ -189,7 +222,9 @@ def build_model_catalog(db: DBSession) -> dict[str, tuple[Provider, ModelConfig]
 def _model_fingerprint(model_catalog: Mapping[str, tuple[Provider, ModelConfig]]) -> str:
     """Fingerprint the model catalog (publish hash input)."""
     return "|".join(
-        sorted(f"{ref}:{compute_model_config_hash(provider, model)}" for ref, (provider, model) in model_catalog.items())
+        sorted(
+            f"{ref}:{compute_model_config_hash(provider, model)}" for ref, (provider, model) in model_catalog.items()
+        )
     )
 
 
@@ -277,9 +312,7 @@ async def list_providers_page(
                     )
                 ).one()
             )
-            health = db.exec(
-                select(ProviderHealth).where(col(ProviderHealth.provider_id) == provider.id)
-            ).first()
+            health = db.exec(select(ProviderHealth).where(col(ProviderHealth.provider_id) == provider.id)).first()
             items.append(
                 {
                     "provider": _provider_read(provider),
@@ -351,6 +384,143 @@ async def create_provider(
         raise
     except Exception as exc:
         logger.exception("provider_create_failed", name=payload.name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Trash (soft-deleted) views
+#
+# IMPORTANT — route ordering: FastAPI matches routes in registration order.
+# The literal paths ``/providers/deleted`` and ``/providers/deleted/{name}``
+# MUST be registered BEFORE the parameterized ``/providers/{name}`` route so
+# that a request for ``/providers/deleted`` is not silently captured by the
+# generic provider handler with ``name="deleted"`` and returns 404.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/providers/deleted", response_model=ApiResponse[list[dict[str, Any]]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["provider"][0])
+async def list_deleted_providers_endpoint(
+    request: Request,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[list[dict[str, Any]]]:
+    """List every soft-deleted provider row ordered by ``updated_at`` desc.
+
+    The projection never carries the raw ``auth_config`` payload; only the
+    masked ``api_key_masked`` is returned, so trash rows leak no additional
+    secrets versus live rows.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the masked trash projection (possibly empty).
+    """
+    try:
+        rows = list_deleted_providers(db)
+        logger.info(
+            "provider_trash_listed",
+            count=len(rows),
+            actor=_creator(current_session),
+        )
+        return ApiResponse.success([_provider_trash_read(row) for row in rows])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("provider_trash_list_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/providers/deleted/{name}", response_model=ApiResponse[dict[str, Any]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["provider"][0])
+async def get_deleted_provider_endpoint(
+    request: Request,
+    name: str,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[dict[str, Any]]:
+    """Return one soft-deleted provider by name, or 404 when not in the trash.
+
+    A live (non-deleted) provider with the same name is invisible to this
+    endpoint so the trash view stays consistent with the list view.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: Provider unique name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the masked trash projection.
+
+    Raises:
+        HTTPException: 404 when no soft-deleted provider with that name exists.
+    """
+    try:
+        provider = get_deleted_provider(db, name)
+        if provider is None:
+            raise HTTPException(status_code=404, detail=f"deleted provider '{name}' not found")
+        logger.info("provider_trash_read", name=name, actor=_creator(current_session))
+        return ApiResponse.success(_provider_trash_read(provider))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("provider_trash_read_failed", name=name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get(
+    "/providers/deleted/{name}/models",
+    response_model=ApiResponse[list[dict[str, Any]]],
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["model_config"][0])
+async def list_deleted_provider_models_endpoint(
+    request: Request,
+    name: str,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[list[dict[str, Any]]]:
+    """List every model config of the soft-deleted provider named ``name``.
+
+    The active-list endpoint cannot return these rows because the parent
+    provider is tombstoned; the trash view is the only consumer that needs
+    them (e.g. to confirm what's in the tombstone before hard-delete).
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: Provider unique name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the masked model rows with their ``deleted`` flag.
+
+    Raises:
+        HTTPException: 404 when no soft-deleted provider with that name exists.
+    """
+    try:
+        models = list_models_under_deleted_provider(db, name)
+        if models is None:
+            raise HTTPException(status_code=404, detail=f"deleted provider '{name}' not found")
+        logger.info(
+            "model_trash_listed",
+            provider_name=name,
+            count=len(models),
+            actor=_creator(current_session),
+        )
+        rows: list[dict[str, Any]] = []
+        for model in models:
+            projection = _model_read(model, name)
+            projection["deleted"] = model.deleted
+            rows.append(projection)
+        return ApiResponse.success(rows)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("model_trash_list_failed", provider_name=name)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -441,9 +611,7 @@ async def update_provider(
         # Re-validate the resulting type/auth_config pair.
         api_key = provider.auth_config.get("api_key") if provider.auth_config else None
         if provider.type != "OLLAMA" and not (isinstance(api_key, str) and api_key):
-            raise HTTPException(
-                status_code=422, detail="auth_config.api_key is required for non-OLLAMA providers"
-            )
+            raise HTTPException(status_code=422, detail="auth_config.api_key is required for non-OLLAMA providers")
 
         db.add(provider)
         db.commit()
@@ -462,19 +630,32 @@ async def update_provider(
 async def delete_provider(
     request: Request,
     name: str,
+    hard: bool = Query(False, description="Physically delete the provider and its data (irreversible)"),
+    x_confirm_hard_delete: str | None = Header(
+        default=None,
+        alias=HARD_DELETE_CONFIRM_HEADER,
+        description="Required 'true' when hard=true; prevents accidental irreversible delete",
+    ),
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
 ) -> ApiResponse[None]:
-    """Soft-delete a provider and cascade-soft-delete its model configs.
+    """Delete a provider: soft by default, hard when ``?hard=true`` is confirmed.
 
-    Guards: the bootstrap-seeded ``default`` provider is undeletable, and a
-    provider with any model still referenced by an AgentApp or SubAgentConfig
-    ``model`` field is rejected with 422. The provider's health row is
-    dropped together with the provider.
+    The default branch soft-deletes the provider and cascades model rows;
+    the provider's health row is dropped together with the provider.
+
+    The hard branch requires the ``X-Confirm-Hard-Delete: true`` header so the
+    operator must explicitly opt in to the irreversible action. All hard
+    deletes fire the audit-only ``provider_hard_deleted`` warning event.
+
+    Guards (default protection + reference check) fire before either branch
+    is dispatched; even ``?hard=true`` cannot escape them.
 
     Args:
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
+        hard: If true, physically delete the provider (irreversible).
+        x_confirm_hard_delete: Header that must equal ``"true"`` when ``hard=true``.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
 
@@ -482,7 +663,8 @@ async def delete_provider(
         Envelope with null data on successful deletion.
 
     Raises:
-        HTTPException: 404 when missing, 422 when protected or referenced.
+        HTTPException: 404 when missing, 422 when protected, referenced, or
+            ``hard=true`` is sent without the confirmation header.
     """
     try:
         provider = _get_provider(db, name)
@@ -504,6 +686,31 @@ async def delete_provider(
                 status_code=422,
                 detail=f"provider '{name}' is referenced by: {', '.join(sorted(owners))}",
             )
+
+        if hard:
+            if x_confirm_hard_delete != HARD_DELETE_CONFIRM_VALUE:
+                logger.warning(
+                    "provider_hard_delete_rejected",
+                    name=name,
+                    reason="missing_confirm_header",
+                    header_value=x_confirm_hard_delete,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{HARD_DELETE_CONFIRM_HEADER} header must be '{HARD_DELETE_CONFIRM_VALUE}' "
+                        f"when hard=true (provider '{name}')"
+                    ),
+                )
+            counts = hard_delete_provider(db, provider)
+            logger.warning(
+                "provider_hard_deleted",
+                name=name,
+                model_count=counts["models"],
+                health_cleared=counts["health"],
+                actor=_creator(current_session),
+            )
+            return ApiResponse.success(None)
 
         for model in models:
             model.deleted = True
@@ -828,19 +1035,28 @@ async def delete_provider_model(
     request: Request,
     name: str,
     model: str,
+    hard: bool = Query(False, description="Physically delete the model config row (irreversible)"),
+    x_confirm_hard_delete: str | None = Header(
+        default=None,
+        alias=HARD_DELETE_CONFIRM_HEADER,
+        description="Required 'true' when hard=true; prevents accidental irreversible delete",
+    ),
     db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
 ) -> ApiResponse[None]:
-    """Soft-delete a model config.
+    """Delete a model config: soft by default, hard when ``?hard=true`` is confirmed.
 
     Guards: the bootstrap-seeded ``default/default`` pair is undeletable,
     and a model still referenced by an AgentApp or SubAgentConfig ``model``
-    field is rejected with 422.
+    field is rejected with 422. Hard delete requires the
+    ``X-Confirm-Hard-Delete: true`` confirmation header.
 
     Args:
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         model: Model config display name.
+        hard: If true, physically delete the model config row.
+        x_confirm_hard_delete: Header that must equal ``"true"`` when ``hard=true``.
         db: Request-scoped DB session.
         current_session: Authenticated chat session.
 
@@ -848,7 +1064,8 @@ async def delete_provider_model(
         Envelope with null data on successful deletion.
 
     Raises:
-        HTTPException: 404 when missing, 422 when protected or referenced.
+        HTTPException: 404 when missing, 422 when protected, referenced, or
+            ``hard=true`` is sent without the confirmation header.
     """
     try:
         provider = _get_provider(db, name)
@@ -876,6 +1093,30 @@ async def delete_provider_model(
                 status_code=422,
                 detail=f"model '{ref}' is referenced by: {', '.join(owners)}",
             )
+
+        if hard:
+            if x_confirm_hard_delete != HARD_DELETE_CONFIRM_VALUE:
+                logger.warning(
+                    "model_config_hard_delete_rejected",
+                    ref=ref,
+                    reason="missing_confirm_header",
+                    header_value=x_confirm_hard_delete,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{HARD_DELETE_CONFIRM_HEADER} header must be '{HARD_DELETE_CONFIRM_VALUE}' "
+                        f"when hard=true (model '{ref}')"
+                    ),
+                )
+            db.delete(model_cfg)
+            db.commit()
+            logger.warning(
+                "model_config_hard_deleted",
+                ref=ref,
+                actor=_creator(current_session),
+            )
+            return ApiResponse.success(None)
 
         model_cfg.deleted = True
         db.add(model_cfg)

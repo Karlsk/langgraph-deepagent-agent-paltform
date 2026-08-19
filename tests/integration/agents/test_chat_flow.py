@@ -30,9 +30,7 @@ API = settings.API_V1_STR
 
 def _publish_app(client: TestClient, headers: dict[str, str], name: str = "chat-app") -> int:
     """Create and publish a minimal AgentApp, returning its id."""
-    created = client.post(
-        f"{API}/apps", json={"name": name, "system_prompt": "You are chat."}, headers=headers
-    )
+    created = client.post(f"{API}/apps", json={"name": name, "system_prompt": "You are chat."}, headers=headers)
     assert created.status_code == 201, created.text
     app_id = unwrap(created, expected_code=201)["id"]
     published = client.post(f"{API}/apps/{app_id}/publish", headers=headers)
@@ -114,9 +112,7 @@ def test_chat_endpoints_round_trip_via_runtime(
 def test_session_binding_rejects_unpublished_app(client: TestClient, user_headers: dict[str, str]) -> None:
     """Binding a session to a draft AgentApp fails; missing ids fail with 404."""
     management = _management_headers(client, user_headers)
-    created = client.post(
-        f"{API}/apps", json={"name": "draft-app", "system_prompt": "Draft."}, headers=management
-    )
+    created = client.post(f"{API}/apps", json={"name": "draft-app", "system_prompt": "Draft."}, headers=management)
     assert created.status_code == 201, created.text
     draft_id = unwrap(created, expected_code=201)["id"]
 

@@ -45,9 +45,7 @@ def test_create_endpoint_envelope_code_mirrors_201(client: TestClient, user_head
     """POST 201 endpoints keep HTTP 201 and carry code=201 inside the envelope."""
     headers = _management_headers(client, user_headers)
 
-    created = client.post(
-        f"{API}/apps", json={"name": "smoke-app", "system_prompt": "Smoke."}, headers=headers
-    )
+    created = client.post(f"{API}/apps", json={"name": "smoke-app", "system_prompt": "Smoke."}, headers=headers)
     assert created.status_code == 201
     data = _assert_envelope(created.json(), code=201)
     assert data["name"] == "smoke-app"

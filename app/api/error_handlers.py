@@ -41,9 +41,7 @@ async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) 
     logger.warning("rate_limit_exceeded", path=request.url.path)
     response = JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content=ApiResponse.error(
-            code=status.HTTP_429_TOO_MANY_REQUESTS, message="Rate limit exceeded"
-        ).model_dump(),
+        content=ApiResponse.error(code=status.HTTP_429_TOO_MANY_REQUESTS, message="Rate limit exceeded").model_dump(),
     )
     # Preserve the retry-after / rate-limit headers the original slowapi handler injected.
     view_rate_limit = getattr(request.state, "view_rate_limit", None)

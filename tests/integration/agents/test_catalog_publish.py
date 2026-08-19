@@ -193,9 +193,7 @@ def test_skill_content_refreshed_on_reassembly(
         assert "version-1" in handle.read()
 
     # Update the global skill; the next compile re-materializes the copy.
-    updated = client.patch(
-        f"{API}/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers
-    )
+    updated = client.patch(f"{API}/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers)
     assert updated.status_code == 200, updated.text
 
     # Clear caches to model a restart, then chat again (reassembly path).

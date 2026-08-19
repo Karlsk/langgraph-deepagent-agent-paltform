@@ -241,9 +241,7 @@ class AgentAppCreate(BaseModel):
     )
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     skill_names: list[str] = Field(default_factory=list, description="Names of skill assets bound to this app")
-    subagent_names: list[str] = Field(
-        default_factory=list, description="Names of sub-agent configs bound to this app"
-    )
+    subagent_names: list[str] = Field(default_factory=list, description="Names of sub-agent configs bound to this app")
     interrupt_on: dict[str, bool] = Field(default_factory=dict, description="Interrupt configuration for the engine")
 
 
@@ -266,9 +264,7 @@ class AgentAppUpdate(BaseModel):
     allowed_tools: Optional[list[str]] = Field(default=None, description="Updated tool whitelist")
     model: Optional[str] = Field(default=None, description="Updated LLM model override")
     skill_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound skill names")
-    subagent_names: Optional[list[str]] = Field(
-        default=None, description="Replacement list of bound sub-agent names"
-    )
+    subagent_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound sub-agent names")
     interrupt_on: Optional[dict[str, bool]] = Field(default=None, description="Replacement interrupt configuration")
 
 

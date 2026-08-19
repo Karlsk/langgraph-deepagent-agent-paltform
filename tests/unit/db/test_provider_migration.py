@@ -38,6 +38,7 @@ def _script() -> ScriptDirectory:
 def _upgrade_to(engine: Engine, script: ScriptDirectory, target: str) -> None:
     """Run every pending upgrade step up to ``target`` on the engine."""
     with engine.begin() as conn:
+
         def run(rev: str, context: MigrationContext) -> list:
             return script._upgrade_revs(target, rev)  # noqa: SLF001 — alembic internal step API
 
@@ -51,6 +52,7 @@ def _upgrade_to(engine: Engine, script: ScriptDirectory, target: str) -> None:
 def _downgrade_to(engine: Engine, script: ScriptDirectory, target: str) -> None:
     """Run every pending downgrade step down to ``target`` on the engine."""
     with engine.begin() as conn:
+
         def run(rev: str, context: MigrationContext) -> list:
             return script._downgrade_revs(target, rev)  # noqa: SLF001 — alembic internal step API
 
@@ -125,7 +127,11 @@ def test_upgrade_splits_llm_config_into_provider_and_model(migrated_engine: Engi
         assert provider["enabled"] == 1
         assert provider["deleted"] == 0
         assert provider["created_by"] == "bootstrap"
-        auth_config = json.loads(provider["auth_config"]) if isinstance(provider["auth_config"], str) else provider["auth_config"]
+        auth_config = (
+            json.loads(provider["auth_config"])
+            if isinstance(provider["auth_config"], str)
+            else provider["auth_config"]
+        )
         assert auth_config == {"api_key": "sk-test-1234567890"}
 
         model = conn.execute(sa.text("SELECT * FROM model_config")).mappings().one()
@@ -169,4 +175,7 @@ def test_downgrade_rebuilds_llm_config(migrated_engine: Engine) -> None:
 
         # Asset references stay resolvable under the legacy semantics.
         app_model = conn.execute(sa.text("SELECT model FROM agent_app WHERE name = 'default'")).scalar_one()
-        assert conn.execute(sa.text("SELECT name FROM llm_config WHERE name = :name"), {"name": app_model}).scalar_one() == app_model
+        assert (
+            conn.execute(sa.text("SELECT name FROM llm_config WHERE name = :name"), {"name": app_model}).scalar_one()
+            == app_model
+        )

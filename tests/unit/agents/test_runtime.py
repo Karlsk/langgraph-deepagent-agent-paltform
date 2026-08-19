@@ -208,7 +208,9 @@ def test_ainvoke_success_and_memory_writeback(mock_memory: dict[str, Any], monke
     model = ScriptedChatModel(responses=[AIMessage(content="hello there")])
     rt = _compile_runtime(model, _make_app(), monkeypatch)
 
-    result = asyncio.run(rt.ainvoke([Message(role="user", content="hi")], session_id="s1", user_id="u1", username="ann"))
+    result = asyncio.run(
+        rt.ainvoke([Message(role="user", content="hi")], session_id="s1", user_id="u1", username="ann")
+    )
 
     # Same projection semantics as graph.py: user + assistant messages returned.
     assert [message.role for message in result] == ["user", "assistant"]
@@ -450,7 +452,9 @@ def test_memory_writeback_failure_is_contained_and_tasks_tracked(
     model = ScriptedChatModel(responses=[AIMessage(content="ok")])
     rt = _compile_runtime(model, _make_app(), monkeypatch)
 
-    result = asyncio.run(rt.ainvoke([Message(role="user", content="hi")], session_id="s-f", user_id="u1", username="ann"))
+    result = asyncio.run(
+        rt.ainvoke([Message(role="user", content="hi")], session_id="s-f", user_id="u1", username="ann")
+    )
     assert result[-1].content == "ok"
 
     asyncio.run(_drain_pending())
@@ -663,9 +667,7 @@ def patched_model_bootstrap(monkeypatch: pytest.MonkeyPatch) -> tuple[Provider, 
     first; the fake session cannot serve that lookup, so the seam returns a
     canned pair.
     """
-    provider = Provider(
-        name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-seeded"}
-    )
+    provider = Provider(name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-seeded"})
     provider.id = 1
     model = ModelConfig(provider_id=provider.id, name=DEFAULT_MODEL_NAME, model_id=settings.DEFAULT_LLM_MODEL)
 
@@ -953,9 +955,7 @@ def test_ensure_default_provider_and_model_never_overwrites_existing(
     llm_bootstrap_session: Session, llm_seed_settings: None
 ) -> None:
     """A pre-existing (admin-edited) pair is returned untouched, never reseeded."""
-    edited = Provider(
-        name=DEFAULT_PROVIDER_NAME, type="OPENAI", auth_config={"api_key": "sk-admin-edited"}
-    )
+    edited = Provider(name=DEFAULT_PROVIDER_NAME, type="OPENAI", auth_config={"api_key": "sk-admin-edited"})
     llm_bootstrap_session.add(edited)
     llm_bootstrap_session.commit()
     llm_bootstrap_session.refresh(edited)
@@ -976,9 +976,7 @@ def test_ensure_default_provider_and_model_recovers_from_concurrent_insert(
     llm_bootstrap_session: Session, llm_seed_settings: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An IntegrityError on insert rolls back and adopts the concurrent winner."""
-    winner = Provider(
-        name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-winner"}
-    )
+    winner = Provider(name=DEFAULT_PROVIDER_NAME, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-winner"})
     call_state = {"failed": False}
     real_commit = llm_bootstrap_session.commit
 
@@ -1099,9 +1097,7 @@ def test_load_model_fingerprint_disabled_reference_raises(llm_bootstrap_session:
     llm_bootstrap_session.add(provider)
     llm_bootstrap_session.commit()
     llm_bootstrap_session.refresh(provider)
-    llm_bootstrap_session.add(
-        ModelConfig(provider_id=provider.id, name="locked", model_id="m", enabled=False)
-    )
+    llm_bootstrap_session.add(ModelConfig(provider_id=provider.id, name="locked", model_id="m", enabled=False))
     llm_bootstrap_session.commit()
 
     app_cfg = _make_app(model="frozen/locked")

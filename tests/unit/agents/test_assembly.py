@@ -202,7 +202,9 @@ def _patch_llm_seams(monkeypatch: pytest.MonkeyPatch, models: dict[str, Any]) ->
         provider_name, _, model_name = ref.partition("/")
         provider = Provider(name=provider_name, type="OPENAI_COMPATIBLE", auth_config={"api_key": "sk-test"})
         provider.id = 1
-        model = ModelConfig(provider_id=provider.id, name=model_name or provider_name, model_id=model_name or provider_name)
+        model = ModelConfig(
+            provider_id=provider.id, name=model_name or provider_name, model_id=model_name or provider_name
+        )
         return provider, model
 
     monkeypatch.setattr(assembly, "load_model_config", fake_load)
