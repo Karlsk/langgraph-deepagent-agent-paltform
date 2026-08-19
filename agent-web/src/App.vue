@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   ChatDotRound,
   Connection,
+  Delete,
   Expand,
   Fold,
   FullScreen,
@@ -83,10 +84,17 @@ async function handleLogout(): Promise<void> {
           <el-icon><Connection /></el-icon>
           <template #title>MCP 管理</template>
         </el-menu-item>
-        <el-menu-item index="/llm">
-          <el-icon><Setting /></el-icon>
-          <template #title>模型管理</template>
-        </el-menu-item>
+        <el-sub-menu index="/llm-group">
+          <template #title>
+            <el-icon><Setting /></el-icon>
+            <span>模型管理</span>
+          </template>
+          <el-menu-item index="/llm">活跃提供商</el-menu-item>
+          <el-menu-item index="/llm/trash">
+            <el-icon><Delete /></el-icon>
+            <template #title>回收站</template>
+          </el-menu-item>
+        </el-sub-menu>
       </el-menu>
 
       <div class="app-sidebar__footer">
@@ -227,6 +235,23 @@ async function handleLogout(): Promise<void> {
   transition:
     background var(--duration-base) var(--ease-standard),
     color var(--duration-base) var(--ease-standard);
+}
+
+/* 二级菜单父项：与普通菜单项同款深色主题（含 hover/激活态） */
+.app-nav :deep(.el-sub-menu__title) {
+  color: var(--color-text-on-dark-muted);
+  transition:
+    background var(--duration-base) var(--ease-standard),
+    color var(--duration-base) var(--ease-standard);
+}
+
+.app-nav :deep(.el-sub-menu__title:hover) {
+  background: var(--color-bg-dark-raised);
+  color: var(--color-text-on-dark);
+}
+
+.app-nav :deep(.el-sub-menu.is-active > .el-sub-menu__title) {
+  color: var(--color-text-on-dark);
 }
 
 .app-nav :deep(.el-menu-item:hover) {

@@ -150,6 +150,12 @@ const { apiMock } = vi.hoisted(() => {
 
 vi.mock('@/api/provider', () => apiMock)
 
+/** vue-router mock：ProviderList 的「回收站」按钮走 useRouter().push */
+const routerPushMock = vi.fn()
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push: routerPushMock }),
+}))
+
 const ROWS_KEY = Symbol('table-rows')
 
 /** 渲染默认插槽（列定义）并向列 provide 当前 data，供单元格插槽按行渲染 */
@@ -316,6 +322,7 @@ function mountPage(): VueWrapper {
         ElInput: ElInputStub,
         ElSelect: ElSelectStub,
         ElOption: ElOptionStub,
+        ElIcon: true,
       },
       directives: { loading: () => undefined },
     },
@@ -495,8 +502,8 @@ describe('ProviderList 模型提供商管理页（task-023 真实 API 版）', (
 
     await findRowButton(wrapper, '删除', 0).trigger('click')
     expect(confirmMock).toHaveBeenCalledWith(
-      '确定删除提供商「openai-prod」吗？',
-      '删除确认',
+      '确定软删除提供商「openai-prod」吗？该操作不会物理清除数据，名称仍占用唯一索引；如需重建同名请先到回收站永久清理。',
+      '软删除确认',
       expect.anything(),
     )
     await flushPromises()
@@ -665,5 +672,41 @@ describe('ProviderList 模型提供商管理页（task-023 真实 API 版）', (
     await findRowButton(wrapper, '测试连接', 1).trigger('click')
     await flushPromises()
     expect(apiMock.listProvidersPage).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe('ProviderList 软删除文案与回收站入口（task-4e6 前端适配）', () => {
+  it('操作列删除按钮文案为「软删除」', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    // 按钮文本精确匹配「软删除」而非硬删入口（活跃列表不暴露硬删）
+    expect(findRowButton(wrapper, '软删除', 0).text()).toContain('软删除')
+    expect(wrapper.text()).not.toContain('永久删除')
+  })
+
+  it('软删除确认框文案包含回收站清理引导', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findRowButton(wrapper, '软删除', 0).trigger('click')
+
+    expect(confirmMock).toHaveBeenCalledWith(
+      expect.stringContaining('软删除'),
+      '软删除确认',
+      expect.anything(),
+    )
+    const message = confirmMock.mock.calls[0]?.[0] as string
+    expect(message).toContain('回收站')
+    expect(message).toContain('唯一索引')
+  })
+
+  it('「回收站」按钮跳转 /llm/trash', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '回收站').trigger('click')
+
+    expect(routerPushMock).toHaveBeenCalledWith('/llm/trash')
   })
 })

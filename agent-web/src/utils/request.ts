@@ -70,6 +70,9 @@ function extractErrorMessage(body: unknown, fallback: string): string {
   return fallback
 }
 
+/** 同名冲突错误文案判定：命中时在 422 主提示后追加回收站清理引导 */
+const DUPLICATE_NAME_HINT_RE = /已存在|already exists|exists|taken|唯一/
+
 request.interceptors.response.use(
   (response) => {
     const body: unknown = response.data
@@ -114,6 +117,14 @@ request.interceptors.response.use(
         error.message || '请求失败',
       )
       ElMessage.error(message)
+      // 同名重建引导：422 唯一索引冲突（provider/model 等）时追加回收站提示，
+      // 延迟弹出避免与主错误消息重叠。关键字匹配后端稳定错误文案
+      // （"provider 'x' already exists" / "model 'x' already exists ..."）。
+      if (status === 422 && DUPLICATE_NAME_HINT_RE.test(message)) {
+        setTimeout(() => {
+          ElMessage.error('如名称已被软删占用，可前往「模型管理 → 回收站」永久清理后重建。')
+        }, 200)
+      }
     } else {
       ElMessage.error('请求失败')
     }

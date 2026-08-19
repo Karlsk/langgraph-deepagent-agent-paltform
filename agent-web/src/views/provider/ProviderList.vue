@@ -15,6 +15,8 @@
  */
 import { ref } from 'vue'
 import type { FormRules } from 'element-plus'
+import { Delete } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
 
 import WebAgentFormDialog from '@/components/WebAgentFormDialog.vue'
 import WebAgentTable from '@/components/WebAgentTable.vue'
@@ -78,6 +80,12 @@ async function api(query: PageQuery): Promise<PageResult<ProviderRowWithMeta>> {
   return listProvidersPage(query)
 }
 
+/** 跳转提供商回收站（软删墓碑 + 硬删除逃生口） */
+function goTrash(): void {
+  void router.push('/llm/trash')
+}
+
+const router = useRouter()
 const tableRef = ref<{ refresh: () => void }>()
 const dialogRef = ref<InstanceType<typeof WebAgentFormDialog>>()
 const dialogVisible = ref(false)
@@ -194,11 +202,11 @@ async function handleSubmit(data: Record<string, unknown>): Promise<void> {
 
 function handleDelete(row: ProviderRowWithMeta): void {
   const confirmAndDelete = useConfirm(
-    `确定删除提供商「${row.provider.name}」吗？`,
+    `确定软删除提供商「${row.provider.name}」吗？该操作不会物理清除数据，名称仍占用唯一索引；如需重建同名请先到回收站永久清理。`,
     async () => {
       await deleteProvider(row.provider.name)
     },
-    { title: '删除确认', successMessage: '删除成功' },
+    { title: '软删除确认', successMessage: '已软删除' },
   )
   void confirmAndDelete().then((done) => {
     if (done) tableRef.value?.refresh()
@@ -223,6 +231,10 @@ function healthTooltip(row: ProviderRowWithMeta): string {
         <p class="page-view__desc">集中管理 LLM 提供商的接入凭证与端点配置。</p>
       </div>
       <div class="page-view__actions">
+        <el-button @click="goTrash">
+          <el-icon class="provider-trash-icon"><Delete /></el-icon>
+          <span>回收站</span>
+        </el-button>
         <el-button class="app-btn app-btn--primary" @click="handleCreate">
           新增提供商
         </el-button>
@@ -274,7 +286,7 @@ function healthTooltip(row: ProviderRowWithMeta): string {
             测试连接
           </el-button>
           <el-button link type="danger" size="small" @click="handleDelete(row as ProviderRowWithMeta)">
-            删除
+            软删除
           </el-button>
         </template>
       </WebAgentTable>

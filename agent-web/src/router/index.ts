@@ -60,6 +60,12 @@ const router = createRouter({
       component: () => import('@/views/provider/ProviderList.vue'),
       meta: { title: '模型管理' },
     },
+    {
+      path: '/llm/trash',
+      name: 'llm-trash',
+      component: () => import('@/views/provider/ProviderTrashList.vue'),
+      meta: { title: '提供商回收站' },
+    },
   ],
 })
 

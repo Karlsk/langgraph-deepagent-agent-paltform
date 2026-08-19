@@ -207,3 +207,78 @@ export function deleteProviderModel(name: string, model: string): Promise<null> 
     `/providers/${encodeURIComponent(name)}/models/${encodeURIComponent(model)}`,
   )
 }
+
+// ---------------------------------------------------------------------------
+// Trash（软删墓碑视图 + 硬删除逃生口）
+// ---------------------------------------------------------------------------
+
+/**
+ * 回收站 provider 行（对应后端 _provider_trash_read 投影）。
+ *
+ * 投影物理剔除 auth_config 原始字典，仅暴露 api_key_masked；
+ * deleted 恒为 true（trash 端点只返回软删行）。
+ */
+export interface DeletedProviderRow {
+  id: number
+  name: string
+  type: ProviderType
+  base_url: string
+  api_key_masked: string
+  enabled: boolean
+  deleted: true
+  created_by: string | null
+  created_at: string | null
+  /** 软删时间（墓碑行的 updated_at 即最近一次状态变更） */
+  updated_at: string | null
+}
+
+/** 回收站 model 行：ModelConfigRead 投影 + deleted 墓碑标记 */
+export interface DeletedModelConfigRow extends ModelConfigRow {
+  deleted: boolean
+}
+
+/** 硬删除二次确认头的固定值（与后端 HARD_DELETE_CONFIRM_VALUE 对齐） */
+const HARD_DELETE_CONFIRM_HEADER = 'X-Confirm-Hard-Delete'
+
+/** 回收站 provider 全量列表：GET /providers/deleted — 按 updated_at desc */
+export function listDeletedProviders(): Promise<DeletedProviderRow[]> {
+  return get<DeletedProviderRow[]>('/providers/deleted')
+}
+
+/** 按 name 查回收站行：GET /providers/deleted/{name} — active/未知均 404 */
+export function getDeletedProvider(name: string): Promise<DeletedProviderRow> {
+  return get<DeletedProviderRow>(`/providers/deleted/${encodeURIComponent(name)}`)
+}
+
+/** 回收站 provider 下的 model 清单：GET /providers/deleted/{name}/models（含 deleted 标记） */
+export function listDeletedProviderModels(
+  name: string,
+): Promise<DeletedModelConfigRow[]> {
+  return get<DeletedModelConfigRow[]>(
+    `/providers/deleted/${encodeURIComponent(name)}/models`,
+  )
+}
+
+/**
+ * 硬删 provider 逃生口：DELETE /providers/{name}?hard=true。
+ *
+ * 必须携带 X-Confirm-Hard-Delete: true 头（缺失时后端 422）；
+ * 成功响应 data 为 null（与软删一致），不可逆操作由调用方负责二次确认。
+ */
+export function hardDeleteProvider(name: string): Promise<null> {
+  return del<null>(`/providers/${encodeURIComponent(name)}`, {
+    params: { hard: true },
+    headers: { [HARD_DELETE_CONFIRM_HEADER]: 'true' },
+  })
+}
+
+/** 硬删 model 逃生口：DELETE /providers/{name}/models/{model}?hard=true（同样需要确认头） */
+export function hardDeleteProviderModel(
+  name: string,
+  model: string,
+): Promise<null> {
+  return del<null>(
+    `/providers/${encodeURIComponent(name)}/models/${encodeURIComponent(model)}`,
+    { params: { hard: true }, headers: { [HARD_DELETE_CONFIRM_HEADER]: 'true' } },
+  )
+}

@@ -28,11 +28,24 @@ describe('控制台导航路由', () => {
       { name: 'agent', path: '/agent' },
       { name: 'chat', path: '/chat' },
       { name: 'llm', path: '/llm' },
+      { name: 'llm-trash', path: '/llm/trash' },
       { name: 'login', path: '/login' },
       { name: 'mcp', path: '/mcp' },
       { name: 'register', path: '/register' },
       { name: 'skill', path: '/skill' },
     ])
+  })
+
+  it('回收站路由 /llm/trash 挂载 ProviderTrashList 且受认证守卫保护', async () => {
+    hasSessionMock.mockReturnValue(false)
+    await router.push('/llm/trash')
+    expect(router.currentRoute.value.name).toBe('login')
+    expect(router.currentRoute.value.query.redirect).toBe('/llm/trash')
+
+    hasSessionMock.mockReturnValue(true)
+    await router.push('/llm/trash')
+    expect(router.currentRoute.value.name).toBe('llm-trash')
+    expect(router.currentRoute.value.meta.title).toBe('提供商回收站')
   })
 })
 
