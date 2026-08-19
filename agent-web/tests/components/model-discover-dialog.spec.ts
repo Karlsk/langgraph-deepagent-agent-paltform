@@ -147,7 +147,7 @@ const ElButtonStub = defineComponent({
 const ElDialogStub = defineComponent({
   name: 'ElDialog',
   props: { modelValue: Boolean, title: String, width: String },
-  emits: ['update:modelValue'],
+  emits: ['update:modelValue', 'close'],
   setup(props, { slots }) {
     return () =>
       props.modelValue
@@ -223,6 +223,71 @@ describe('ModelDiscoverDialog 上游发现弹窗', () => {
     expect(wrapper.text()).toContain('deepseek-v4-flash')
     expect(wrapper.text()).toContain('deepseek-v4-pro')
     expect(wrapper.text()).toContain('deepseek-v4-distill')
+  })
+
+  it('关闭后重新打开上游发现：清空上一次拉取结果', async () => {
+    const wrapper = mountDiscoverDialog('deepseek')
+
+    await findButton(wrapper, '拉取上游模型').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('deepseek-v4-flash')
+
+    wrapper.findComponent(ElDialogStub).vm.$emit('close')
+    await flushPromises()
+    const closedTableData = wrapper.findComponent(ElTableStub).props('data') as RemoteModelInfo[]
+    expect(closedTableData).toEqual([])
+
+    await wrapper.setProps({ modelValue: false })
+    await wrapper.setProps({ modelValue: true })
+
+    const tableData = wrapper.findComponent(ElTableStub).props('data') as RemoteModelInfo[]
+    expect(tableData).toEqual([])
+    expect(findButton(wrapper, '创建').attributes('data-disabled')).toBe('true')
+  })
+
+  it('切换 provider：清空旧 provider 的拉取结果', async () => {
+    const wrapper = mountDiscoverDialog('deepseek')
+
+    await findButton(wrapper, '拉取上游模型').trigger('click')
+    await flushPromises()
+    await wrapper.findAll('.select-toggle')[0].trigger('click')
+    await flushPromises()
+    expect(findButton(wrapper, '创建').attributes('data-disabled')).toBe('false')
+
+    await wrapper.setProps({ providerName: 'openai' })
+
+    const tableData = wrapper.findComponent(ElTableStub).props('data') as RemoteModelInfo[]
+    expect(tableData).toEqual([])
+    expect(findButton(wrapper, '创建').attributes('data-disabled')).toBe('true')
+    expect(apiMock.discoverProviderModels).toHaveBeenCalledTimes(1)
+  })
+
+  it('再次拉取：请求开始前立即清空旧结果和选中项', async () => {
+    let resolveSecondFetch: (value: RemoteModelInfo[]) => void = () => undefined
+    apiMock.discoverProviderModels
+      .mockResolvedValueOnce([...CANNED])
+      .mockImplementationOnce(
+        () =>
+          new Promise<RemoteModelInfo[]>((resolve) => {
+            resolveSecondFetch = resolve
+          }),
+      )
+    const wrapper = mountDiscoverDialog('deepseek')
+
+    await findButton(wrapper, '拉取上游模型').trigger('click')
+    await flushPromises()
+    await wrapper.findAll('.select-toggle')[0].trigger('click')
+    await flushPromises()
+
+    await findButton(wrapper, '拉取上游模型').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    const tableData = wrapper.findComponent(ElTableStub).props('data') as RemoteModelInfo[]
+    expect(tableData).toEqual([])
+    expect(findButton(wrapper, '创建').attributes('data-disabled')).toBe('true')
+
+    resolveSecondFetch([])
+    await flushPromises()
   })
 
   it('勾选 2 个模型后点击"创建 2 个"：调 createProviderModel 两次', async () => {

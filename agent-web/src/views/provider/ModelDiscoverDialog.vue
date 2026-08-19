@@ -8,7 +8,7 @@
  * - 部分失败降级：成功 N 失败 M 弹通知；emit 'created' 让父组件刷新；
  * - ANTHROPIC provider 应在父组件禁用入口（"从上游发现"按钮 disabled）。
  */
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 
 import {
   createProviderModel,
@@ -34,15 +34,24 @@ const selectedRows = ref<RemoteModelInfo[]>([])
 const loading = ref(false)
 const creating = ref(false)
 
+function resetResults(): void {
+  models.value = []
+  selectedRows.value = []
+}
+
+watch(
+  [() => props.modelValue, () => props.providerName],
+  () => resetResults(),
+)
+
 async function handleFetch(): Promise<void> {
+  resetResults()
   loading.value = true
   try {
     models.value = await discoverProviderModels(props.providerName)
-    selectedRows.value = []
   } catch {
     // 统一请求层拦截器已提示错误；本地仅清空表格避免遗留状态。
-    models.value = []
-    selectedRows.value = []
+    resetResults()
   } finally {
     loading.value = false
   }
@@ -53,6 +62,7 @@ function handleSelectionChange(rows: RemoteModelInfo[]): void {
 }
 
 function handleClose(): void {
+  resetResults()
   emit('update:modelValue', false)
 }
 
