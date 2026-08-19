@@ -5,7 +5,7 @@ masked form ``api_key_masked`` (``****`` + last four characters) is ever
 returned, mirroring the retired llm-config masking contract.
 """
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -152,6 +152,23 @@ class ConnectionTestResult(BaseModel):
     status: str = Field(..., description="Probe outcome")
     latency_ms: Optional[int] = Field(default=None, description="Round-trip latency of the probe")
     error_message: Optional[str] = Field(default=None, description="Failure reason (None on success)")
+
+
+class RemoteModelInfo(BaseModel):
+    """Single entry of an upstream ``GET /models`` listing (auth-free projection).
+
+    Returned by the on-demand discover endpoint so the UI can offer one
+    selection per model id without echoing auth secrets back.
+
+    Attributes:
+        id: Upstream model identifier (used verbatim as the local model_id)
+        owned_by: Upstream owner tag when present (informational only)
+        raw: Full upstream payload as a dict for future extensibility
+    """
+
+    id: str = Field(..., description="Upstream model identifier (used verbatim as the local model_id)")
+    owned_by: Optional[str] = Field(default=None, description="Upstream owner tag (informational only)")
+    raw: dict[str, Any] = Field(default_factory=dict, description="Full upstream payload as a dict")
 
 
 # ---------------------------------------------------------------------------

@@ -83,11 +83,13 @@ const dialogRef = ref<InstanceType<typeof WebAgentFormDialog>>()
 const dialogVisible = ref(false)
 const editingName = ref<string | null>(null)
 
-/** ProviderModelDialog 状态：保存当前弹窗对应的 provider 名，控制弹窗可见性 */
+/** ProviderModelDialog 状态：保存当前弹窗对应的 provider 名 + 类型，控制弹窗可见性 */
 const modelDialogVisible = ref(false)
 const modelDialogProviderName = ref<string | null>(null)
+const modelDialogProviderType = ref<ProviderType | null>(null)
 function handleManageModels(row: ProviderRowWithMeta): void {
   modelDialogProviderName.value = row.provider.name
+  modelDialogProviderType.value = row.provider.type
   modelDialogVisible.value = true
 }
 
@@ -317,9 +319,10 @@ function healthTooltip(row: ProviderRowWithMeta): string {
     </WebAgentFormDialog>
 
     <ProviderModelDialog
-      v-if="modelDialogProviderName"
+      v-if="modelDialogProviderName && modelDialogProviderType"
       v-model="modelDialogVisible"
       :provider-name="modelDialogProviderName"
+      :provider-type="modelDialogProviderType"
     />
   </div>
 </template>

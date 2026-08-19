@@ -33,6 +33,7 @@ from app.core.limiter import limiter
 from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider, ProviderHealth
 from app.models.session import Session as ChatSession
+from app.schemas.providers import RemoteModelInfo
 from tests.conftest import unwrap
 
 pytestmark = pytest.mark.unit
@@ -498,6 +499,95 @@ def test_provider_test_disabled_422(client: TestClient, db_session: DBSession) -
     """Probing a disabled provider is rejected with 422."""
     _seed_provider(db_session, enabled=False)
     assert client.post("/providers/proxy/test").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Discover upstream models (POST /providers/{name}/discover-models)
+# ---------------------------------------------------------------------------
+
+
+def test_discover_models_returns_envelope_with_rows(
+    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful discovery returns RemoteModelInfo rows inside the envelope."""
+    _seed_provider(db_session)
+    canned = [
+        RemoteModelInfo(id="deepseek-v4-flash", owned_by="deepseek", raw={"id": "deepseek-v4-flash"}),
+        RemoteModelInfo(id="deepseek-v4-pro", owned_by="deepseek", raw={"id": "deepseek-v4-pro"}),
+    ]
+
+    async def fake_discover(_provider: Any) -> list[RemoteModelInfo]:
+        """Stand-in for the real service: return canned rows without any network call."""
+        return canned
+
+    monkeypatch.setattr(providers_module, "discover_remote_models", fake_discover)
+
+    response = client.post("/providers/proxy/discover-models")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 200
+    rows = body["data"]
+    assert [r["id"] for r in rows] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert all(r["owned_by"] == "deepseek" for r in rows)
+    assert all(r["raw"]["id"].startswith("deepseek-v4") for r in rows)
+
+
+def test_discover_models_unknown_provider_404(client: TestClient) -> None:
+    """Discovering models of a missing provider returns 404."""
+    assert client.post("/providers/ghost/discover-models").status_code == 404
+
+
+def test_discover_models_anthropic_returns_422(
+    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ANTHROPIC provider is rejected with 422 (service raises ValueError)."""
+
+    async def fake_discover(_provider: Any) -> list[RemoteModelInfo]:
+        """Simulate the service's ANTHROPIC guard without touching the network."""
+        raise ValueError("provider type 'ANTHROPIC' does not support auto-discovery")
+
+    monkeypatch.setattr(providers_module, "discover_remote_models", fake_discover)
+    _seed_provider(db_session, type="ANTHROPIC")
+
+    response = client.post("/providers/proxy/discover-models")
+    assert response.status_code == 422
+    assert "ANTHROPIC" in response.json()["message"]
+
+
+def test_discover_models_upstream_failure_returns_502(
+    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upstream ConnectionError surfaces as 502 (bad gateway)."""
+
+    async def fake_discover(_provider: Any) -> list[RemoteModelInfo]:
+        """Simulate an upstream failure so the endpoint maps it to 502."""
+        raise ConnectionError("fake upstream DNS failure")
+
+    monkeypatch.setattr(providers_module, "discover_remote_models", fake_discover)
+    _seed_provider(db_session)
+
+    response = client.post("/providers/proxy/discover-models")
+    assert response.status_code == 502
+    assert "upstream call failed" in response.json()["message"]
+    assert "DNS failure" in response.json()["message"]
+
+
+def test_discover_models_handles_disabled_provider(
+    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discovery does not require the provider to be enabled (test endpoint does)."""
+    canned = [RemoteModelInfo(id="m-1", owned_by="vendor", raw={"id": "m-1"})]
+
+    async def fake_discover(_provider: Any) -> list[RemoteModelInfo]:
+        """Return one row so the test verifies the disabled flag is not enforced."""
+        return canned
+
+    monkeypatch.setattr(providers_module, "discover_remote_models", fake_discover)
+    _seed_provider(db_session, enabled=False)
+
+    response = client.post("/providers/proxy/discover-models")
+    assert response.status_code == 200
+    assert [r["id"] for r in response.json()["data"]] == ["m-1"]
 
 
 # ---------------------------------------------------------------------------

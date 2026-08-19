@@ -11,10 +11,11 @@
  * 删除走 useConfirm（与 ProviderList 一致的二次确认语义）；错误由统一请求层
  * 拦截器提示；删除 / 创建 / 编辑 成功后刷新本地 models 数组。
  */
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import type { FormRules } from 'element-plus'
 
 import WebAgentFormDialog from '@/components/WebAgentFormDialog.vue'
+import ModelDiscoverDialog from '@/views/provider/ModelDiscoverDialog.vue'
 import {
   createProviderModel,
   deleteProviderModel,
@@ -22,6 +23,7 @@ import {
   updateProviderModel,
   type ModelConfigRow,
   type ModelConfigCreatePayload,
+  type ProviderType,
 } from '@/api/provider'
 import { useConfirm } from '@/composables/useConfirm'
 import { notifySuccess } from '@/utils/notify'
@@ -29,6 +31,11 @@ import { notifySuccess } from '@/utils/notify'
 const props = defineProps<{
   /** 当前 provider 唯一名称（来自 ProviderList 行） */
   providerName: string
+  /**
+   * Provider 类型：用于"从上游发现"按钮在 ANTHROPIC 时禁用（ANTHROPIC 不支持
+   * 上游 /models 端点）。ProviderList 行已携带该字段，从父组件透传即可。
+   */
+  providerType?: ProviderType
   modelValue: boolean
 }>()
 
@@ -41,6 +48,9 @@ const loading = ref(false)
 const dialogRef = ref<InstanceType<typeof WebAgentFormDialog>>()
 const innerDialogVisible = ref(false)
 const editingName = ref<string | null>(null)
+const discoverVisible = ref(false)
+/** ANTHROPIC provider 不支持上游 /models 端点：禁用以避免 422。 */
+const discoverDisabled = computed(() => props.providerType === 'ANTHROPIC')
 
 interface ModelFormShape {
   name: string
@@ -186,6 +196,13 @@ function handleDelete(row: ModelConfigRow): void {
       <el-button class="app-btn app-btn--primary" :disabled="loading" @click="handleCreate">
         新增模型
       </el-button>
+      <el-button
+        class="app-btn app-btn--secondary"
+        :disabled="loading || discoverDisabled"
+        @click="discoverVisible = true"
+      >
+        从上游发现
+      </el-button>
       <span v-if="loading" class="model-dialog__loading">加载中…</span>
     </div>
 
@@ -262,6 +279,12 @@ function handleDelete(row: ModelConfigRow): void {
         </el-form-item>
       </template>
     </WebAgentFormDialog>
+
+    <ModelDiscoverDialog
+      v-model="discoverVisible"
+      :provider-name="providerName"
+      @created="refresh"
+    />
   </el-dialog>
 </template>
 

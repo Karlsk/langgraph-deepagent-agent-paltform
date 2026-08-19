@@ -58,7 +58,9 @@ from app.schemas.providers import (
     ProviderRead,
     ProviderRowWithMeta,
     ProviderUpdate,
+    RemoteModelInfo,
 )
+from app.services.llm.discovery import discover_remote_models
 from app.services.llm.llm_store import compute_model_config_hash
 
 router = APIRouter()
@@ -597,6 +599,56 @@ async def test_provider_connection(
     except Exception as exc:
         logger.exception("provider_connection_test_failed", name=name)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/providers/{name}/discover-models",
+    response_model=ApiResponse[list[RemoteModelInfo]],
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["provider"][0])
+async def discover_provider_models(
+    request: Request,
+    name: str,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[list[dict[str, Any]]]:
+    """List the upstream ``/models`` of a stored provider (auth-free projection).
+
+    Uses the provider's stored ``auth_config.api_key`` and ``base_url`` to
+    call the upstream. The constructed client is closed in a finally block
+    inside ``discover_remote_models`` so connections never leak.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: Provider unique name.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the projected ``RemoteModelInfo`` rows from the
+        upstream ``GET /models`` call.
+
+    Raises:
+        HTTPException: 404 when missing, 422 when the provider type is in
+            ``UNSUPPORTED_TYPES`` (e.g. ANTHROPIC), 502 when the upstream
+            call fails.
+    """
+    provider = _get_provider(db, name)
+    if provider is None:
+        raise HTTPException(status_code=404, detail=f"provider '{name}' not found")
+
+    try:
+        rows = await discover_remote_models(provider)
+        return ApiResponse.success([row.model_dump() for row in rows])
+    except ValueError as exc:
+        # Unsupported family — synchronous rejection, no network attempted.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("provider_discover_failed", name=name)
+        raise HTTPException(
+            status_code=502,
+            detail=f"upstream call failed: {str(exc)[:300]}",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

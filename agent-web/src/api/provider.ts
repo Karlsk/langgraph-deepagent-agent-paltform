@@ -153,6 +153,20 @@ export function testProviderConnection(name: string): Promise<ConnectionTestResu
   )
 }
 
+/** 上游 /models 条目投影（对应后端 RemoteModelInfo）；ANTHROPIC 端点直接 422 不返回 */
+export interface RemoteModelInfo {
+  id: string
+  owned_by: string | null
+  raw: Record<string, unknown>
+}
+
+/** 从上游发现模型：POST /providers/{name}/discover-models — ANTHROPIC / 上游失败 422/502 */
+export function discoverProviderModels(name: string): Promise<RemoteModelInfo[]> {
+  return post<RemoteModelInfo[]>(
+    `/providers/${encodeURIComponent(name)}/discover-models`,
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Model configs (nested under providers)
 // ---------------------------------------------------------------------------
