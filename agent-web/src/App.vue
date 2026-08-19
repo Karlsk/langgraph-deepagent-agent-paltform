@@ -230,6 +230,11 @@ async function handleLogout(): Promise<void> {
   overflow-y: auto;
 }
 
+/* Element Plus 会给嵌套 el-menu 设置默认白色背景；二级菜单保持与侧边栏同色。 */
+.app-nav :deep(.el-sub-menu .el-menu) {
+  background: var(--color-bg-dark);
+}
+
 .app-nav :deep(.el-menu-item) {
   color: var(--color-text-on-dark-muted);
   transition:
