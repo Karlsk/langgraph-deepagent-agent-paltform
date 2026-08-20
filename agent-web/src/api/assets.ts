@@ -1,6 +1,7 @@
 /**
- * Agent 资产 API 模块：对接后端 5 大资产模块（SubAgents / Skills /
- * AgentApps / MCP Servers / LLM Configs）。
+ * Agent 资产 API 模块：对接后端 4 大资产模块（SubAgents / Skills /
+ * AgentApps / LLM Configs）。MCP Servers 已迁移至 `@/api/mcp`（因含 CRUD +
+ * 调试端点 + stdio manifest 共 10 个接口，独立承载更清晰）。
  *
  * 约定：
  * - 响应信封 {code, message, data} 已由 request.ts 拦截器解包，本模块函数
@@ -50,21 +51,6 @@ export interface AgentAppRow {
   status: 'draft' | 'published'
   published_hash: string | null
   version: number
-  created_by: string | null
-}
-
-/** MCP Server 资产行（对应后端 McpServerRead） */
-export interface McpServerRow {
-  name: string
-  transport: 'stdio' | 'http'
-  command: string | null
-  args: string[]
-  env: Record<string, string>
-  url: string | null
-  headers: Record<string, string>
-  enabled: boolean
-  description: string
-  content_hash: string
   created_by: string | null
 }
 
@@ -197,20 +183,6 @@ export function listAgentApps(): Promise<AgentAppRow[]> {
 /** 分页列表：GET /apps/page */
 export function listAgentAppsPage(query: PageQuery = {}): Promise<PageResult<AgentAppRow>> {
   return get<PageResult<AgentAppRow>>('/apps/page', { params: toParams(query) })
-}
-
-// ---------------------------------------------------------------------------
-// MCP Servers
-// ---------------------------------------------------------------------------
-
-/** 全量列表：GET /mcp-servers */
-export function listMcpServers(): Promise<McpServerRow[]> {
-  return get<McpServerRow[]>('/mcp-servers')
-}
-
-/** 分页列表：GET /mcp-servers/page */
-export function listMcpServersPage(query: PageQuery = {}): Promise<PageResult<McpServerRow>> {
-  return get<PageResult<McpServerRow>>('/mcp-servers/page', { params: toParams(query) })
 }
 
 // ---------------------------------------------------------------------------
