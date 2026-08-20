@@ -70,6 +70,9 @@ services:
     volumes:
       - ./app:/app/app
       - ./logs:/app/logs
+      # stdio MCP manifest directory: drop *.json manifests on the host and
+      # sync them via POST /mcp-servers/stdio-sync (see mcp-servers/README.md)
+      - ./mcp-servers:/app/mcp-servers
     env_file:
       - .env.${APP_ENV:-development}
     environment:

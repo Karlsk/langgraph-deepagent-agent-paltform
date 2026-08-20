@@ -177,6 +177,15 @@ class Settings:
             if part.strip()
         ]
 
+        # MCP pooled session idle TTL (seconds): pooled sessions unused longer
+        # than this are closed on the next acquire. Deliberately below the
+        # adapters' default 300s sse_read_timeout so we recycle first.
+        self.MCP_SESSION_IDLE_TTL = float(os.getenv("MCP_SESSION_IDLE_TTL", "240"))
+
+        # Root directory of stdio MCP manifests (one JSON file per server;
+        # Docker deployments mount ./mcp-servers here and sync via API).
+        self.MCP_STDIO_ROOT = os.getenv("MCP_STDIO_ROOT", "./mcp-servers")
+
         # Logging Configuration
         self.LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -221,6 +230,7 @@ class Settings:
             "skill": ["60 per minute"],
             "agent_app": ["60 per minute"],
             "mcp_server": ["60 per minute"],
+            "mcp_tools_debug": ["30 per minute"],
             "provider": ["60 per minute"],
             "model_config": ["60 per minute"],
             "tools_catalog": ["60 per minute"],

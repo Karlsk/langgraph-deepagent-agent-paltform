@@ -31,3 +31,9 @@ app/sdn/config/sdn_alert_inspection.yaml
 # Frontend
 node_modules/
 *.tsbuildinfo
+
+# MCP stdio manifest directory: only the README is tracked; runtime
+# manifests (*.json) and any helper scripts (*.py) are host-managed and
+# must NOT be committed (see mcp-servers/README.md).
+mcp-servers/*.json
+mcp-servers/*.py
