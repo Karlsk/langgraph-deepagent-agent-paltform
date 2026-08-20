@@ -9,7 +9,7 @@ Asset ``model`` fields reference a model config as ``"<provider>/<model>"``
 ``app.schemas.providers``.
 """
 
-from typing import Literal, Optional, Self
+from typing import Any, Literal, Optional, Self
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic.fields import FieldInfo
@@ -311,40 +311,45 @@ class McpServerCreate(BaseModel):
     """Request model for registering an MCP server.
 
     Transport constraints: stdio requires ``command`` (and forbids ``url``);
-    http requires ``url`` (and forbids ``command``).
+    sse and http require ``url`` (and forbid ``command``).
 
     Attributes:
-        name: Globally unique MCP server name (immutable after creation)
-        transport: Transport backend (stdio|http)
+        name: Globally unique MCP server name (immutable after creation; must
+            not contain ``__`` — the reserved ``{server}__{tool}`` namespace
+            separator)
+        transport: Transport backend (stdio|sse|http)
         command: Executable command for stdio transport
         args: Argument list for the stdio command
         env: Extra environment variables for the stdio process
-        url: Endpoint URL for http transport
-        headers: Extra HTTP headers for http transport
+        url: Endpoint URL for sse/http transports
+        headers: Extra HTTP headers for sse/http transports
         enabled: Whether this server is active at runtime
         description: Human-readable description of the server
     """
 
     name: str = _name_field("Globally unique MCP server name")  # pyright: ignore[reportAssignmentType]
-    transport: Literal["stdio", "http"] = Field(..., description="Transport backend")
+    transport: Literal["stdio", "sse", "http"] = Field(..., description="Transport backend")
     command: Optional[str] = Field(default=None, description="Executable command for stdio transport")
     args: list[str] = Field(default_factory=list, description="Argument list for the stdio command")
     env: dict[str, str] = Field(default_factory=dict, description="Extra environment variables for stdio")
-    url: Optional[str] = Field(default=None, description="Endpoint URL for http transport")
-    headers: dict[str, str] = Field(default_factory=dict, description="Extra HTTP headers for http transport")
+    url: Optional[str] = Field(default=None, description="Endpoint URL for sse/http transports")
+    headers: dict[str, str] = Field(default_factory=dict, description="Extra HTTP headers for sse/http transports")
     enabled: bool = Field(default=True, description="Whether this server is active at runtime")
     description: str = Field(default="", description="Human-readable description of the server")
 
     @model_validator(mode="after")
     def validate_transport_fields(self) -> Self:
-        """Enforce command/url mutual exclusion and presence per transport.
+        """Enforce command/url mutual exclusion, presence and the name policy.
 
         Returns:
             Self: The validated model
 
         Raises:
-            ValueError: If required fields are missing or forbidden for the transport
+            ValueError: If required fields are missing or forbidden for the
+                transport, or the name contains the ``__`` namespace separator.
         """
+        if "__" in self.name:
+            raise ValueError("name must not contain '__' (reserved as the server__tool namespace separator)")
         if self.transport == "stdio":
             if not self.command:
                 raise ValueError("command is required for stdio transport")
@@ -352,9 +357,9 @@ class McpServerCreate(BaseModel):
                 raise ValueError("url must not be set for stdio transport")
         else:
             if not self.url:
-                raise ValueError("url is required for http transport")
+                raise ValueError(f"url is required for {self.transport} transport")
             if self.command is not None:
-                raise ValueError("command must not be set for http transport")
+                raise ValueError(f"command must not be set for {self.transport} transport")
         return self
 
 
@@ -362,22 +367,22 @@ class McpServerUpdate(BaseModel):
     """Partial update model for an MCP server (PATCH semantics; name is immutable).
 
     Attributes:
-        transport: Updated transport backend (stdio|http)
+        transport: Updated transport backend (stdio|sse|http)
         command: Updated executable command for stdio transport
         args: Replacement argument list for the stdio command
         env: Replacement environment variables for the stdio process
-        url: Updated endpoint URL for http transport
-        headers: Replacement HTTP headers for http transport
+        url: Updated endpoint URL for sse/http transports
+        headers: Replacement HTTP headers for sse/http transports
         enabled: Updated active flag
         description: Updated description
     """
 
-    transport: Optional[Literal["stdio", "http"]] = Field(default=None, description="Updated transport backend")
+    transport: Optional[Literal["stdio", "sse", "http"]] = Field(default=None, description="Updated transport backend")
     command: Optional[str] = Field(default=None, description="Updated executable command for stdio transport")
     args: Optional[list[str]] = Field(default=None, description="Replacement argument list for the stdio command")
     env: Optional[dict[str, str]] = Field(default=None, description="Replacement environment variables for stdio")
-    url: Optional[str] = Field(default=None, description="Updated endpoint URL for http transport")
-    headers: Optional[dict[str, str]] = Field(default=None, description="Replacement HTTP headers for http transport")
+    url: Optional[str] = Field(default=None, description="Updated endpoint URL for sse/http transports")
+    headers: Optional[dict[str, str]] = Field(default=None, description="Replacement HTTP headers for sse/http transports")
     enabled: Optional[bool] = Field(default=None, description="Updated active flag")
     description: Optional[str] = Field(default=None, description="Updated description")
 
@@ -400,9 +405,9 @@ class McpServerUpdate(BaseModel):
                 raise ValueError("url must not be set for stdio transport")
         else:
             if not self.url:
-                raise ValueError("url is required for http transport")
+                raise ValueError(f"url is required for {self.transport} transport")
             if self.command is not None:
-                raise ValueError("command must not be set for http transport")
+                raise ValueError(f"command must not be set for {self.transport} transport")
         return self
 
 
@@ -411,12 +416,12 @@ class McpServerRead(BaseModel):
 
     Attributes:
         name: Globally unique MCP server name
-        transport: Transport backend (stdio|http)
+        transport: Transport backend (stdio|sse|http)
         command: Executable command for stdio transport
         args: Argument list for the stdio command
         env: Extra environment variables for the stdio process
-        url: Endpoint URL for http transport
-        headers: Extra HTTP headers for http transport
+        url: Endpoint URL for sse/http transports
+        headers: Extra HTTP headers for sse/http transports
         enabled: Whether this server is active at runtime
         description: Human-readable description of the server
         content_hash: Hash of the effective content (used for publish/versioning)
@@ -424,16 +429,56 @@ class McpServerRead(BaseModel):
     """
 
     name: str = Field(..., description="Globally unique MCP server name")
-    transport: Literal["stdio", "http"] = Field(..., description="Transport backend")
+    transport: Literal["stdio", "sse", "http"] = Field(..., description="Transport backend")
     command: Optional[str] = Field(default=None, description="Executable command for stdio transport")
     args: list[str] = Field(default_factory=list, description="Argument list for the stdio command")
     env: dict[str, str] = Field(default_factory=dict, description="Extra environment variables for stdio")
-    url: Optional[str] = Field(default=None, description="Endpoint URL for http transport")
-    headers: dict[str, str] = Field(default_factory=dict, description="Extra HTTP headers for http transport")
+    url: Optional[str] = Field(default=None, description="Endpoint URL for sse/http transports")
+    headers: dict[str, str] = Field(default_factory=dict, description="Extra HTTP headers for sse/http transports")
     enabled: bool = Field(..., description="Whether this server is active at runtime")
     description: str = Field(default="", description="Human-readable description of the server")
     content_hash: str = Field(..., description="Hash of the effective content")
     created_by: Optional[str] = Field(default=None, description="Audit-only creator identifier")
+
+
+class McpToolInfo(BaseModel):
+    """One tool of an MCP server as returned by the debug listing endpoint.
+
+    Attributes:
+        name: Raw tool name as exposed by the server (un-namespaced)
+        description: Tool description
+        args_schema: JSON schema of the tool arguments
+    """
+
+    name: str = Field(..., description="Raw tool name as exposed by the server")
+    description: str = Field(default="", description="Tool description")
+    args_schema: dict[str, Any] = Field(default_factory=dict, description="JSON schema of the tool arguments")
+
+
+class McpToolCallRequest(BaseModel):
+    """Request model for the MCP tool debug-call endpoint.
+
+    Attributes:
+        tool_name: Raw (un-namespaced) tool name on the target server
+        arguments: Tool arguments validated against the tool schema
+    """
+
+    tool_name: str = Field(..., min_length=1, description="Raw tool name on the target server")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
+
+
+class McpToolCallResult(BaseModel):
+    """Response model for the MCP tool debug-call endpoint.
+
+    Attributes:
+        server: Owning MCP server name
+        tool_name: Raw tool name that was invoked
+        result: Tool output content (string or content-block list)
+    """
+
+    server: str = Field(..., description="Owning MCP server name")
+    tool_name: str = Field(..., description="Raw tool name that was invoked")
+    result: Any = Field(default=None, description="Tool output content")
 
 
 # ---------------------------------------------------------------------------
