@@ -1,4 +1,7 @@
-"""Admin API for MCP server assets (CRUD + security validation) and the tool catalog.
+"""Admin API for MCP server assets and tool operations.
+
+CRUD + security validation, the tool catalog, stdio manifest discovery and
+tool debug endpoints.
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
 every endpoint only authenticates via ``get_current_session`` and records the
@@ -8,22 +11,24 @@ Error semantics: missing resources return 404; name collisions, validation
 failures and dangling tool references return 422; unexpected failures return
 500 after ``logger.exception``. MCP server secrets may only be expressed as
 ``${ENV_VAR}`` placeholders — plaintext secret values are rejected at the
-interface layer.
+interface layer. Debug endpoints surface upstream failures as 502 and
+timeouts as 504.
+
+Transport backends: ``stdio`` (command), ``sse`` and ``http`` (url; ``http``
+is the streamable-http runtime alias). MCP tools are catalogued under the
+``{server}__{tool}`` namespace; collision checks compare namespaced names.
 """
 
-import asyncio
-import os
 import re
 from collections.abc import Mapping
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from pydantic import ValidationError
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
 from app.api.v1.agent_assets_common import (
-    _canonical_sha256,
     _creator,
     _read_patch_body,
     _validate_payload,
@@ -31,6 +36,7 @@ from app.api.v1.agent_assets_common import (
     paginate_by_name,
 )
 from app.api.v1.auth import get_current_session
+from app.core import mcp_client
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
@@ -40,16 +46,25 @@ from app.schemas.agent_apps import (
     McpServerCreate,
     McpServerRead,
     McpServerUpdate,
+    McpToolCallRequest,
+    McpToolCallResult,
+    McpToolInfo,
     ToolCatalogEntry,
 )
 from app.schemas.base import ApiResponse, PageResult
 from app.services.agents.mcp_manager import (
-    build_connection_config,
     build_tool_catalog,
     check_server_tool_collision,
     load_mcp_servers,
     shutdown_mcp_clients,
+    to_spec,
     validate_tool_names,
+)
+from app.services.agents.mcp_stdio_registry import (
+    mcp_content_hash,
+    plan_stdio_sync,
+    sync_stdio_manifests,
+    validate_stdio_command,
 )
 
 router = APIRouter()
@@ -57,17 +72,9 @@ router = APIRouter()
 # Secrets may only be expressed as a single ${ENV_VAR} placeholder.
 _PLACEHOLDER_ONLY_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
-# Probe of a candidate MCP server must not block the management API.
-_MCP_PROBE_TIMEOUT_SECONDS = 30.0
-
-# Shell interpreters are always forbidden as stdio commands (unconditional
-# blacklist; the configurable allowlist lives in settings).
-_SHELL_INTERPRETERS = frozenset(
-    {"sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "cmd", "powershell", "pwsh"}
-)
-# Inline execution modes that turn a trusted interpreter into arbitrary code execution.
-_PYTHON_INLINE_FLAGS = frozenset({"-c", "-m"})
-_NODE_INLINE_FLAGS = frozenset({"-e", "--eval", "-p", "--print"})
+# Debug endpoints must not block the management API; tool execution may be slow.
+_MCP_LIST_TIMEOUT_SECONDS = 30.0
+_MCP_CALL_TIMEOUT_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -77,17 +84,15 @@ _NODE_INLINE_FLAGS = frozenset({"-e", "--eval", "-p", "--print"})
 
 def _mcp_content_hash(cfg: McpServerConfig) -> str:
     """Compute the content hash of the effective MCP server configuration."""
-    return _canonical_sha256(
-        {
-            "transport": cfg.transport,
-            "command": cfg.command,
-            "args": cfg.args,
-            "env": cfg.env,
-            "url": cfg.url,
-            "headers": cfg.headers,
-            "enabled": cfg.enabled,
-            "description": cfg.description,
-        }
+    return mcp_content_hash(
+        transport=cfg.transport,
+        command=cfg.command,
+        args=list(cfg.args),
+        env=dict(cfg.env),
+        url=cfg.url,
+        headers=dict(cfg.headers),
+        enabled=cfg.enabled,
+        description=cfg.description,
     )
 
 
@@ -101,7 +106,7 @@ def _ensure_placeholder_secrets(values: Mapping[str, str], *, section: str, serv
     """Reject plaintext secrets: values must be pure ``${ENV_VAR}`` placeholders.
 
     Args:
-        values: The env (stdio) or headers (http) mapping to validate.
+        values: The env (stdio) or headers (sse/http) mapping to validate.
         section: Config section name used in the error detail.
         server_name: Owning MCP server name (logging context).
 
@@ -121,9 +126,9 @@ def _validate_transport_pairing(transport: str, command: str | None, url: str | 
     """Validate the merged transport/command/url combination of an MCP server.
 
     Args:
-        transport: Effective transport backend (stdio|http).
+        transport: Effective transport backend (stdio|sse|http).
         command: Effective stdio command.
-        url: Effective http endpoint URL.
+        url: Effective sse/http endpoint URL.
 
     Raises:
         HTTPException: 422 when required fields are missing or forbidden.
@@ -135,79 +140,30 @@ def _validate_transport_pairing(transport: str, command: str | None, url: str | 
             raise HTTPException(status_code=422, detail="url must not be set for stdio transport")
         return
     if not url:
-        raise HTTPException(status_code=422, detail="url is required for http transport")
+        raise HTTPException(status_code=422, detail=f"url is required for {transport} transport")
     if command is not None:
-        raise HTTPException(status_code=422, detail="command must not be set for http transport")
+        raise HTTPException(status_code=422, detail=f"command must not be set for {transport} transport")
 
 
 def _validate_stdio_command(command: str, args: list[str], server_name: str) -> None:
-    """Constrain the stdio command surface (phase-1 shared deployment, no isolation).
-
-    Rejects shell interpreters outright, requires the executable basename to be
-    in ``settings.MCP_STDIO_ALLOWED_COMMANDS``, and forbids inline execution
-    modes (``python -c/-m``, ``node -e/--eval``) that amount to arbitrary code.
-
-    Args:
-        command: The stdio executable.
-        args: The argument list passed to the executable.
-        server_name: Owning MCP server name (logging context).
+    """Constrain the stdio command surface (policy shared with manifest sync).
 
     Raises:
         HTTPException: 422 when the command or its inline mode is forbidden.
     """
-    base = os.path.basename(command.strip()).lower()
-    if base.endswith(".exe"):
-        base = base.removesuffix(".exe")
-    if base in _SHELL_INTERPRETERS:
-        logger.warning("mcp_stdio_command_rejected", server=server_name, reason="shell_interpreter", command=base)
-        raise HTTPException(status_code=422, detail=f"stdio command '{base}' is a forbidden shell interpreter")
-    allowlist = {name.lower() for name in settings.MCP_STDIO_ALLOWED_COMMANDS}
-    if base not in allowlist:
-        logger.warning("mcp_stdio_command_rejected", server=server_name, reason="not_allowlisted", command=base)
-        raise HTTPException(
-            status_code=422,
-            detail=f"stdio command '{base}' is not in MCP_STDIO_ALLOWED_COMMANDS ({', '.join(sorted(allowlist))})",
-        )
-    if base.startswith("python") and any(arg in _PYTHON_INLINE_FLAGS for arg in args):
-        logger.warning("mcp_stdio_command_rejected", server=server_name, reason="inline_execution", command=base)
-        raise HTTPException(status_code=422, detail="stdio args must not use inline execution modes (-c/-m)")
-    if base == "node" and any(arg in _NODE_INLINE_FLAGS for arg in args):
-        logger.warning("mcp_stdio_command_rejected", server=server_name, reason="inline_execution", command=base)
-        raise HTTPException(status_code=422, detail="stdio args must not use inline execution modes (-e/--eval)")
-
-
-async def _probe_server_tool_names(server: McpServerConfig) -> list[str] | None:
-    """Load the tool names of a candidate server via an ephemeral client.
-
-    Used for fail-fast collision validation before the configuration is
-    persisted. Probe failures and timeouts (``_MCP_PROBE_TIMEOUT_SECONDS``)
-    degrade to ``None`` (skip the collision check), mirroring mcp_manager's
-    per-server degradation policy.
-
-    Args:
-        server: Candidate (possibly unpersisted) MCP server configuration.
-
-    Returns:
-        The tool names exposed by the server, or None when they could not be
-        loaded (excluded config, connection failure or timeout).
-    """
-    connection = build_connection_config(server)
-    if connection is None:
-        return None
-
-    async def _load() -> list[str]:
-        client = MultiServerMCPClient({server.name: connection})
-        tools = await client.get_tools()
-        return [tool.name for tool in tools]
-
     try:
-        return await asyncio.wait_for(_load(), timeout=_MCP_PROBE_TIMEOUT_SECONDS)
-    except TimeoutError:
-        logger.warning("mcp_server_tool_probe_timeout", server=server.name, timeout_seconds=_MCP_PROBE_TIMEOUT_SECONDS)
-        return None
-    except Exception:  # noqa: BLE001 — probe degradation must not block CRUD
-        logger.exception("mcp_server_tool_probe_failed", server=server.name)
-        return None
+        validate_stdio_command(command, args)
+    except ValueError as exc:
+        logger.warning("mcp_stdio_command_rejected", server=server_name, command=command, error=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _get_server_or_404(db: DBSession, name: str) -> McpServerConfig:
+    """Fetch one MCP server row or raise 404."""
+    server = db.get(McpServerConfig, name)
+    if server is None:
+        raise HTTPException(status_code=404, detail=f"mcp server '{name}' not found")
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +234,74 @@ async def list_mcp_servers_page(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/mcp-servers/stdio-manifests", response_model=ApiResponse[dict[str, Any]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
+async def preview_stdio_manifests(
+    request: Request,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """Dry-run the stdio manifest directory sync (no writes, no probes).
+
+    Literal path registered before ``/mcp-servers/{name}`` so it is never
+    captured as a server name.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the planned create/update/unchanged/skip report.
+    """
+    try:
+        return ApiResponse.success(plan_stdio_sync(db))
+    except Exception as exc:
+        logger.exception("mcp_stdio_manifests_preview_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/mcp-servers/stdio-sync", response_model=ApiResponse[dict[str, Any]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
+async def apply_stdio_sync(
+    request: Request,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """Execute the stdio manifest directory sync (upsert by name).
+
+    New servers are probed and collision-checked; failures skip that server
+    and are recorded in the report. Pooled MCP sessions are invalidated when
+    anything changed.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the executed sync report.
+    """
+    try:
+        report = await sync_stdio_manifests(db)
+        db.commit()
+        if report["created"] or report["updated"]:
+            await shutdown_mcp_clients()
+        logger.info(
+            "mcp_stdio_sync_completed",
+            created=len(report["created"]),
+            updated=len(report["updated"]),
+            skipped=len(report["skipped"]),
+            invalid=len(report["invalid"]),
+        )
+        return ApiResponse.success(report)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("mcp_stdio_sync_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/mcp-servers", response_model=ApiResponse[McpServerRead], status_code=201)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_server"][0])
 async def create_mcp_server(
@@ -325,10 +349,11 @@ async def create_mcp_server(
         )
         server.content_hash = _mcp_content_hash(server)
 
-        tool_names = await _probe_server_tool_names(server)
-        if tool_names:
+        raw_tool_names = await mcp_client.probe_tools(to_spec(server), _MCP_LIST_TIMEOUT_SECONDS)
+        if raw_tool_names:
+            namespaced = [mcp_client.namespaced_tool_name(payload.name, name) for name in raw_tool_names]
             try:
-                await check_server_tool_collision(db, tool_names)
+                await check_server_tool_collision(db, namespaced)
             except ValueError as exc:
                 logger.warning("mcp_server_collision_rejected", name=payload.name, error=str(exc))
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -369,10 +394,7 @@ async def get_mcp_server(
         HTTPException: 404 when the MCP server does not exist.
     """
     try:
-        server = db.get(McpServerConfig, name)
-        if server is None:
-            raise HTTPException(status_code=404, detail=f"mcp server '{name}' not found")
-        return ApiResponse.success(server)
+        return ApiResponse.success(_get_server_or_404(db, name))
     except HTTPException:
         raise
     except Exception as exc:
@@ -453,12 +475,13 @@ async def update_mcp_server(
         )
         candidate.content_hash = _mcp_content_hash(candidate)
 
-        tool_names = await _probe_server_tool_names(candidate)
-        if tool_names:
+        raw_tool_names = await mcp_client.probe_tools(to_spec(candidate), _MCP_LIST_TIMEOUT_SECONDS)
+        if raw_tool_names:
+            namespaced = [mcp_client.namespaced_tool_name(name, tool_name) for tool_name in raw_tool_names]
             catalog = await build_tool_catalog(db)
             other_names = [entry["name"] for entry in catalog if entry.get("server") != name]
             try:
-                validate_tool_names(other_names, tool_names)
+                validate_tool_names(other_names, namespaced)
             except ValueError as exc:
                 logger.warning("mcp_server_collision_rejected", name=name, error=str(exc))
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -508,9 +531,7 @@ async def delete_mcp_server(
         HTTPException: 404 when the MCP server does not exist.
     """
     try:
-        server = db.get(McpServerConfig, name)
-        if server is None:
-            raise HTTPException(status_code=404, detail=f"mcp server '{name}' not found")
+        server = _get_server_or_404(db, name)
         db.delete(server)
         db.commit()
         await shutdown_mcp_clients()
@@ -520,6 +541,108 @@ async def delete_mcp_server(
         raise
     except Exception as exc:
         logger.exception("mcp_server_delete_failed", name=name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Tool debug endpoints (live inspection; never touch the pooled sessions)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/mcp-servers/{name}/tools", response_model=ApiResponse[list[McpToolInfo]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_tools_debug"][0])
+async def list_mcp_server_tools(
+    request: Request,
+    name: str,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """Live-list the current tools of one MCP server via an ephemeral session.
+
+    Reads the server's up-to-date tool list (cache bypass); disabled servers
+    are listable too (read-only debugging).
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: MCP server primary key.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying raw tool names, descriptions and JSON schemas.
+
+    Raises:
+        HTTPException: 404 unknown server; 422 unresolved config; 502
+            upstream failure; 504 listing timeout.
+    """
+    try:
+        server = _get_server_or_404(db, name)
+        try:
+            summaries = await mcp_client.list_tools(to_spec(server), _MCP_LIST_TIMEOUT_SECONDS)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=f"mcp server '{name}' timed out listing tools") from exc
+        except mcp_client.MCPUpstreamError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return ApiResponse.success(
+            [
+                McpToolInfo(name=summary.name, description=summary.description, args_schema=summary.args_schema)
+                for summary in summaries
+            ]
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("mcp_server_tools_list_failed", name=name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/mcp-servers/{name}/call-tool", response_model=ApiResponse[McpToolCallResult])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["mcp_tools_debug"][0])
+async def call_mcp_server_tool(
+    request: Request,
+    name: str,
+    payload: McpToolCallRequest,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """Invoke one tool of an MCP server via an ephemeral session (debug).
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: MCP server primary key.
+        payload: Raw tool name and arguments.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the tool output content.
+
+    Raises:
+        HTTPException: 404 unknown server; 422 unknown tool or missing
+            required arguments (client-side guards; type validation stays
+            authoritative on the server); 502 tool/server failure; 504 call
+            timeout.
+    """
+    try:
+        server = _get_server_or_404(db, name)
+        try:
+            result = await mcp_client.call_tool(
+                to_spec(server), payload.tool_name, payload.arguments, _MCP_CALL_TIMEOUT_SECONDS
+            )
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=f"mcp tool '{payload.tool_name}' timed out") from exc
+        except mcp_client.MCPUpstreamError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.info("mcp_tool_debug_called", server=name, tool=payload.tool_name)
+        return ApiResponse.success(McpToolCallResult(server=name, tool_name=payload.tool_name, result=result))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("mcp_server_tool_call_failed", name=name, tool=payload.tool_name)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
