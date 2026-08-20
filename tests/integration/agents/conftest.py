@@ -8,8 +8,9 @@ Zero real network / zero real LLM / zero real MCP by construction:
 - LLM calls are served by scripted ``BaseChatModel`` substitutes (every
   replayed AIMessage gets a fresh id so the deepagents messages reducer
   never deduplicates);
-- MCP clients are a fake ``MultiServerMCPClient`` returning constructed
-  ``BaseTool`` instances;
+- MCP sessions are in-memory fakes at the core adapter seam
+  (``create_session`` / ``load_mcp_tools``) returning constructed
+  ``BaseTool`` instances, registered per server via the ``fake_mcp`` fixture;
 - the checkpointer is a shared in-memory ``MemorySaver``.
 """
 
@@ -39,8 +40,8 @@ from app.api.error_handlers import (
     validation_exception_handler,
 )
 from app.api.v1 import auth as auth_module
-from app.api.v1 import mcp_servers as mcp_servers_module
 from app.api.v1.api import api_router
+from app.core import mcp_client
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
@@ -97,7 +98,7 @@ class ScriptedChatModel(BaseChatModel):
 
 
 # ---------------------------------------------------------------------------
-# Fake MCP client
+# Fake MCP adapter seam (core layer)
 # ---------------------------------------------------------------------------
 
 
@@ -106,28 +107,55 @@ def make_mcp_tool(name: str, reply: str = "mcp-ok") -> StructuredTool:
     return StructuredTool.from_function(func=lambda: reply, name=name, description=f"fake mcp tool {name}")
 
 
-class FakeMcpClient:
-    """In-process stand-in for MultiServerMCPClient (zero real connections).
+class FakeMcpState:
+    """Per-test registry of the fake MCP adapter seam.
 
-    The per-server tool list is served from the class-level ``tools_by_server``
-    registry keyed by the single server name of the connection mapping.
+    ``tools_by_server`` maps server names to raw (un-namespaced) tool lists;
+    ``fail_servers`` marks servers whose session open/load always fails (the
+    core layer retries three times, then degrades that server).
     """
 
     tools_by_server: dict[str, list[Any]] = {}
     fail_servers: set[str] = set()
 
-    def __init__(self, connections: dict[str, Any]) -> None:
-        """Store the connection mapping exactly like the real client."""
-        self.connections = connections
 
-    async def get_tools(self) -> list[Any]:
-        """Serve the registered fake tools of every connected server."""
-        tools: list[Any] = []
-        for server_name in self.connections:
-            if server_name in self.fail_servers:
-                raise ConnectionError(f"fake mcp connection failed for {server_name}")
-            tools.extend(self.tools_by_server.get(server_name, []))
-        return tools
+class _FakeMcpSession:
+    """In-process stand-in for an mcp.ClientSession."""
+
+    def __init__(self, connection: dict[str, Any]) -> None:
+        """Store the connection the session was opened for."""
+        self.connection = connection
+
+    async def initialize(self) -> None:
+        """Initialization is a no-op."""
+        return None
+
+
+class _FakeMcpSessionCM:
+    """Async-context-manager stand-in for create_session."""
+
+    def __init__(self, connection: dict[str, Any]) -> None:
+        """Create the fake session for the requested connection."""
+        self.session = _FakeMcpSession(connection)
+
+    async def __aenter__(self) -> _FakeMcpSession:
+        """Return the wrapped fake session."""
+        return self.session
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        """Teardown is a no-op; never suppress exceptions."""
+        return False
+
+
+async def _fake_load_mcp_tools(
+    session: Any, server_name: str | None = None, handle_tool_errors: bool = True
+) -> list[Any]:
+    """Serve the registered fake tools of one server (or fail the open)."""
+    del session, handle_tool_errors
+    assert server_name is not None
+    if server_name in FakeMcpState.fail_servers:
+        raise ConnectionError(f"fake mcp connection failed for {server_name}")
+    return list(FakeMcpState.tools_by_server.get(server_name, []))
 
 
 # ---------------------------------------------------------------------------
@@ -254,16 +282,20 @@ def scripted_model(monkeypatch: pytest.MonkeyPatch) -> ScriptedChatModel:
 
 @pytest.fixture(autouse=True)
 def fake_mcp(monkeypatch: pytest.MonkeyPatch) -> Generator[dict[str, list[Any]], None, None]:
-    """Route every MCP client construction through FakeMcpClient."""
-    tools_by_server: dict[str, list[Any]] = {}
-    FakeMcpClient.tools_by_server = tools_by_server
-    FakeMcpClient.fail_servers = set()
-    monkeypatch.setattr(mcp_manager, "MultiServerMCPClient", FakeMcpClient)
-    monkeypatch.setattr(mcp_servers_module, "MultiServerMCPClient", FakeMcpClient)
-    yield tools_by_server
-    mcp_manager._clients.clear()  # noqa: SLF001 — process cache hygiene
-    mcp_manager._server_hashes.clear()  # noqa: SLF001
-    mcp_manager._tool_cache.clear()  # noqa: SLF001
+    """Route every MCP session through the in-memory adapter fakes."""
+    FakeMcpState.tools_by_server = {}
+    FakeMcpState.fail_servers = set()
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(mcp_client, "create_session", lambda connection: _FakeMcpSessionCM(connection))
+    monkeypatch.setattr(mcp_client, "load_mcp_tools", _fake_load_mcp_tools)
+    monkeypatch.setattr(mcp_client, "_retry_sleep", _no_sleep)
+    yield FakeMcpState.tools_by_server
+    mcp_client._sessions.clear()  # noqa: SLF001 — process cache hygiene
+    mcp_client._server_hashes.clear()  # noqa: SLF001
+    mcp_client._locks.clear()  # noqa: SLF001
     mcp_manager._catalog_cache.clear()  # noqa: SLF001
 
 
@@ -373,7 +405,7 @@ async def create_chat_session(client: TestClient, headers: dict[str, str], agent
 
 
 __all__ = [
-    "FakeMcpClient",
+    "FakeMcpState",
     "ScriptedChatModel",
     "assert_error_envelope",
     "collect_stream",

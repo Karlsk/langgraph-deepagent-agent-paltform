@@ -17,14 +17,14 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
+from app.core import mcp_client
 from app.core.cache import cache_service
 from app.core.config import settings
 from app.models.agent_assets import AgentApp, McpServerConfig
-from app.services.agents import mcp_manager
 from app.services.agents import runtime as runtime_module
 from app.services.memory import memory_service
 
-from .conftest import FakeMcpClient
+from .conftest import FakeMcpState
 
 pytestmark = pytest.mark.integration
 
@@ -42,7 +42,7 @@ def test_lifespan_warmup_degrades_without_external_services(
     async def instant_sleep(seconds: float) -> None:
         """Skip tenacity backoff waits so the failing server degrades fast."""
 
-    monkeypatch.setattr(mcp_manager, "_retry_sleep", instant_sleep)
+    monkeypatch.setattr(mcp_client, "_retry_sleep", instant_sleep)
 
     async def no_checkpointer() -> None:
         return None
@@ -56,7 +56,7 @@ def test_lifespan_warmup_degrades_without_external_services(
     with DBSession(db_engine) as db_session:
         db_session.add(broken)
         db_session.commit()
-    FakeMcpClient.fail_servers = {"broken-server"}
+    FakeMcpState.fail_servers = {"broken-server"}
 
     # Import (or reuse) the real application; the module-level langfuse init
     # already observed LANGFUSE_TRACING_ENABLED=False from settings isolation.

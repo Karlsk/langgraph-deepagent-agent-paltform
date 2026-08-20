@@ -33,19 +33,18 @@ from app.api.v1 import mcp_servers as mcp_servers_module
 from app.api.v1 import skills as skills_module
 from app.api.v1 import subagents as subagents_module
 from app.api.v1 import auth as auth_module
+from app.core import mcp_client
 from app.core.config import settings
 from app.core.limiter import limiter
-from app.models.agent_assets import McpServerConfig
+from app.core.mcp_client import MCPUpstreamError, ToolSummary
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.models.session import Session as ChatSession
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents import skills_store
+from pydantic import ValidationError
 from tests.conftest import unwrap
 
 pytestmark = pytest.mark.unit
-
-# Real probe implementation captured before autouse fixtures stub it out.
-_REAL_PROBE_SERVER_TOOL_NAMES = mcp_servers_module._probe_server_tool_names
 
 BUILTIN_CATALOG: list[dict[str, Any]] = [
     {"name": "duckduckgo_results_json", "source": "builtin"},
@@ -116,9 +115,9 @@ def quiet_shutdown(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture(autouse=True)
 def probe_tools(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    """Stub the candidate MCP server tool probe (zero real connections)."""
+    """Stub the core-layer MCP tool probe (zero real connections)."""
     probe = AsyncMock(return_value=[])
-    monkeypatch.setattr(mcp_servers_module, "_probe_server_tool_names", probe)
+    monkeypatch.setattr(mcp_client, "probe_tools", probe)
     return probe
 
 
@@ -770,31 +769,6 @@ def test_create_mcp_server_plaintext_headers_rejected(client: TestClient) -> Non
     assert unwrap(ok, expected_code=201)["headers"] == {"Authorization": "${MCP_AUTH}"}
 
 
-def test_probe_server_tool_names_timeout_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A probe exceeding the timeout degrades to None instead of hanging."""
-    import asyncio
-
-    class SlowClient:
-        def __init__(self, connections: Any) -> None:
-            pass
-
-        async def get_tools(self) -> list[Any]:
-            await asyncio.sleep(5)
-            return []
-
-    monkeypatch.setattr(mcp_servers_module, "MultiServerMCPClient", SlowClient)
-    monkeypatch.setattr(mcp_servers_module, "_MCP_PROBE_TIMEOUT_SECONDS", 0.01)
-    server = McpServerConfig(
-        name="slow",
-        transport="stdio",
-        command="uvx",
-        args=[],
-        env={},
-        content_hash="x",
-    )
-    assert asyncio.run(_REAL_PROBE_SERVER_TOOL_NAMES(server)) is None
-
-
 def test_create_mcp_server_tool_collision_rejected(
     client: TestClient, probe_tools: AsyncMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -899,6 +873,247 @@ def test_delete_mcp_server_removes_row_and_invalidates_cache(client: TestClient,
     assert client.get("/mcp-servers/fs-server").status_code == 404
     assert client.delete("/mcp-servers/fs-server").status_code == 404
     quiet_shutdown.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# sse transport + namespace-reserved name policy
+# ---------------------------------------------------------------------------
+
+
+def test_create_mcp_server_sse_returns_201(client: TestClient) -> None:
+    """An sse server registers with url + placeholder-only headers."""
+    response = client.post(
+        "/mcp-servers",
+        json=_mcp_body(
+            name="events",
+            transport="sse",
+            command=None,
+            url="https://events.example.com/sse",
+            headers={"Authorization": "${MCP_AUTH}"},
+        ),
+    )
+    assert response.status_code == 201
+    payload = unwrap(response, expected_code=201)
+    assert payload["transport"] == "sse"
+    assert payload["url"] == "https://events.example.com/sse"
+    assert payload["headers"] == {"Authorization": "${MCP_AUTH}"}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"transport": "sse", "command": None},  # missing url
+        {"transport": "sse", "command": "uvx", "url": "https://events.example.com/sse"},  # command forbidden
+    ],
+)
+def test_create_mcp_server_sse_pairing_violations_rejected(client: TestClient, overrides: dict[str, Any]) -> None:
+    """Sse without url or with command is rejected with 422."""
+    response = client.post("/mcp-servers", json=_mcp_body(name="events", **overrides))
+    assert response.status_code == 422
+
+
+def test_create_mcp_server_name_with_namespace_separator_rejected(client: TestClient) -> None:
+    """Names containing '__' are rejected so {server}__{tool} stays parseable."""
+    response = client.post("/mcp-servers", json=_mcp_body(name="bad__name"))
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Router order: literal paths must precede /mcp-servers/{name}
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_router_registers_literal_paths_before_parametrized_name() -> None:
+    """stdio-manifests / stdio-sync must never be captured as a server name."""
+    paths = [route.path for route in mcp_servers_module.router.routes]
+    literal = {"/mcp-servers/page", "/mcp-servers/stdio-manifests", "/mcp-servers/stdio-sync"}
+    parametrized_index = paths.index("/mcp-servers/{name}")
+    for path in literal:
+        assert paths.index(path) < parametrized_index
+
+
+# ---------------------------------------------------------------------------
+# stdio manifest discovery endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_stdio_manifests_preview_returns_dry_run_report(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /mcp-servers/stdio-manifests returns the plan without writing."""
+    report = {
+        "scanned": 2,
+        "created": ["weather"],
+        "updated": [],
+        "unchanged": ["stub"],
+        "skipped": [],
+        "invalid": [{"file": "broken.json", "reason": "bad json"}],
+    }
+
+    def fake_plan(db: Any) -> dict[str, Any]:
+        del db
+        return report
+
+    monkeypatch.setattr(mcp_servers_module, "plan_stdio_sync", fake_plan)
+
+    response = client.get("/mcp-servers/stdio-manifests")
+
+    assert response.status_code == 200
+    assert unwrap(response) == report
+
+
+def test_stdio_sync_applies_report_and_invalidates_cache_on_change(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, quiet_shutdown: AsyncMock
+) -> None:
+    """POST /mcp-servers/stdio-sync commits the report and refreshes caches."""
+    report = {"scanned": 1, "created": ["weather"], "updated": [], "unchanged": [], "skipped": [], "invalid": []}
+
+    async def fake_sync(db: Any) -> dict[str, Any]:
+        del db
+        return report
+
+    monkeypatch.setattr(mcp_servers_module, "sync_stdio_manifests", fake_sync)
+
+    response = client.post("/mcp-servers/stdio-sync")
+
+    assert response.status_code == 200
+    assert unwrap(response) == report
+    quiet_shutdown.assert_awaited_once()
+
+
+def test_stdio_sync_without_changes_keeps_caches(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, quiet_shutdown: AsyncMock
+) -> None:
+    """A no-op sync does not invalidate the pooled sessions."""
+    report = {"scanned": 1, "created": [], "updated": [], "unchanged": ["weather"], "skipped": [], "invalid": []}
+
+    async def fake_sync(db: Any) -> dict[str, Any]:
+        del db
+        return report
+
+    monkeypatch.setattr(mcp_servers_module, "sync_stdio_manifests", fake_sync)
+
+    assert client.post("/mcp-servers/stdio-sync").status_code == 200
+    quiet_shutdown.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tool debug endpoints (ephemeral sessions; explicit error semantics)
+# ---------------------------------------------------------------------------
+
+
+def _seed_sse_server(client: TestClient) -> None:
+    """Register one sse server row for the debug endpoint tests."""
+    client.post(
+        "/mcp-servers",
+        json=_mcp_body(name="events", transport="sse", command=None, url="https://events.example.com/sse"),
+    )
+
+
+def test_list_mcp_server_tools_returns_live_summaries(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /mcp-servers/{name}/tools returns raw tool names, descriptions, schemas."""
+    _seed_sse_server(client)
+
+    async def fake_list(spec: Any, timeout: float) -> list[ToolSummary]:
+        del spec, timeout
+        return [ToolSummary(name="subscribe", description="Subscribe to a feed", args_schema={"type": "object"})]
+
+    monkeypatch.setattr(mcp_client, "list_tools", fake_list)
+
+    response = client.get("/mcp-servers/events/tools")
+
+    assert response.status_code == 200
+    assert unwrap(response) == [
+        {"name": "subscribe", "description": "Subscribe to a feed", "args_schema": {"type": "object"}}
+    ]
+
+
+def test_list_mcp_server_tools_unknown_server_404(client: TestClient) -> None:
+    """Listing tools of a missing server returns 404."""
+    assert client.get("/mcp-servers/ghost/tools").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (ValueError("unresolved ${ENV_VAR}"), 422),
+        (MCPUpstreamError("boom"), 502),
+        (TimeoutError(), 504),
+    ],
+)
+def test_list_mcp_server_tools_error_mapping(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected: int,
+) -> None:
+    """Excluded config / upstream failure / timeout map to 422 / 502 / 504."""
+    _seed_sse_server(client)
+
+    async def fake_list(spec: Any, timeout: float) -> list[ToolSummary]:
+        del spec, timeout
+        raise error
+
+    monkeypatch.setattr(mcp_client, "list_tools", fake_list)
+
+    assert client.get("/mcp-servers/events/tools").status_code == expected
+
+
+def test_call_mcp_server_tool_returns_result(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /mcp-servers/{name}/call-tool returns the tool output content."""
+    _seed_sse_server(client)
+
+    async def fake_call(spec: Any, tool_name: str, arguments: dict[str, Any], timeout: float) -> str:
+        del spec, timeout
+        return f"{tool_name}:{arguments.get('topic')}"
+
+    monkeypatch.setattr(mcp_client, "call_tool", fake_call)
+
+    response = client.post(
+        "/mcp-servers/events/call-tool",
+        json={"tool_name": "subscribe", "arguments": {"topic": "news"}},
+    )
+
+    assert response.status_code == 200
+    assert unwrap(response) == {"server": "events", "tool_name": "subscribe", "result": "subscribe:news"}
+
+
+def test_call_mcp_server_tool_unknown_server_404(client: TestClient) -> None:
+    """Calling a tool of a missing server returns 404."""
+    assert (
+        client.post("/mcp-servers/ghost/call-tool", json={"tool_name": "x", "arguments": {}}).status_code == 404
+    )
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (ValueError("unknown tool 'nope'"), 422),
+        (ValidationError.from_exception_data("title", []), 422),
+        (MCPUpstreamError("boom"), 502),
+        (TimeoutError(), 504),
+    ],
+)
+def test_call_mcp_server_tool_error_mapping(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected: int,
+) -> None:
+    """Unknown tool / invalid args / upstream failure / timeout map to 422/422/502/504."""
+    _seed_sse_server(client)
+
+    async def fake_call(spec: Any, tool_name: str, arguments: dict[str, Any], timeout: float) -> str:
+        del spec, tool_name, arguments, timeout
+        raise error
+
+    monkeypatch.setattr(mcp_client, "call_tool", fake_call)
+
+    response = client.post("/mcp-servers/events/call-tool", json={"tool_name": "x", "arguments": {}})
+
+    assert response.status_code == expected
 
 
 # ---------------------------------------------------------------------------

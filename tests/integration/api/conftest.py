@@ -31,13 +31,12 @@ from app.api.error_handlers import (
     validation_exception_handler,
 )
 from app.api.v1 import auth as auth_module
-from app.api.v1 import mcp_servers as mcp_servers_module
 from app.api.v1.api import api_router
+from app.core import mcp_client
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.models.user import User
-from app.services.agents import mcp_manager
 from app.services.database import database_service
 from app.services.memory import memory_service
 from app.utils.auth import create_access_token
@@ -150,17 +149,30 @@ def user_headers(user: User) -> dict[str, str]:
 
 @pytest.fixture(autouse=True)
 def fake_mcp(monkeypatch: pytest.MonkeyPatch) -> Generator[dict[str, list[Any]], None, None]:
-    """Route every MCP client construction through a no-op stub."""
+    """Route every MCP session through in-memory stubs (zero connections)."""
 
-    class _StubMcpClient:
-        def __init__(self, connections: dict[str, Any]) -> None:
-            self.connections = connections
+    class _StubMcpSession:
+        async def initialize(self) -> None:
+            return None
 
-        async def get_tools(self) -> list[Any]:
-            return []
+    class _StubMcpSessionCM:
+        def __init__(self, connection: dict[str, Any]) -> None:
+            self.connection = connection
 
-    monkeypatch.setattr(mcp_manager, "MultiServerMCPClient", _StubMcpClient)
-    monkeypatch.setattr(mcp_servers_module, "MultiServerMCPClient", _StubMcpClient)
+        async def __aenter__(self) -> _StubMcpSession:
+            return _StubMcpSession()
+
+        async def __aexit__(self, *exc_info: Any) -> bool:
+            return False
+
+    async def _stub_load_mcp_tools(
+        session: Any, server_name: str | None = None, handle_tool_errors: bool = True
+    ) -> list[Any]:
+        del session, server_name, handle_tool_errors
+        return []
+
+    monkeypatch.setattr(mcp_client, "create_session", lambda connection: _StubMcpSessionCM(connection))
+    monkeypatch.setattr(mcp_client, "load_mcp_tools", _stub_load_mcp_tools)
     yield {}
 
 

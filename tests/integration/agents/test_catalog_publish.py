@@ -73,8 +73,8 @@ def test_mcp_server_registration_feeds_tool_catalog(
 
     assert by_name["duckduckgo_results_json"]["source"] == "builtin"
     assert by_name["ask_human"]["source"] == "builtin"
-    assert by_name["it_search"]["source"] == "mcp"
-    assert by_name["it_search"]["server"] == "it-server"
+    assert by_name["it-server__it_search"]["source"] == "mcp"
+    assert by_name["it-server__it_search"]["server"] == "it-server"
 
 
 def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
@@ -123,7 +123,7 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
             "system_prompt": "You are support.",
             "skill_names": ["report-style"],
             "subagent_names": ["researcher"],
-            "allowed_tools": ["it_search", "ghost_tool"],
+            "allowed_tools": ["it-server__it_search", "ghost_tool"],
         },
         headers=headers,
     )
@@ -138,7 +138,7 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
     assert "ghost_tool" in denied.json()["message"]
 
     # Fix the whitelist, publish succeeds, /apps/published lists the app.
-    fixed = client.patch(f"{API}/apps/{app_id}", json={"allowed_tools": ["it_search"]}, headers=headers)
+    fixed = client.patch(f"{API}/apps/{app_id}", json={"allowed_tools": ["it-server__it_search"]}, headers=headers)
     assert fixed.status_code == 200, fixed.text
     published = client.post(f"{API}/apps/{app_id}/publish", headers=headers)
     assert published.status_code == 200, published.text

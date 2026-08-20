@@ -42,6 +42,10 @@ def _setup_mcp_server(client: TestClient, headers: dict[str, str], fake_tools: d
     assert response.status_code == 201, response.text
 
 
+# Namespaced catalog name of the fake it_search tool (server "it-server").
+IT_SEARCH = "it-server__it_search"
+
+
 def test_hil_interrupt_then_resume_round_trip(
     client: TestClient,
     user_headers: dict[str, str],
@@ -58,8 +62,8 @@ def test_hil_interrupt_then_resume_round_trip(
         json={
             "name": "hil-app",
             "system_prompt": "You need approval.",
-            "allowed_tools": ["it_search"],
-            "interrupt_on": {"it_search": True},
+            "allowed_tools": [IT_SEARCH],
+            "interrupt_on": {IT_SEARCH: True},
         },
         headers=headers,
     )
@@ -75,7 +79,7 @@ def test_hil_interrupt_then_resume_round_trip(
     scripted_model.responses = [
         AIMessage(
             content="",
-            tool_calls=[{"name": "it_search", "args": {}, "id": "tc-fixed", "type": "tool_call"}],
+            tool_calls=[{"name": IT_SEARCH, "args": {}, "id": "tc-fixed", "type": "tool_call"}],
         ),
         AIMessage(content="approved-final"),
     ]
@@ -87,7 +91,7 @@ def test_hil_interrupt_then_resume_round_trip(
     assert len(interrupt_messages) == 1
     interrupt_content = interrupt_messages[0]["content"]
     assert interrupt_messages[0]["role"] == "assistant"
-    assert "it_search" in interrupt_content  # interrupt value names the pending action
+    assert IT_SEARCH in interrupt_content  # interrupt value names the pending action
     assert scripted_model.n == 1  # paused before the tool ran
 
     # Turn 2: approve the pending action; the run resumes to completion.
@@ -116,7 +120,7 @@ def test_runtime_cache_hit_and_fingerprint_reassembly(
 
     created = client.post(
         f"{API}/apps",
-        json={"name": "cached-app", "system_prompt": "You are cached.", "allowed_tools": ["it_search"]},
+        json={"name": "cached-app", "system_prompt": "You are cached.", "allowed_tools": [IT_SEARCH]},
         headers=headers,
     )
     assert created.status_code == 201, created.text
