@@ -185,6 +185,27 @@ export function callMcpServerTool(
 }
 
 // ---------------------------------------------------------------------------
+// 全局工具目录（SubAgent 允许的工具下拉选项来源）
+// ---------------------------------------------------------------------------
+
+/**
+ * 全量工具目录：GET /tools/catalog。
+ *
+ * 运行时已注入的 builtin 工具 + 所有 enabled MCP server 注册的工具聚合视图，
+ * 每条带 source / server 标记（参见 {@link ToolCatalogEntry}）。
+ *
+ * SubAgent 允许的工具下拉选项与后端 {@code allowed_tools} 字段命名空间一致：
+ * - builtin：`entry.name`（裸名，如 `duckduckgo_results_json`）
+ * - mcp：`${entry.server}__${entry.name}`（如 `demo-stdio__echo`）
+ *
+ * 响应内容由后端 `build_tool_catalog` 服务函数实时聚合，不读缓存；
+ * tool 注册状态变化后调用本接口可拿到最新快照。
+ */
+export function listToolCatalog(): Promise<ToolCatalogEntry[]> {
+  return get<ToolCatalogEntry[]>('/tools/catalog')
+}
+
+// ---------------------------------------------------------------------------
 // stdio manifest 自动发现
 // ---------------------------------------------------------------------------
 

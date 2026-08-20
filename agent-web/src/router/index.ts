@@ -43,6 +43,12 @@ const router = createRouter({
       meta: { title: 'Agent 管理' },
     },
     {
+      path: '/subagent',
+      name: 'subagent',
+      component: () => import('@/views/agent/SubAgentList.vue'),
+      meta: { title: '子代理管理' },
+    },
+    {
       path: '/skill',
       name: 'skill',
       component: () => import('@/views/skill/SkillList.vue'),

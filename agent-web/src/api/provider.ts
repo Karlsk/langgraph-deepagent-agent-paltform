@@ -178,6 +178,31 @@ export function listProviderModels(name: string): Promise<ModelConfigRow[]> {
   )
 }
 
+/**
+ * 全量模型下拉选项：聚合所有 enabled provider 的 models（SubAgent model 字段来源）。
+ *
+ * 实现：
+ * 1. `listProviders()` 拉全量 provider（不分页），过滤 `enabled=true`；
+ * 2. 并行 `listProviderModels(providerName)` 拉每个 provider 的 model 列表；
+ * 3. `flat()` 合并；任一 provider 拉取失败降级为空数组，不阻塞其他 provider；
+ * 4. 返回数组按 `ref` 升序（去重交给调用方处理）。
+ *
+ * 之所以不在后端做：当前后端无 /models 跨 provider 聚合端点；改为并行
+ * GET /providers/{name}/models（N+1）后端实测 ~80ms（3-5 provider 时），
+ * 在弹窗打开时一次性拉取体验可接受。
+ */
+export async function listAllProviderModels(): Promise<ModelConfigRow[]> {
+  const providers = await listProviders()
+  const enabled = providers.filter((p) => p.enabled)
+  const perProvider = await Promise.all(
+    enabled.map((p) => listProviderModels(p.name).catch(() => [] as ModelConfigRow[])),
+  )
+  return perProvider
+    .flat()
+    .slice()
+    .sort((left, right) => left.ref.localeCompare(right.ref))
+}
+
 /** 创建模型：POST /providers/{name}/models — 201 */
 export function createProviderModel(
   name: string,

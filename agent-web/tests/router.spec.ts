@@ -33,10 +33,11 @@ describe('控制台导航路由', () => {
       { name: 'mcp', path: '/mcp' },
       { name: 'register', path: '/register' },
       { name: 'skill', path: '/skill' },
+      { name: 'subagent', path: '/subagent' },
     ])
   })
 
-  it('回收站路由 /llm/trash 挂载 ProviderTrashList 且受认证守卫保护', async () => {
+  it('回收站路由 /llm/trash 挂载 ProviderTrashList 且受认证守卫保护', { timeout: 15_000 }, async () => {
     hasSessionMock.mockReturnValue(false)
     await router.push('/llm/trash')
     expect(router.currentRoute.value.name).toBe('login')

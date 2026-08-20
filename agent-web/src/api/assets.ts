@@ -1,7 +1,7 @@
 /**
- * Agent 资产 API 模块：对接后端 4 大资产模块（SubAgents / Skills /
- * AgentApps / LLM Configs）。MCP Servers 已迁移至 `@/api/mcp`（因含 CRUD +
- * 调试端点 + stdio manifest 共 10 个接口，独立承载更清晰）。
+ * Agent 资产 API 模块：对接后端 3 大资产模块（Skills / AgentApps /
+ * LLM Configs）。MCP Servers 已迁移至 `@/api/mcp`，SubAgents 已迁移至
+ * `@/api/subagents`（两者均含 CRUD + 调试/测试端点，独立承载更清晰）。
  *
  * 约定：
  * - 响应信封 {code, message, data} 已由 request.ts 拦截器解包，本模块函数
@@ -13,20 +13,6 @@
  */
 import { del, get, patch, post } from '@/utils/request'
 import type { PageQuery, PageResult } from '@/types'
-
-/** SubAgent 资产行（对应后端 SubAgentRead） */
-export interface SubAgentRow {
-  name: string
-  description: string
-  when_to_use: string
-  system_prompt: string
-  allowed_tools: string[] | null
-  model: string | null
-  max_turns: number | null
-  content_hash: string
-  version: number
-  created_by: string | null
-}
 
 /** Skill 资产元数据行（对应后端 SkillRead） */
 export interface SkillRow {
@@ -71,20 +57,6 @@ export interface LlmConfigRow {
 /** 把 PageQuery 透传为后端查询参数（page/pageSize/keyword） */
 function toParams(query: PageQuery): Record<string, unknown> {
   return { page: query.page, pageSize: query.pageSize, keyword: query.keyword }
-}
-
-// ---------------------------------------------------------------------------
-// SubAgents
-// ---------------------------------------------------------------------------
-
-/** 全量列表：GET /subagents */
-export function listSubAgents(): Promise<SubAgentRow[]> {
-  return get<SubAgentRow[]>('/subagents')
-}
-
-/** 分页列表：GET /subagents/page */
-export function listSubAgentsPage(query: PageQuery = {}): Promise<PageResult<SubAgentRow>> {
-  return get<PageResult<SubAgentRow>>('/subagents/page', { params: toParams(query) })
 }
 
 // ---------------------------------------------------------------------------

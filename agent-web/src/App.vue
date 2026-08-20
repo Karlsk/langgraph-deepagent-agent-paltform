@@ -10,6 +10,7 @@ import {
   FullScreen,
   MagicStick,
   Moon,
+  Pointer,
   Setting,
   User,
 } from '@element-plus/icons-vue'
@@ -75,6 +76,10 @@ async function handleLogout(): Promise<void> {
         <el-menu-item index="/agent">
           <el-icon><User /></el-icon>
           <template #title>Agent 管理</template>
+        </el-menu-item>
+        <el-menu-item index="/subagent">
+          <el-icon><Pointer /></el-icon>
+          <template #title>子代理管理</template>
         </el-menu-item>
         <el-menu-item index="/skill">
           <el-icon><MagicStick /></el-icon>
