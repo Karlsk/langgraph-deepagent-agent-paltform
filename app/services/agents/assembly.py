@@ -6,13 +6,18 @@ Everything upstream (API routes, runtime services) talks to the compiled
 
 Assembly pipeline (``compile_agent_app``):
 
-1. ``sync_user_skills`` re-materializes the app's skills into the per-user
-   skill directory (``{SKILLS_ROOT}/users/<user_id>/``).
+1. The effective skill set is the union of ``app_cfg.skill_names`` and every
+   bound subagent's effective ``skill_names`` (``None`` contributes nothing
+   because the sub-agent will inherit the parent's skill set; explicit empty
+   lists and explicit whitelists both contribute their names). The union is
+   materialised by ``sync_user_skills`` into the per-user skill directory.
 2. ``build_tool_catalog`` merges builtin + MCP tools (fail-fast whitelist
    validation happens against this catalog in ``validate_publish``).
 3. ``resolve_tools`` applies the app-level tool whitelist (None = all).
 4. Each ``SubAgentConfig`` becomes a declarative deepagents ``SubAgent`` via
-   ``build_subagent_spec`` with explicit inheritance resolution.
+   ``build_subagent_spec`` with explicit inheritance resolution
+   (including skill inheritance: ``cfg.skill_names is None`` -> inherit the
+   app's effective skill set, ``[]`` -> none, ``[...]`` -> explicit whitelist).
 5. Skills are served through ``FilesystemBackend(root_dir=<user skill dir>)``
    with source ``"/"`` (each ``<name>/SKILL.md`` directory is one skill).
 6. ``MemoryMiddleware`` injects the per-request dynamic context on every
@@ -227,18 +232,27 @@ def build_subagent_spec(
     parent_tools: Sequence[BaseTool],
     parent_model: BaseChatModel,
     resolve_model: Callable[[str], BaseChatModel],
+    parent_skills: Sequence[str] = (),
     tool_index: Optional[Mapping[str, BaseTool]] = None,
 ) -> SubAgent:
     """Convert a SubAgentConfig row into a declarative deepagents SubAgent spec.
 
-    Inheritance is explicit: ``allowed_tools=None`` inherits the parent's
-    resolved tools and ``model=None`` inherits the parent's model instance
-    (the same object). A non-NULL ``model`` is a ``"provider/model"``
-    reference resolved through ``resolve_model``.
-    ``when_to_use`` maps to ``SubAgent["description"]`` (what the orchestrator
-    sees when deciding whether to delegate). When ``max_turns`` is set, a
-    ``TurnLimitMiddleware`` is attached via the spec's ``middleware`` field
-    (supported since deepagents 0.7.5 — see module docstring).
+    Inheritance is explicit:
+
+    - ``allowed_tools=None`` inherits the parent's resolved tools.
+    - ``model=None`` inherits the parent's model instance (the same object).
+    - ``skill_names=None`` inherits the parent's published skill set
+      (``parent_skills``, the parent's effective ``["/<name>", ...]`` list).
+    - ``skill_names=[]`` explicitly binds no skills (overrides inheritance).
+    - ``skill_names=[<name>, ...]`` becomes ``["/<name>", ...]`` after the
+      bind-time whitelist resolution.
+
+    A non-NULL ``model`` is a ``"provider/model"`` reference resolved through
+    ``resolve_model``. ``when_to_use`` maps to ``SubAgent["description"]``
+    (what the orchestrator sees when deciding whether to delegate). When
+    ``max_turns`` is set, a ``TurnLimitMiddleware`` is attached via the
+    spec's ``middleware`` field (supported since deepagents 0.7.5 — see
+    module docstring).
 
     Args:
         cfg: The persisted sub-agent configuration row.
@@ -246,6 +260,9 @@ def build_subagent_spec(
         parent_model: Model instance used by the parent agent.
         resolve_model: Resolver mapping a ``"provider/model"`` reference to a
             chat model instance (supplied by ``compile_agent_app``).
+        parent_skills: Effective skill source paths of the parent agent
+            (already prefixed with ``"/"``); ``None`` for the standalone
+            runner, where inheritance degenerates to ``[]``.
         tool_index: Optional full name -> tool index used to resolve an
             explicit ``allowed_tools`` whitelist; defaults to the parent's
             tool set when omitted.
@@ -277,12 +294,26 @@ def build_subagent_spec(
     if cfg.max_turns is not None:
         spec["middleware"] = [TurnLimitMiddleware(cfg.max_turns)]
 
+    if cfg.skill_names is None:
+        skills: list[str] = list(parent_skills)
+        skill_source = "inherited"
+    elif cfg.skill_names == []:
+        skills = []
+        skill_source = "none"
+    else:
+        skills = [f"/{name}" for name in cfg.skill_names]
+        skill_source = "whitelist"
+    if skills:
+        spec["skills"] = skills  # type: ignore[typeddict-item]
+
     logger.debug(
         "subagent_spec_built",
         name=cfg.name,
         inherited_tools=cfg.allowed_tools is None,
         inherited_model=cfg.model is None,
         max_turns=cfg.max_turns,
+        skill_source=skill_source,
+        skill_count=len(skills),
     )
     return spec
 
@@ -298,12 +329,32 @@ def compile_standalone_subagent(
     tools: list[BaseTool],
     model: BaseChatModel,
     checkpointer: Checkpointer | None = None,
+    skills_dir: Path | None = None,
 ) -> CompiledStateGraph:
     """Compile a standalone one-shot graph for test-running a subagent config.
 
-    Unlike ``compile_agent_app`` the graph has no subagents, no skills and no
-    memory middleware — it is the bare subagent itself (``cfg.system_prompt``
-    as the system prompt) so a test run exercises exactly this configuration.
+    Unlike ``compile_agent_app`` the graph has no subagents, no memory
+    middleware and no shared compile cache — it is the bare subagent itself
+    (``cfg.system_prompt`` as the system prompt) so a test run exercises
+    exactly this configuration.
+
+    Skill support (mirrors ``build_subagent_spec`` semantics at the sub-agent
+    boundary, with ``None`` degenerating to ``[]`` because there is no
+    parent to inherit from):
+
+    - ``cfg.skill_names is None`` -> bind no skills (standalone has no
+      parent to inherit).
+    - ``cfg.skill_names == []`` -> bind no skills.
+    - ``cfg.skill_names == [..]`` -> bind exactly those skills, served from
+      the caller-supplied ``skills_dir``.
+
+    When any skills are bound, a ``FilesystemBackend(root_dir=skills_dir)``
+    is attached so the agent can read ``<name>/SKILL.md`` files. The caller
+    is responsible for materializing skill contents into ``skills_dir``
+    (typically ``skills_store.materialize_for_user`` writing into a tmp dir)
+    so the standalone runner never touches ``settings.SKILLS_ROOT`` directly
+    and tests stay isolated.
+
     When ``cfg.max_turns`` is set the same ``TurnLimitMiddleware`` gate used
     for embedded subagents is attached. The compiled graph is returned as-is:
     nothing is written into the process-level compile cache and, unless the
@@ -314,6 +365,9 @@ def compile_standalone_subagent(
         tools: Resolved tool instances the subagent may call.
         model: Chat model instance executing the subagent.
         checkpointer: Optional checkpointer to attach (defaults to None).
+        skills_dir: Optional directory whose ``<skill>/SKILL.md`` layout backs
+            the skills backend. Required whenever ``cfg.skill_names`` is a
+            non-empty list.
 
     Returns:
         The compiled standalone deep agent graph.
@@ -322,12 +376,27 @@ def compile_standalone_subagent(
     if cfg.max_turns is not None:
         middleware.append(TurnLimitMiddleware(cfg.max_turns))
 
+    # Standalone runner has no parent: ``None`` collapses to ``[]`` per the
+    # inheritance contract documented at the module level.
+    requested_skills: list[str] = list(cfg.skill_names or [])
+    skills: list[str] = [f"/{name}" for name in requested_skills]
+
+    backend: FilesystemBackend | None = None
+    if skills:
+        if skills_dir is None:
+            raise ValueError(
+                f"skills_dir is required when subagent '{cfg.name}' declares skill_names={cfg.skill_names!r}"
+            )
+        backend = FilesystemBackend(root_dir=str(skills_dir))
+
     graph = create_deep_agent(
         model=model,
         tools=tools,
         system_prompt=cfg.system_prompt,
         middleware=middleware,
         checkpointer=checkpointer,
+        skills=skills or None,
+        backend=backend,
         name=f"subagent-test:{cfg.name}",
     )
     logger.info(
@@ -336,6 +405,7 @@ def compile_standalone_subagent(
         tool_count=len(tools),
         max_turns=cfg.max_turns,
         checkpointer=checkpointer is not None,
+        skill_count=len(skills),
     )
     return graph
 
@@ -370,7 +440,10 @@ async def compile_agent_app(
         ValueError: When the tool whitelist references unknown tool names or
             a model reference cannot be resolved.
     """
-    await sync_user_skills(user_id, app_cfg.skill_names)
+    effective_skill_names = sorted(
+        set(app_cfg.skill_names) | {n for cfg in subagent_cfgs for n in (cfg.skill_names or [])}
+    )
+    await sync_user_skills(user_id, effective_skill_names)
 
     catalog = await build_tool_catalog(session)
     mcp_tools = await get_mcp_tools(session)
@@ -389,9 +462,15 @@ async def compile_agent_app(
         """Resolve a subagent model reference against the live DB."""
         return build_chat_model(*load_model_config(session, reference))
 
+    parent_skills: list[str] = [f"/{name}" for name in effective_skill_names]
     subagents = [
         build_subagent_spec(
-            cfg, parent_tools=tools, parent_model=model, tool_index=tool_index, resolve_model=resolve_model
+            cfg,
+            parent_tools=tools,
+            parent_model=model,
+            tool_index=tool_index,
+            resolve_model=resolve_model,
+            parent_skills=parent_skills,
         )
         for cfg in subagent_cfgs
     ]
@@ -406,7 +485,7 @@ async def compile_agent_app(
         system_prompt=app_cfg.system_prompt,
         middleware=[MemoryMiddleware()],
         subagents=subagents or None,
-        skills=["/"] if app_cfg.skill_names else None,
+        skills=parent_skills or None,
         backend=backend,
         interrupt_on=interrupt_on,
         checkpointer=checkpointer,
@@ -419,7 +498,7 @@ async def compile_agent_app(
         user_id=user_id,
         tool_count=len(tools),
         subagent_count=len(subagents),
-        skill_count=len(app_cfg.skill_names),
+        skill_count=len(effective_skill_names),
     )
     return graph
 
@@ -502,7 +581,16 @@ _APP_FIELDS = (
     "interrupt_on",
     "engine",
 )
-_SUBAGENT_FIELDS = ("name", "description", "when_to_use", "system_prompt", "allowed_tools", "model", "max_turns")
+_SUBAGENT_FIELDS = (
+    "name",
+    "description",
+    "when_to_use",
+    "system_prompt",
+    "allowed_tools",
+    "model",
+    "max_turns",
+    "skill_names",
+)
 
 
 def _project(obj: Any, fields: Sequence[str]) -> dict[str, Any]:

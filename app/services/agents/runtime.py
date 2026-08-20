@@ -611,11 +611,34 @@ def _load_subagents(session: Session, names: Sequence[str]) -> list[SubAgentConf
     return list(session.exec(statement).all())
 
 
-async def _load_skill_hashes(session: Session, names: Sequence[str]) -> dict[str, str]:
-    """Map bound skill names to their persisted content hashes."""
-    if not names:
+async def _load_skill_hashes(
+    session: Session,
+    names: Sequence[str],
+    subagent_cfgs: Sequence[SubAgentConfig] = (),
+) -> dict[str, str]:
+    """Map bound skill names to their persisted content hashes.
+
+    The fingerprint input must cover the union of ``app_cfg.skill_names`` and
+    every bound subagent's explicit ``skill_names`` (the inherited/None case
+    contributes nothing because the sub-agent resolves to the app's set at
+    compile time, which is already covered by ``app_cfg.skill_names``).
+    Missing subagent-only skills in this projection would silently skip the
+    recompile that should fire when a subagent-only skill's body changes.
+
+    Args:
+        session: SQLModel database session.
+        names: Skill names from the parent AgentApp ``skill_names``.
+        subagent_cfgs: Bound SubAgentConfig rows whose explicit
+            ``skill_names`` contribute to the fingerprint.
+
+    Returns:
+        Mapping of skill name -> content hash for every name listed.
+    """
+    extra = {n for cfg in subagent_cfgs for n in (cfg.skill_names or [])}
+    lookup = sorted(set(names) | extra)
+    if not lookup:
         return {}
-    assets = session.exec(select(SkillAsset).where(col(SkillAsset.name).in_(names))).all()
+    assets = session.exec(select(SkillAsset).where(col(SkillAsset.name).in_(lookup))).all()
     return {asset.name: asset.content_hash for asset in assets}
 
 
@@ -736,7 +759,7 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
         raise ValueError(f"agent app {app_cfg.name!r} is not published (status={app_cfg.status})")
 
     subagent_cfgs = _load_subagents(session, app_cfg.subagent_names)
-    skill_hashes = await _load_skill_hashes(session, app_cfg.skill_names)
+    skill_hashes = await _load_skill_hashes(session, app_cfg.skill_names, subagent_cfgs)
     mcp_fingerprint = await _load_mcp_fingerprint(session)
     model_fingerprint, resolved_model_name = await _load_model_fingerprint(session, app_cfg, subagent_cfgs)
     fingerprint = assembly.compute_fingerprint(

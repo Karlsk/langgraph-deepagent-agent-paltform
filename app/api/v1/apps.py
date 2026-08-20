@@ -372,6 +372,21 @@ async def publish_agent_app(
             if asset is None:
                 raise HTTPException(status_code=422, detail=f"referenced skill '{skill_name}' does not exist")
             skill_hashes[skill_name] = asset.content_hash
+        # Sub-agent explicit whitelists (the inherit ``None`` case contributes
+        # nothing because the sub-agent resolves to the app's set, already
+        # covered above) also have to resolve to a real SkillAsset; otherwise
+        # a dangling subagent-only skill would silently skip recompilation.
+        for cfg in subagent_cfgs:
+            for skill_name in cfg.skill_names or []:
+                if skill_name in skill_hashes:
+                    continue
+                asset = db.get(SkillAsset, skill_name)
+                if asset is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"referenced skill '{skill_name}' (subagent '{cfg.name}') does not exist",
+                    )
+                skill_hashes[skill_name] = asset.content_hash
 
         catalog = await build_tool_catalog(db)
         model_catalog = build_model_catalog(db)
@@ -393,7 +408,13 @@ async def publish_agent_app(
         db.add(app_cfg)
         db.commit()
         db.refresh(app_cfg)
-        logger.info("agent_app_published", app_id=app_id, version=app_cfg.version)
+        logger.info(
+            "agent_app_published",
+            app_id=app_id,
+            version=app_cfg.version,
+            skill_count=len(skill_hashes),
+            subagent_count=len(subagent_cfgs),
+        )
         return ApiResponse.success(app_cfg)
     except HTTPException:
         raise

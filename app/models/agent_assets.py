@@ -25,6 +25,15 @@ class SubAgentConfig(BaseModel, table=True):
         allowed_tools: Optional tool whitelist (None = inherit from parent agent)
         model: Optional LLM model override
         max_turns: Optional turn budget limit
+        skill_names: Optional whitelist of SkillAsset names bound to this sub-agent.
+            Semantics mirror ``AgentApp.skill_names`` but at the sub-agent scope:
+
+            * ``None`` (default): inherit the parent AgentApp's published skill set.
+            * ``[]``: explicitly bind no skills (overrides parent inheritance).
+            * ``["pdf-export", ...]``: explicit whitelist scoped to this sub-agent.
+
+            Standalone single-shot tests (no parent app) treat ``None`` as ``[]``
+            because there is no parent to inherit from.
         content_hash: Hash of the effective content (used for publish/versioning)
         version: Monotonic configuration version counter
         created_by: Audit-only creator identifier
@@ -39,6 +48,7 @@ class SubAgentConfig(BaseModel, table=True):
     allowed_tools: Optional[list[str]] = Field(default=None, sa_column=Column(JSON))
     model: Optional[str] = Field(default=None)
     max_turns: Optional[int] = Field(default=None)
+    skill_names: Optional[list[str]] = Field(default=None, sa_column=Column(JSON))
     content_hash: str
     version: int = Field(default=1)
     created_by: Optional[str] = Field(default=None)

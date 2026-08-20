@@ -81,7 +81,13 @@ def test_subagent_test_unknown_name_404(client: TestClient, user_headers: dict[s
 def test_skill_delete_cascades_user_copies(
     client: TestClient, user_headers: dict[str, str], scripted_model: Any, memory_checkpointer: Any
 ) -> None:
-    """Deleting a global skill removes the per-user copies created by assembly."""
+    """Deleting a global skill removes the per-user copies created by assembly.
+
+    Exercises both halves of the new reference-protection contract:
+    1. Bound to an AgentApp -> DELETE returns 422 listing the reference;
+    2. Unbind via PATCH (workaround path, still supported), DELETE succeeds,
+       and per-user copies / global directory are wiped.
+    """
     headers = _auth(client, user_headers)
     skill = client.post(
         f"{API}/skills",
@@ -112,10 +118,112 @@ def test_skill_delete_cascades_user_copies(
     user_copy_dir = os.path.join(settings.SKILLS_ROOT, "users", "system", "doomed-skill")
     assert os.path.isfile(os.path.join(user_copy_dir, "SKILL.md"))
 
-    # Unbind the skill from the app (delete rejects dangling references), then delete.
+    # Reference-protection path: skill still bound to the app -> DELETE is rejected (422).
+    blocked = client.delete(f"{API}/skills/doomed-skill", headers=headers)
+    assert blocked.status_code == 422, blocked.text
+    blocked_body = blocked.json()
+    assert blocked_body["code"] == 422
+    assert "doomed-skill" in blocked_body["message"]
+    assert "doomed-app" in blocked_body["message"]
+
+    # Unbind the skill from the app, then DELETE succeeds and cascade cleans both copies.
     assert client.patch(f"{API}/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
     deleted = client.delete(f"{API}/skills/doomed-skill", headers=headers)
     assert deleted.status_code == 200, deleted.text
 
     assert not os.path.exists(user_copy_dir)
     assert not os.path.isdir(os.path.join(settings.SKILLS_ROOT, "global", "doomed-skill"))
+
+
+# ---------------------------------------------------------------------------
+# subagent.skill_names binding (end-to-end through /subagents/{name}/test)
+# ---------------------------------------------------------------------------
+
+
+def test_subagent_one_shot_test_with_skills(
+    client: TestClient, user_headers: dict[str, str], scripted_model: Any
+) -> None:
+    """A subagent with explicit ``skill_names`` materialises skills into a tmp dir for the test run.
+
+    End-to-end coverage: create a global skill -> create a subagent bound to it
+    -> ``POST /subagents/{name}/test`` must materialise the SKILL.md under a
+    caller-supplied tmp dir (FilesystemBackend layout) and still respect
+    isolation (no compile-cache pollution, no per-user skill directory
+    created under ``settings.SKILLS_ROOT``).
+    """
+    headers = _auth(client, user_headers)
+
+    # Seed a global skill the subagent will bind to.
+    skill = client.post(
+        f"{API}/skills",
+        json={
+            "name": "doc-export",
+            "description": "Export documents",
+            "body": "# doc-export\n\n## When to use\nwhen the user wants to export\n",
+        },
+        headers=headers,
+    )
+    assert skill.status_code == 201, skill.text
+
+    # Create a subagent with an explicit whitelist.
+    created = client.post(
+        f"{API}/subagents",
+        json={
+            "name": "exporter",
+            "description": "Exports documents",
+            "when_to_use": "When the user wants to export",
+            "system_prompt": "You export things.",
+            "skill_names": ["doc-export"],
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    payload = unwrap(created, expected_code=201)
+    assert payload["skill_names"] == ["doc-export"]
+
+    scripted_model.responses = [AIMessage(content="exported")]
+    result = client.post(f"{API}/subagents/exporter/test", json={"prompt": "export this"}, headers=headers)
+    assert result.status_code == 200, result.text
+    body = unwrap(result)
+    assert body["final_message"] == "exported"
+    assert body["turns"] == 1
+    # Isolation contract still holds.
+    assert len(assembly._compile_cache) == 0  # noqa: SLF001
+    # No per-user skill copies were created by the standalone runner (it uses
+    # a private tmp dir, never ``settings.SKILLS_ROOT/users/...``).
+    user_skill_root = os.path.join(settings.SKILLS_ROOT, "users")
+    if os.path.isdir(user_skill_root):
+        for entry in os.listdir(user_skill_root):
+            assert entry != "system", "standalone runner must not pollute per-user skill dirs"
+    # The global skill directory survives intact.
+    assert os.path.isfile(os.path.join(settings.SKILLS_ROOT, "global", "doc-export", "SKILL.md"))
+
+
+def test_subagent_one_shot_test_with_skill_names_none_inherits_empty(
+    client: TestClient, user_headers: dict[str, str], scripted_model: Any
+) -> None:
+    """A subagent with ``skill_names=None`` runs cleanly (standalone collapses None -> []).
+
+    The standalone runner has no parent app to inherit from, so omitting
+    ``skill_names`` must behave like an empty whitelist (no skills bound).
+    The run still completes and reports success without touching the global
+    skill tree.
+    """
+    headers = _auth(client, user_headers)
+    created = client.post(
+        f"{API}/subagents",
+        json={
+            "name": "plain",
+            "description": "Plain helper",
+            "when_to_use": "Always",
+            "system_prompt": "You are plain.",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    assert unwrap(created, expected_code=201)["skill_names"] is None
+
+    scripted_model.responses = [AIMessage(content="ok")]
+    result = client.post(f"{API}/subagents/plain/test", json={"prompt": "hi"}, headers=headers)
+    assert result.status_code == 200, result.text
+    assert unwrap(result)["final_message"] == "ok"

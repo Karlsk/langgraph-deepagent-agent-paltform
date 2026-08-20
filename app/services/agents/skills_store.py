@@ -400,6 +400,36 @@ async def materialize_for_user(user_id: str, skill_names: Sequence[str]) -> None
     logger.info("skills_materialized_for_user", user_id=uid, skill_count=len(names))
 
 
+async def materialize_into_directory(target_dir: Path, skill_names: Sequence[str]) -> None:
+    """Copy the given global skills into ``<target_dir>/<name>/SKILL.md``.
+
+    Unlike :func:`materialize_for_user`, the destination directory is supplied
+    by the caller (typically a ``tmp_path`` fixture in tests). The layout
+    matches what ``FilesystemBackend`` expects, so a compiled standalone
+    sub-agent graph can read the skills with no further setup.
+
+    Existing files are overwritten. The target directory and skill
+    sub-directories are created on demand.
+
+    Args:
+        target_dir: Destination root directory; created when missing.
+        skill_names: Names of global skills to copy.
+
+    Raises:
+        ValueError: If any skill name is invalid or the global file is
+            missing.
+    """
+    for name in skill_names:
+        _validate_skill_name(name)
+        body = await read_global(name)
+        await asyncio.to_thread(_atomic_write, target_dir / name / _SKILL_FILE_NAME, body)
+    logger.info(
+        "skills_materialized_into_directory",
+        target_dir=str(target_dir),
+        skill_count=len(list(skill_names)),
+    )
+
+
 async def sync_user_skills(user_id: str, associated_names: Sequence[str]) -> None:
     """Reassemble a user's skill directory to match the association set.
 

@@ -16,6 +16,7 @@ from sqlmodel import Session as DBSession
 from app.api.v1.agent_assets_common import (
     _creator,
     _read_patch_body,
+    _skill_owners,
     _validate_payload,
     get_db_session,
 )
@@ -302,6 +303,13 @@ async def delete_skill(
     try:
         if db.get(SkillAsset, name) is None:
             raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+        owners = _skill_owners(db, name)
+        if owners:
+            logger.warning("skill_delete_rejected", name=name, reason="referenced", owners=owners)
+            raise HTTPException(
+                status_code=422,
+                detail=f"skill '{name}' is referenced by: {', '.join(owners)}",
+            )
         await skills_store.delete_global(db, name=name)
         logger.info("skill_deleted", name=name)
         return ApiResponse.success(None)

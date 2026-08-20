@@ -8,6 +8,7 @@ and SubAgentConfig rows live in an in-memory SQLite database.
 import asyncio
 import uuid
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,7 +20,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.core.config import settings
 from app.core.metrics import agent_test_runs_total, subagent_task_duration_seconds
-from app.models.agent_assets import SubAgentConfig
+from app.models.agent_assets import SubAgentConfig, SkillAsset
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.services.agents import test_runner
 
@@ -387,3 +388,120 @@ def test_run_subagent_once_omits_callback_when_tracing_disabled(
     asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="hi"))
 
     assert captured["config"]["callbacks"] == []
+
+
+# ---------------------------------------------------------------------------
+# skill_names binding (standalone runner materialises into tmp dir)
+# ---------------------------------------------------------------------------
+
+
+def _seed_skill(session: Session, *, name: str, body: str) -> SkillAsset:
+    """Persist a SkillAsset row plus its SKILL.md file under settings.SKILLS_ROOT/global."""
+    from app.services.agents import skills_store
+
+    skills_root = Path(settings.SKILLS_ROOT)
+    skill_dir = skills_root / "global" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+    asset = SkillAsset(
+        name=name,
+        description=f"{name} body",
+        content_hash=skills_store._sha256(body),  # noqa: SLF001 — test seed
+        created_by="test",
+    )
+    session.add(asset)
+    session.commit()
+    session.refresh(asset)
+    return asset
+
+
+def test_run_subagent_once_with_skill_names_materializes_tmp_dir(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A subagent with non-empty skill_names materialises SKILL.md files into the tmp dir.
+
+    Verifies the runner:
+    - Resolves the cfg.skill_names list and copies every named global skill
+      into ``tmp_skills_root/<name>/SKILL.md`` (so ``FilesystemBackend`` can serve it).
+    - Calls ``compile_standalone_subagent`` with the supplied tmp dir as
+      ``skills_dir`` (so the backend mounts the correct root).
+    - Treats ``None`` as ``[]`` (no parent to inherit from).
+    """
+    _seed_skill(db_session, name="pdf-export", body="# pdf-export\n\n## When to use\nrender\n")
+    _seed_skill(db_session, name="markdown-fix", body="# markdown-fix\n\n## When to use\nlint\n")
+    _seed_config(db_session, skill_names=["pdf-export", "markdown-fix"])
+    _patch_registry(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="ok")]))
+
+    # Snapshot of calls into compile_standalone_subagent so we can assert
+    # the runner passed our tmp dir (and the skill list).
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_compile(cfg: Any, **kwargs: Any) -> _CapturingGraph:
+        captured_kwargs.update(kwargs)
+        return _CapturingGraph({})
+
+    monkeypatch.setattr(test_runner, "compile_standalone_subagent", fake_compile)
+
+    tmp_skills_root = tmp_path / "skills"
+    asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="go", tmp_skills_root=tmp_skills_root))
+
+    # Every bound skill now lives in the caller's tmp dir (FilesystemBackend layout).
+    assert (tmp_skills_root / "pdf-export" / "SKILL.md").is_file()
+    assert (tmp_skills_root / "markdown-fix" / "SKILL.md").is_file()
+    # compile_standalone_subagent received the tmp dir as skills_dir.
+    assert captured_kwargs["skills_dir"] is tmp_skills_root
+    # The checkpointer must stay None (test isolation contract).
+    assert captured_kwargs["checkpointer"] is None
+
+
+def test_run_subagent_once_missing_skill_raises_and_counts_error(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bound skill that does not exist on disk causes a ValueError and counts status=error."""
+    # Only seed one of the two declared skills; the other is missing.
+    _seed_skill(db_session, name="pdf-export", body="# pdf-export\n")
+    _seed_config(db_session, skill_names=["pdf-export", "ghost"])
+    _patch_registry(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="ok")]))
+
+    error_before = _run_counter("error")
+    success_before = _run_counter("success")
+
+    with pytest.raises(ValueError, match="ghost"):
+        asyncio.run(
+            test_runner.run_subagent_once(db_session, name="helper", prompt="go", tmp_skills_root=tmp_path / "skills")
+        )
+
+    assert _run_counter("error") == error_before + 1
+    assert _run_counter("success") == success_before
+
+
+def test_run_subagent_once_without_skill_names_skips_tmp_root(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A subagent with ``skill_names=None`` passes ``None`` through and skips materialisation.
+
+    Mirrors the standalone contract: ``None`` collapses to ``[]`` (no parent
+    to inherit from) and no tmp dir is required even when the caller
+    supplies one — the runner simply forwards the argument as-is and the
+    downstream assembly treats the empty skill list as "bind nothing".
+    """
+    _seed_config(db_session)  # skill_names defaults to None
+    _patch_registry(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="ok")]))
+
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_compile(cfg: Any, **kwargs: Any) -> _CapturingGraph:
+        captured_kwargs.update(kwargs)
+        return _CapturingGraph({})
+
+    monkeypatch.setattr(test_runner, "compile_standalone_subagent", fake_compile)
+
+    # tmp_skills_root is provided but unused because no skills are declared.
+    asyncio.run(
+        test_runner.run_subagent_once(db_session, name="helper", prompt="go", tmp_skills_root=tmp_path / "unused")
+    )
+
+    # compile_standalone_subagent received the same tmp_skills_root, but the
+    # assembly treats ``cfg.skill_names is None`` as ``[]`` and binds no skills.
+    assert captured_kwargs["skills_dir"] == tmp_path / "unused"
+    assert not (tmp_path / "unused").exists(), "materialise skipped -> no directory created"

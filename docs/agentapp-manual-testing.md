@@ -662,10 +662,18 @@ curl -s -X POST "$BASE/subagents" \
 
 **预期**：HTTP 201 且 `code=201`，信封 `data` 为 `SubAgentRead`：`data.allowed_tools=null`、
 `data.model=null`、`data.max_turns=null`（留空即**继承父 AgentApp** 的工具/模型）、
+`data.skill_names=null`（留空即继承父 AgentApp 的 skill 全集）、
 `data.version=1`、`data.content_hash` 非空。
 
 > `model` 字段的语义是 **`provider/model` 引用**（见 5.5 节）；留空继承父应用引用，
 > NULL 最终解析到 `default/default`。
+>
+> `skill_names` 字段继承语义（与 `allowed_tools` / `model` 对齐）：
+> - `null`（留空）：运行时继承父 AgentApp 已发布的 skill 全集；
+> - `[]`：显式不绑定任何 skill；
+> - `[<name>, ...]`：显式白名单，只绑定列表内的 skill。
+>
+> 单轮测试（`POST /subagents/<name>/test`）无父级上下文，会将 `null` 按 `[]` 处理。
 
 **失败排查**：422 信封：重名（`message` 为 `subagent 'xxx' already exists`）或 `name` 不符合命名规则（`Validation error` + `data` 错误列表）。
 
@@ -682,10 +690,28 @@ curl -s -X PATCH "$BASE/subagents/search-helper" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"max_turns": 3}'
+
+# 绑定一个显式 skill 白名单（仅允许 csv-report / doc-export；其它父级 skill 被剔除）
+curl -s -X PATCH "$BASE/subagents/search-helper" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"skill_names": ["csv-report", "doc-export"]}'
+
+# 显式清空 skill（[] = 绑定 0 个 skill；与 null 继承的语义不同）
+curl -s -X PATCH "$BASE/subagents/search-helper" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"skill_names": []}'
+
+# 还原成继承父 AgentApp 全集（PATCH null 视为「未提供」，不会清空当前值；
+# 若要清除，需要显式传 [] 或带白名单）
 ```
 
 **预期**：PATCH 后信封 `data` 中 `max_turns=3`、`version` 自增、`content_hash` 更新；
-空 payload 返回 422 信封，`message` 为 `nothing to update`。
+`skill_names` PATCH 后返回更新后的列表。PATCH null 与不带 `skill_names` 字段都被后端视为「未提供」
+（不会清空当前值——遵循 PATCH 语义）。空 payload 返回 422 信封，`message` 为 `nothing to update`。
+`skill_names` PATCH 时列表元素必须指向已存在的全局 skill（`POST /skills` 创建过），
+否则 publish 校验会 422 拒绝（参考 6.2 节）。
 
 ### 5.3 单轮测试运行（⚠️ 需外部资源 / 会消耗 token）
 
@@ -712,6 +738,38 @@ curl -s -X PATCH "$BASE/subagents/search-helper" \
 ```
 
 **预期**：422 信封，`message` 为 `name is immutable and cannot be changed`。
+
+### 5.6 SubAgent / Skill 删除的引用保护
+
+`SubAgent` 被 `AgentApp.subagent_names` 引用时，删除 SubAgent 会被 422 拒绝；同理
+`Skill` 被任一 `AgentApp.skill_names` 或 `SubAgentConfig.skill_names` 引用时，删除 Skill
+也会被 422 拒绝。需要先解除引用（把 SubAgent 从 AgentApp 移除 / 把 Skill 从 AgentApp 或
+SubAgent 移除）才能删除。
+
+#### 5.6.1 删除被 AgentApp 引用的 SubAgent
+
+```bash
+# 前置：上一步 demo-assistant 已 subagent_names=["search-helper"]
+curl -s -X DELETE "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：422 信封，`message` 形如 `subagent 'search-helper' is referenced by: agent_app:demo-assistant`。
+先 `PATCH /apps/$APP_ID` 把 `subagent_names` 清空（或去掉 `search-helper`），再删除 SubAgent 即可。
+
+#### 5.6.2 删除被 AgentApp 或 SubAgent 引用的 Skill
+
+```bash
+# 前置：第 3 节创建过 csv-report，且 demo-assistant.skill_names 或 search-helper.skill_names 包含它
+curl -s -X DELETE "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：422 信封，`message` 形如 `skill 'csv-report' is referenced by: agent_app:demo-assistant, subagent:search-helper`。
+先 `PATCH /apps/$APP_ID` 与 `PATCH /subagents/search-helper` 把 `skill_names` 移除
+（或改为不包含 `csv-report` 的列表）才能删除 Skill。
+
+> 与 `DELETE /providers/<name>` / `DELETE /providers/<name>/models/<model>` 的「软删 + 引用保护」
+> 语义对齐，但**SubAgent / Skill 是物理删除**——成功 DELETE 后 GET 即返回 404。
+> 应用层的 422 拒绝确保了资产间的引用一致性；不存在「被禁用的中间状态」。
 
 ### 5.5 Provider / Model 管理（providers CRUD + 按需健康探测）
 
@@ -888,6 +946,11 @@ curl -s -X POST "$BASE/apps/$BAD_APP_ID/publish" \
 分别返回 422 信封，`message` 为 `referenced skill 'xxx' does not exist` / `referenced subagent 'xxx' does not exist`。
 应用或子代理的 `model` 引用不存在/被禁用的 `provider/model` 对（如把 `model` PATCH 成 `ghost/none`）
 也返回 422 信封，`message` 列出缺失/禁用的引用。
+
+> **子代理 skill 引用**：发布时 `publish_agent_app` 会展开 `subagent_names` 里每个 SubAgent 的
+> `skill_names` 白名单，与应用自身的 `skill_names` 取并集，缺一不可——引用不存在的全局 skill
+> 时返回 422 信封，`message` 形如 `referenced skill 'xxx' (subagent '<name>') does not exist`。
+> 这避免了「应用能 publish，但运行时子代理拿不到 skill」的运行时失败。
 
 （可用 `DELETE $BASE/apps/$BAD_APP_ID` 清理该脏数据应用。）
 
@@ -1098,12 +1161,14 @@ curl -s -X DELETE "$BASE/apps/$HIL_APP_ID" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/apps/$APP_ID" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/mcp-servers/demo-stdio" -H "Authorization: Bearer $TOKEN"
-# skill 删除会级联清理用户副本（含 {SKILLS_ROOT}/users/<user_id>/ 下的物化文件）
+# skill 删除会级联清理用户副本（含 {SKILLS_ROOT}/users/<user_id>/ 下的物化文件），
+# 并校验「无人引用」（AgentApp.skill_names / SubAgentConfig.skill_names 必须先清空）。
 curl -s -X DELETE "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ```
 
-每个 DELETE 成功返回信封 `{"code": 200, "message": "...", "data": null}`；对不存在的资源返回 404 信封。
-另请删除第 4.1 步放入的 `app/tmp_mcp_demo_server.py` 测试脚本文件。
+每个 DELETE 成功返回信封 `{"code": 200, "message": "...", "data": null}`；对不存在的资源返回 404 信封；
+被引用的 SubAgent/Skill 返回 422 信封（参考 5.6 节）。另请删除第 4.1 步放入的
+`app/tmp_mcp_demo_server.py` 测试脚本文件。
 
 ### 9.2 停止容器与清理数据
 

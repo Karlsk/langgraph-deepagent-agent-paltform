@@ -301,6 +301,58 @@ def test_build_subagent_spec_unknown_tool_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
+# build_subagent_spec — skill_names inheritance
+# ---------------------------------------------------------------------------
+
+
+def test_build_subagent_spec_skill_names_none_inherits_parent_skills() -> None:
+    """``skill_names=None`` resolves to the parent's published skill set (verbatim)."""
+    spec = assembly.build_subagent_spec(
+        _make_subagent(skill_names=None),
+        parent_tools=[echo],
+        parent_model=_parent_model(),
+        resolve_model=lambda reference: _parent_model(),
+        parent_skills=["/pdf-export", "/csv-clean"],
+    )
+    assert spec.get("skills") == ["/pdf-export", "/csv-clean"]
+
+
+def test_build_subagent_spec_skill_names_empty_overrides_to_no_skills() -> None:
+    """``skill_names=[]`` explicitly binds no skills (overrides inheritance)."""
+    spec = assembly.build_subagent_spec(
+        _make_subagent(skill_names=[]),
+        parent_tools=[echo],
+        parent_model=_parent_model(),
+        resolve_model=lambda reference: _parent_model(),
+        parent_skills=["/pdf-export", "/csv-clean"],
+    )
+    assert "skills" not in spec
+
+
+def test_build_subagent_spec_skill_names_explicit_whitelist_prefixes_slash() -> None:
+    """Explicit ``skill_names=[..]`` is materialised as ``["/<name>", ...]``."""
+    spec = assembly.build_subagent_spec(
+        _make_subagent(skill_names=["pdf-export"]),
+        parent_tools=[echo],
+        parent_model=_parent_model(),
+        resolve_model=lambda reference: _parent_model(),
+        parent_skills=["/csv-clean"],
+    )
+    assert spec.get("skills") == ["/pdf-export"]
+
+
+def test_build_subagent_spec_default_parent_skills_empty_when_omitted() -> None:
+    """Omitting ``parent_skills`` defaults to an empty parent set (None -> [])."""
+    spec = assembly.build_subagent_spec(
+        _make_subagent(skill_names=None),
+        parent_tools=[echo],
+        parent_model=_parent_model(),
+        resolve_model=lambda reference: _parent_model(),
+    )
+    assert "skills" not in spec
+
+
+# ---------------------------------------------------------------------------
 # max_turns gate — looping fake model is terminated
 # ---------------------------------------------------------------------------
 
@@ -464,6 +516,7 @@ def test_compute_fingerprint_is_subagent_order_insensitive() -> None:
         {"app_cfg": _make_app(skill_names=["other"])},
         {"subagent_cfgs": [_make_subagent(max_turns=4)]},
         {"subagent_cfgs": [_make_subagent(system_prompt="new sub prompt")]},
+        {"subagent_cfgs": [_make_subagent(skill_names=["pdf-export"])]},
         {"skill_hashes": {"greet": "hash-b"}},
         {"mcp_fingerprint": "srv:hash-2"},
         {"model_fingerprint": "default/default:hash-2"},

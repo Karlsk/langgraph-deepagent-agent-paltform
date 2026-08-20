@@ -283,6 +283,47 @@ def test_delete_subagent_removes_row(client: TestClient) -> None:
     assert client.delete("/subagents/researcher").status_code == 404
 
 
+def test_create_subagent_with_skill_names_returns_field(client: TestClient) -> None:
+    """POST /subagents persists skill_names and surfaces it on the read payload."""
+    body = _subagent_body(skill_names=["pdf-export", "csv-clean"])
+    response = client.post("/subagents", json=body)
+    assert response.status_code == 201
+    payload = unwrap(response, expected_code=201)
+    assert payload["skill_names"] == ["pdf-export", "csv-clean"]
+
+
+def test_create_subagent_default_skill_names_is_null(client: TestClient) -> None:
+    """Omitting skill_names yields a NULL row (inherit parent app semantics)."""
+    response = client.post("/subagents", json=_subagent_body())
+    assert response.status_code == 201
+    assert unwrap(response, expected_code=201)["skill_names"] is None
+
+
+def test_patch_subagent_skill_names_bumps_hash_and_version(client: TestClient) -> None:
+    """skill_names is part of the content_hash; changing it invalidates the hash."""
+    created = unwrap(client.post("/subagents", json=_subagent_body()), expected_code=201)
+    response = client.patch("/subagents/researcher", json={"skill_names": ["pdf-export"]})
+    assert response.status_code == 200
+    payload = unwrap(response)
+    assert payload["skill_names"] == ["pdf-export"]
+    assert payload["version"] == 2
+    assert payload["content_hash"] != created["content_hash"]
+
+
+def test_delete_subagent_referenced_by_agent_app_rejected(client: TestClient, db_session: DBSession) -> None:
+    """A SubAgent bound by an AgentApp's subagent_names is delete-protected (422)."""
+    client.post("/subagents", json=_subagent_body())
+    _seed_default_pair(db_session)
+    unwrap(client.post("/apps", json=_app_body(subagent_names=["researcher"])), expected_code=201)
+    response = client.delete("/subagents/researcher")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == 422
+    assert "agent_app:support-app" in body["message"]
+    # Row is preserved; reads still succeed.
+    assert client.get("/subagents/researcher").status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # SubAgent test-run endpoint
 # ---------------------------------------------------------------------------
@@ -411,6 +452,38 @@ def test_delete_skill_removes_row(client: TestClient) -> None:
     assert client.delete("/skills/pdf-export").status_code == 200
     assert client.get("/skills/pdf-export").status_code == 404
     assert client.delete("/skills/pdf-export").status_code == 404
+
+
+def test_delete_skill_referenced_by_app_rejected(client: TestClient) -> None:
+    """A skill in any AgentApp.skill_names is delete-protected (422)."""
+    client.post("/skills", json=_skill_body())
+    unwrap(client.post("/apps", json=_app_body(skill_names=["pdf-export"])), expected_code=201)
+    response = client.delete("/skills/pdf-export")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == 422
+    assert "agent_app:support-app" in body["message"]
+    assert client.get("/skills/pdf-export").status_code == 200
+
+
+def test_delete_skill_referenced_by_subagent_rejected(client: TestClient) -> None:
+    """A skill in any SubAgentConfig.skill_names is delete-protected (422)."""
+    client.post("/skills", json=_skill_body())
+    client.post("/subagents", json=_subagent_body(skill_names=["pdf-export"]))
+    response = client.delete("/skills/pdf-export")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == 422
+    assert "subagent:researcher" in body["message"]
+    assert client.get("/skills/pdf-export").status_code == 200
+
+
+def test_delete_skill_inherit_subagent_not_blocked(client: TestClient) -> None:
+    """A SubAgent with skill_names=None does NOT block skill deletion (inherit mode)."""
+    client.post("/skills", json=_skill_body())
+    client.post("/subagents", json=_subagent_body())  # skill_names omitted -> None
+    response = client.delete("/skills/pdf-export")
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +670,55 @@ def test_publish_missing_subagent_reference_rejected(client: TestClient) -> None
     app_id = unwrap(client.post("/apps", json=_app_body(subagent_names=["ghost-sub"])), expected_code=201)["id"]
     response = client.post(f"/apps/{app_id}/publish")
     assert response.status_code == 422
+
+
+def test_publish_subagent_missing_skill_reference_rejected(client: TestClient, db_session: DBSession) -> None:
+    """A subagent's explicit skill_names must resolve to a real SkillAsset."""
+    client.post("/subagents", json=_subagent_body(skill_names=["ghost-skill"]))
+    _seed_default_pair(db_session)
+    app_id = unwrap(client.post("/apps", json=_app_body(subagent_names=["researcher"])), expected_code=201)["id"]
+    response = client.post(f"/apps/{app_id}/publish")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == 422
+    assert "ghost-skill" in body["message"]
+    assert "researcher" in body["message"]
+
+
+def test_publish_subagent_skills_union_with_app_skills_changes_hash(client: TestClient, db_session: DBSession) -> None:
+    """A subagent-only skill must be folded into the publish hash (recompile trigger).
+
+    App has only skill A; sub-agent adds skill B (not in app). Publishing the
+    same app with a different sub-agent (no skill B) must produce a different
+    ``published_hash`` because the sub-agent contributes to the fingerprint.
+    """
+    client.post("/skills", json=_skill_body(name="pdf-export"))
+    client.post("/skills", json=_skill_body(name="csv-clean", body="v2\n"))
+    _seed_default_pair(db_session)
+
+    # App + sub-agent bound to the extra skill only
+    client.post("/subagents", json=_subagent_body(skill_names=["csv-clean"]))
+    app_a = unwrap(
+        client.post(
+            "/apps",
+            json=_app_body(name="with-sub-skill", skill_names=["pdf-export"], subagent_names=["researcher"]),
+        ),
+        expected_code=201,
+    )["id"]
+    response_a = unwrap(client.post(f"/apps/{app_a}/publish"))
+
+    # App + a different sub-agent that contributes no extra skills
+    client.post("/subagents", json=_subagent_body(name="plain", skill_names=None))
+    app_b = unwrap(
+        client.post(
+            "/apps",
+            json=_app_body(name="plain-sub", skill_names=["pdf-export"], subagent_names=["plain"]),
+        ),
+        expected_code=201,
+    )["id"]
+    response_b = unwrap(client.post(f"/apps/{app_b}/publish"))
+
+    assert response_a["published_hash"] != response_b["published_hash"]
 
 
 def test_publish_unknown_app_404(client: TestClient) -> None:
@@ -937,9 +1059,7 @@ def test_mcp_router_registers_literal_paths_before_parametrized_name() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stdio_manifests_preview_returns_dry_run_report(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_stdio_manifests_preview_returns_dry_run_report(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """GET /mcp-servers/stdio-manifests returns the plan without writing."""
     report = {
         "scanned": 2,
@@ -1010,9 +1130,7 @@ def _seed_sse_server(client: TestClient) -> None:
     )
 
 
-def test_list_mcp_server_tools_returns_live_summaries(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_list_mcp_server_tools_returns_live_summaries(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """GET /mcp-servers/{name}/tools returns raw tool names, descriptions, schemas."""
     _seed_sse_server(client)
 
@@ -1082,9 +1200,7 @@ def test_call_mcp_server_tool_returns_result(client: TestClient, monkeypatch: py
 
 def test_call_mcp_server_tool_unknown_server_404(client: TestClient) -> None:
     """Calling a tool of a missing server returns 404."""
-    assert (
-        client.post("/mcp-servers/ghost/call-tool", json={"tool_name": "x", "arguments": {}}).status_code == 404
-    )
+    assert client.post("/mcp-servers/ghost/call-tool", json={"tool_name": "x", "arguments": {}}).status_code == 404
 
 
 @pytest.mark.parametrize(

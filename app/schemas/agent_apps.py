@@ -36,6 +36,16 @@ def _name_field(description: str) -> FieldInfo:
 class SubAgentCreate(BaseModel):
     """Request model for creating a reusable sub-agent.
 
+    Inheritance semantics for ``skill_names`` mirror those of the parent agent
+    app:
+
+    * ``None`` (default): inherit the parent AgentApp's published skill set.
+    * ``[]``: explicitly bind no skills (overrides parent inheritance).
+    * ``["pdf-export", ...]``: explicit whitelist scoped to this sub-agent.
+
+    Standalone single-shot tests (no parent app) treat ``None`` as ``[]``
+    because there is no parent to inherit from.
+
     Attributes:
         name: Globally unique sub-agent name (immutable after creation)
         description: Human-readable description shown to the orchestrating agent
@@ -44,6 +54,7 @@ class SubAgentCreate(BaseModel):
         allowed_tools: Optional tool whitelist (None = inherit from parent agent)
         model: Optional LLM model override
         max_turns: Optional turn budget limit
+        skill_names: Optional skill whitelist (None = inherit from parent agent)
     """
 
     name: str = _name_field("Globally unique sub-agent name")  # pyright: ignore[reportAssignmentType]
@@ -55,10 +66,22 @@ class SubAgentCreate(BaseModel):
     )
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     max_turns: Optional[int] = Field(default=None, ge=1, description="Optional turn budget limit")
+    skill_names: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Optional skill whitelist (None = inherit parent agent app's skill set, "
+            "[] = explicitly bind no skills, ['pdf-export', ...] = explicit whitelist)"
+        ),
+    )
 
 
 class SubAgentUpdate(BaseModel):
     """Partial update model for a sub-agent (PATCH semantics; name is immutable).
+
+    List/dict fields use whole-replacement semantics: passing a value replaces
+    the stored collection entirely; omitting it leaves it untouched. Use
+    ``skill_names`` to replace the bound skill whitelist; ``None`` means the
+    field was not provided in the request body.
 
     Attributes:
         description: Updated description
@@ -67,6 +90,7 @@ class SubAgentUpdate(BaseModel):
         allowed_tools: Updated tool whitelist (None = inherit from parent agent)
         model: Updated LLM model override
         max_turns: Updated turn budget limit
+        skill_names: Replacement skill whitelist (None = not provided in PATCH body)
     """
 
     description: Optional[str] = Field(default=None, description="Updated description")
@@ -77,6 +101,13 @@ class SubAgentUpdate(BaseModel):
     )
     model: Optional[str] = Field(default=None, description="Updated LLM model override")
     max_turns: Optional[int] = Field(default=None, ge=1, description="Updated turn budget limit")
+    skill_names: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Replacement skill whitelist (None = not provided; [] = explicitly no skills; "
+            "['pdf-export', ...] = explicit whitelist)"
+        ),
+    )
 
 
 class SubAgentRead(BaseModel):
@@ -90,6 +121,7 @@ class SubAgentRead(BaseModel):
         allowed_tools: Optional tool whitelist (None = inherit from parent agent)
         model: Optional LLM model override
         max_turns: Optional turn budget limit
+        skill_names: Optional skill whitelist (None = inherit parent agent app's skill set)
         content_hash: Hash of the effective content (used for publish/versioning)
         version: Monotonic configuration version counter
         created_by: Audit-only creator identifier
@@ -102,6 +134,13 @@ class SubAgentRead(BaseModel):
     allowed_tools: Optional[list[str]] = Field(default=None, description="Optional tool whitelist")
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     max_turns: Optional[int] = Field(default=None, description="Optional turn budget limit")
+    skill_names: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Optional skill whitelist (None = inherit parent agent app's skill set, "
+            "[] = explicitly bind no skills, [...] = explicit whitelist)"
+        ),
+    )
     content_hash: str = Field(..., description="Hash of the effective content")
     version: int = Field(..., description="Monotonic configuration version counter")
     created_by: Optional[str] = Field(default=None, description="Audit-only creator identifier")
@@ -382,7 +421,9 @@ class McpServerUpdate(BaseModel):
     args: Optional[list[str]] = Field(default=None, description="Replacement argument list for the stdio command")
     env: Optional[dict[str, str]] = Field(default=None, description="Replacement environment variables for stdio")
     url: Optional[str] = Field(default=None, description="Updated endpoint URL for sse/http transports")
-    headers: Optional[dict[str, str]] = Field(default=None, description="Replacement HTTP headers for sse/http transports")
+    headers: Optional[dict[str, str]] = Field(
+        default=None, description="Replacement HTTP headers for sse/http transports"
+    )
     enabled: Optional[bool] = Field(default=None, description="Updated active flag")
     description: Optional[str] = Field(default=None, description="Updated description")
 

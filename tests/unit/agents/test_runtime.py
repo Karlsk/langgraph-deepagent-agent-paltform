@@ -475,7 +475,8 @@ def _patch_get_runtime_seams(monkeypatch: pytest.MonkeyPatch, model: ScriptedCha
     monkeypatch.setattr(runtime, "_resolve_agent_app", fake_resolve)
     monkeypatch.setattr(runtime, "_load_subagents", lambda session, names: [])
 
-    async def fake_skill_hashes(session: Any, names: Any) -> dict[str, str]:
+    async def fake_skill_hashes(session: Any, app_names: Any, subagent_cfgs: Any = None) -> dict[str, str]:
+        del app_names, subagent_cfgs
         return {}
 
     async def fake_mcp_fingerprint(session: Any) -> str:

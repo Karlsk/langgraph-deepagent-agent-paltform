@@ -11,6 +11,7 @@ failures return 422; unexpected failures return 500 after ``logger.exception``.
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pathlib import Path
 from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
@@ -26,7 +27,7 @@ from app.api.v1.auth import get_current_session
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
-from app.models.agent_assets import SubAgentConfig
+from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.session import Session as ChatSession
 from app.schemas.agent_apps import (
     SubAgentCreate,
@@ -37,6 +38,8 @@ from app.schemas.agent_apps import (
 )
 from app.schemas.base import ApiResponse, PageResult
 from app.services.agents.test_runner import run_subagent_once
+import tempfile
+import shutil
 
 router = APIRouter()
 
@@ -56,8 +59,19 @@ def _subagent_content_hash(cfg: SubAgentConfig) -> str:
             "allowed_tools": cfg.allowed_tools,
             "model": cfg.model,
             "max_turns": cfg.max_turns,
+            "skill_names": cfg.skill_names,
         }
     )
+
+
+def _subagent_owners(db: DBSession, subagent_name: str) -> list[str]:
+    """Return agent-app names that bind ``subagent_name`` in their subagent list."""
+    owners: list[str] = []
+    for app in db.exec(select(AgentApp)).all():
+        names = list(getattr(app, "subagent_names", []) or [])
+        if subagent_name in names:
+            owners.append(f"agent_app:{app.name}")
+    return sorted(owners)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +177,7 @@ async def create_subagent(
             allowed_tools=payload.allowed_tools,
             model=payload.model,
             max_turns=payload.max_turns,
+            skill_names=payload.skill_names,
             content_hash="",
             created_by=_creator(current_session),
         )
@@ -288,6 +303,13 @@ async def delete_subagent(
         subagent = db.get(SubAgentConfig, name)
         if subagent is None:
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
+        owners = _subagent_owners(db, name)
+        if owners:
+            logger.warning("subagent_delete_rejected", name=name, reason="referenced", owners=owners)
+            raise HTTPException(
+                status_code=422,
+                detail=f"subagent '{name}' is referenced by: {', '.join(owners)}",
+            )
         db.delete(subagent)
         db.commit()
         logger.info("subagent_deleted", name=name)
@@ -327,7 +349,18 @@ async def test_subagent(
         if db.get(SubAgentConfig, name) is None:
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
         logger.info("subagent_test_requested", name=name, user_id=current_session.user_id)
-        return ApiResponse.success(await run_subagent_once(session=db, name=name, prompt=payload.prompt))
+        # ``run_subagent_once`` materialises bound skills into this tmp dir
+        # so the standalone graph can read them without touching the live
+        # ``settings.SKILLS_ROOT`` (test isolation contract).
+        tmp_skills_root = tempfile.mkdtemp(prefix="subagent-test-skills-")
+        try:
+            return ApiResponse.success(
+                await run_subagent_once(
+                    session=db, name=name, prompt=payload.prompt, tmp_skills_root=Path(tmp_skills_root)
+                )
+            )
+        finally:
+            shutil.rmtree(tmp_skills_root, ignore_errors=True)
     except HTTPException:
         raise
     except ValueError as exc:

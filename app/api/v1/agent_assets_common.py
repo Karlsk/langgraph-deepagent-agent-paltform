@@ -22,6 +22,7 @@ from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
 from app.core.logging import logger
+from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.session import Session as ChatSession
 from app.schemas.base import PageResult
 from app.services.database import database_service
@@ -102,6 +103,41 @@ def _validate_payload(model_type: type[_ModelT], body: dict[str, Any]) -> _Model
     except ValidationError as exc:
         logger.warning("agent_apps_payload_invalid", model=model_type.__name__, error=str(exc))
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _skill_owners(db: DBSession, skill_name: str) -> list[str]:
+    """Return asset labels that reference ``skill_name`` in their skill lists.
+
+    Looks at both ``AgentApp.skill_names`` (the global app-level binding) and
+    ``SubAgentConfig.skill_names`` (the per-sub-agent whitelist). Sub-agent
+    rows whose ``skill_names`` is ``None`` (inherit mode) are skipped because
+    they do not commit to a concrete binding until publish-time resolution.
+
+    Application-side filtering keeps the helper dialect-neutral (SQLite + PG)
+    and matches the small-N, read-heavy access pattern of the API endpoints.
+
+    Args:
+        db: Request-scoped DB session.
+        skill_name: Skill name to look up.
+
+    Returns:
+        Sorted, deduplicated list of owner labels in the form
+        ``agent_app:<name>`` or ``subagent:<name>``.
+    """
+    owners: set[str] = set()
+    apps = db.exec(select(AgentApp)).all()
+    for app in apps:
+        names = list(getattr(app, "skill_names", []) or [])
+        if skill_name in names:
+            owners.add(f"agent_app:{app.name}")
+    subagents = db.exec(select(SubAgentConfig)).all()
+    for sub in subagents:
+        names = getattr(sub, "skill_names", None)
+        if names is None:
+            continue  # inherit mode: no concrete binding yet
+        if skill_name in names:
+            owners.add(f"subagent:{sub.name}")
+    return sorted(owners)
 
 
 def paginate_by_name(
