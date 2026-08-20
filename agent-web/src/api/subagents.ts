@@ -33,6 +33,14 @@ export interface SubAgentRow {
   /** `provider/model` 引用；null → 运行时回退到 `default/default` */
   model: string | null
   max_turns: number | null
+  /**
+   * 绑定的 skill 资产名白名单（语义对称 `AgentApp.skill_names`）：
+   * - `null`：运行时继承父 AgentApp 的全集；
+   * - `[]`：显式不绑定任何 skill；
+   * - `[<name>, ...]`：显式白名单。
+   * 单轮测试无父级上下文时，`null` 在后端按 `[]` 处理。
+   */
+  skill_names: string[] | null
   content_hash: string
   version: number
   created_by: string | null
@@ -47,6 +55,11 @@ export interface SubAgentCreatePayload {
   allowed_tools?: string[] | null
   model?: string | null
   max_turns?: number | null
+  /**
+   * 绑定的 skill 资产名白名单。语义同 `SubAgentRow.skill_names`。
+   * 不传时后端默认 `null`（继承父 AgentApp）。
+   */
+  skill_names?: string[] | null
 }
 
 /** 部分更新 payload（对应后端 SubAgentUpdate；name 不可改；空对象会被后端 422 拒绝） */
@@ -57,6 +70,11 @@ export interface SubAgentPatchPayload {
   allowed_tools?: string[] | null
   model?: string | null
   max_turns?: number | null
+  /**
+   * 替换为新的 skill 白名单（语义同 `SubAgentRow.skill_names`）。
+   * `null` 视为在 PATCH 中未提供；`[]` 显式清空；`[<name>, ...]` 显式白名单。
+   */
+  skill_names?: string[] | null
 }
 
 /** 单轮测试运行请求 payload（对应后端 SubAgentTestRequest） */

@@ -29,6 +29,7 @@ import {
 } from '@/api/subagents'
 import { listToolCatalog, type ToolCatalogEntry } from '@/api/mcp'
 import { listAllProviderModels, type ModelConfigRow } from '@/api/provider'
+import { listSkills, type SkillRow } from '@/api/assets'
 import { useConfirm } from '@/composables/useConfirm'
 import { notifySuccess } from '@/utils/notify'
 import type { PageQuery, PageResult } from '@/types'
@@ -41,6 +42,7 @@ const columns: TableColumnConfig[] = [
   { label: '何时使用', prop: 'when_to_use', slot: 'whenToUse' },
   { label: '版本', prop: 'version', width: 80 },
   { label: '工具数', prop: 'allowed_tools', width: 90, slot: 'toolCount' },
+  { label: '技能', prop: 'skill_names', width: 90, slot: 'skillNames' },
   { label: '模型', prop: 'model', width: 180, slot: 'model' },
   { label: '操作', prop: 'actions', width: 220, slot: 'actions' },
 ]
@@ -84,6 +86,13 @@ interface ModelOption {
   providerName: string
 }
 const modelOptions = ref<ModelOption[]>([])
+
+/** skill 下拉选项：取自 listSkills（全局 skill 资产） */
+interface SkillOption {
+  value: string
+  label: string
+}
+const skillOptions = ref<SkillOption[]>([])
 const optionsLoading = ref(false)
 
 /** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 + 命名空间化 value */
@@ -124,11 +133,21 @@ async function loadModelOptions(): Promise<void> {
   }
 }
 
-/** 一次性预加载两个选项；任一失败不影响另一项 */
+/** 拉 skill 下拉选项：单次失败降级为空数组，下拉渲染「暂无选项」占位 */
+async function loadSkillOptions(): Promise<void> {
+  try {
+    const rows = await listSkills()
+    skillOptions.value = rows.map((row: SkillRow) => ({ value: row.name, label: row.name }))
+  } catch {
+    skillOptions.value = []
+  }
+}
+
+/** 一次性预加载三个选项；任一失败不影响另一项 */
 async function loadFormOptions(): Promise<void> {
   optionsLoading.value = true
   try {
-    await Promise.all([loadToolCatalogOptions(), loadModelOptions()])
+    await Promise.all([loadToolCatalogOptions(), loadModelOptions(), loadSkillOptions()])
   } finally {
     optionsLoading.value = false
   }
@@ -152,6 +171,13 @@ interface SubAgentFormShape {
   /** `provider/model` 引用；空字符串 → null → 运行时回退 default/default */
   model: string
   max_turns: number | null
+  /**
+   * 绑定的 skill 资产名白名单：
+   * - 空数组 → 后端 null（继承父 AgentApp）；
+   * - 非空数组 → 后端显式白名单；
+   * - 留空未选等同于 null。
+   */
+  skill_names: string[]
 }
 
 /** WebAgentFormDialog.open() 不传 data 时为 {}，字段 optional */
@@ -186,6 +212,7 @@ function handleEdit(row: SubAgentRow): void {
     allowed_tools: row.allowed_tools ? [...row.allowed_tools] : [],
     model: row.model ?? '',
     max_turns: row.max_turns,
+    skill_names: row.skill_names ? [...row.skill_names] : [],
   } satisfies SubAgentFormShape)
 }
 
@@ -212,6 +239,9 @@ function buildPayload(form: SubmitFormShape): {
     form.max_turns !== undefined && form.max_turns !== null && form.max_turns !== ('' as unknown as number)
       ? Number(form.max_turns)
       : null
+  const skillNames = Array.isArray(form.skill_names) && form.skill_names.length > 0
+    ? [...form.skill_names]
+    : null
 
   const create: SubAgentCreatePayload = {
     name,
@@ -221,6 +251,7 @@ function buildPayload(form: SubmitFormShape): {
     allowed_tools: allowedTools,
     model: modelValue,
     max_turns: maxTurns,
+    skill_names: skillNames,
   }
   const patch: SubAgentPatchPayload = {
     description,
@@ -229,6 +260,7 @@ function buildPayload(form: SubmitFormShape): {
     allowed_tools: allowedTools,
     model: modelValue,
     max_turns: maxTurns,
+    skill_names: skillNames,
   }
   return { create, patch }
 }
@@ -281,6 +313,22 @@ function toolCountText(row: SubAgentRow): string {
   return `${row.allowed_tools.length} 项`
 }
 
+/**
+ * skill_names 数组展示：
+ * - null → 「继承」（继承父 AgentApp 全集）；
+ * - [] → 「无」（显式不绑定）；
+ * - 非空 → 「N 项」。
+ */
+function skillNamesText(row: SubAgentRow): string {
+  if (row.skill_names === null || row.skill_names === undefined) {
+    return '继承'
+  }
+  if (row.skill_names.length === 0) {
+    return '无'
+  }
+  return `${row.skill_names.length} 项`
+}
+
 /** 模型展示：null → 「继承父应用」；否则显示 provider/model 引用 */
 function modelLabel(row: SubAgentRow): string {
   return row.model ?? '继承父应用'
@@ -316,6 +364,9 @@ function modelLabel(row: SubAgentRow): string {
         </template>
         <template #toolCount="{ row }">
           <span>{{ toolCountText(row as SubAgentRow) }}</span>
+        </template>
+        <template #skillNames="{ row }">
+          <span>{{ skillNamesText(row as SubAgentRow) }}</span>
         </template>
         <template #model="{ row }">
           <span class="subagent-model">{{ modelLabel(row as SubAgentRow) }}</span>
@@ -414,6 +465,27 @@ function modelLabel(row: SubAgentRow): string {
         </el-form-item>
         <el-form-item label="最大轮次" prop="max_turns">
           <el-input-number v-model="form.max_turns" :min="1" :max="50" placeholder="正整数；留空继承父应用" />
+        </el-form-item>
+        <el-form-item label="关联技能" prop="skill_names">
+          <el-select
+            v-model="form.skill_names"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            clearable
+            :loading="optionsLoading"
+            no-data-text="暂无可用技能（请先在 技能管理 页创建 skill 资产）"
+            placeholder="留空表示继承父 AgentApp；显式清空（点击清空按钮）则不绑定任何技能"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in skillOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
         </el-form-item>
       </template>
     </WebAgentFormDialog>

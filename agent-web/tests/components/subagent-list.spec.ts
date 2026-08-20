@@ -22,6 +22,7 @@ import type {
   SubAgentTestResult,
 } from '@/api/subagents'
 import type { PageResult } from '@/types'
+import type { SkillRow } from '@/api/assets'
 
 /**
  * element-plus mock：ElMessage 既可函数调用（notify.ts 走 ElMessage({ type })）
@@ -49,7 +50,8 @@ const confirmMock = elMessageBoxMock.confirm
 const elMessageFn = elMessageMock
 
 /**
- * 5 行 mock（覆盖 allowed_tools null / [] / 多项；model null / 默认 / 自定义；version 1..3）
+ * 5 行 mock（覆盖 allowed_tools null / [] / 多项；model null / 默认 / 自定义；version 1..3；
+ * skill_names null / [] / 多项，验证列展示的「继承 / 无 / N 项」三分支）
  */
 const ROWS: SubAgentRow[] = [
   {
@@ -60,6 +62,7 @@ const ROWS: SubAgentRow[] = [
     allowed_tools: ['duckduckgo_results_json'],
     model: null,
     max_turns: 3,
+    skill_names: null,
     content_hash: 'h1',
     version: 1,
     created_by: 'seed',
@@ -72,6 +75,7 @@ const ROWS: SubAgentRow[] = [
     allowed_tools: null,
     model: 'default/default',
     max_turns: null,
+    skill_names: [],
     content_hash: 'h2',
     version: 2,
     created_by: 'admin',
@@ -84,6 +88,7 @@ const ROWS: SubAgentRow[] = [
     allowed_tools: ['demo-stdio__echo', 'demo-stdio__add'],
     model: 'proxy/m3',
     max_turns: 5,
+    skill_names: ['pdf-export', 'csv-clean'],
     content_hash: 'h3',
     version: 1,
     created_by: 'admin',
@@ -96,6 +101,7 @@ const ROWS: SubAgentRow[] = [
     allowed_tools: null,
     model: 'default/default',
     max_turns: 2,
+    skill_names: ['pdf-export'],
     content_hash: 'h4',
     version: 3,
     created_by: 'seed',
@@ -108,10 +114,18 @@ const ROWS: SubAgentRow[] = [
     allowed_tools: [],
     model: null,
     max_turns: null,
+    skill_names: null,
     content_hash: 'h5',
     version: 1,
     created_by: 'seed',
   },
+]
+
+/** 3 条全局 skill 资产（SubAgentList 表单「关联技能」下拉的 options 来源） */
+const SKILL_ROWS: SkillRow[] = [
+  { name: 'pdf-export', description: '导出 PDF', content_hash: 'spdf', version: 1, created_by: 'seed' },
+  { name: 'csv-clean', description: '清洗 CSV', content_hash: 'scsv', version: 1, created_by: 'seed' },
+  { name: 'doc-writer', description: '撰写文档', content_hash: 'sdoc', version: 1, created_by: 'seed' },
 ]
 
 /**
@@ -143,6 +157,18 @@ const { mcpMock } = vi.hoisted(() => ({
 vi.mock('@/api/mcp', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/mcp')>()
   return { ...actual, listToolCatalog: mcpMock.listToolCatalog }
+})
+
+/**
+ * assets.ts 的 listSkills mock：仅取 name（SubAgentList 只用 value=label=name）。
+ * 默认返回 3 条全局技能资产，覆盖「全部 skill_names」选项来源。
+ */
+const { assetsMock } = vi.hoisted(() => ({
+  assetsMock: { listSkills: vi.fn() },
+}))
+vi.mock('@/api/assets', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/assets')>()
+  return { ...actual, listSkills: assetsMock.listSkills }
 })
 
 /**
@@ -496,6 +522,7 @@ beforeEach(() => {
         allowed_tools: payload.allowed_tools ?? null,
         model: payload.model ?? null,
         max_turns: payload.max_turns ?? null,
+        skill_names: payload.skill_names ?? null,
         content_hash: 'new-hash',
         version: 1,
         created_by: 'user',
@@ -513,6 +540,7 @@ beforeEach(() => {
           allowed_tools: null,
           model: null,
           max_turns: null,
+          skill_names: null,
           content_hash: '',
           version: 0,
           created_by: null,
@@ -551,6 +579,8 @@ beforeEach(() => {
     { id: 2, provider_name: 'proxy', name: 'm3', model_id: 'm3', ref: 'proxy/m3', context_size: null, extra_params: {}, enabled: true, created_by: null, created_at: null, updated_at: null },
     { id: 3, provider_name: 'default', name: 'fast', model_id: 'fast', ref: 'default/fast', context_size: null, extra_params: {}, enabled: true, created_by: null, created_at: null, updated_at: null },
   ])
+  // 全局 skill 资产：3 条（pdf-export / csv-clean / doc-writer），覆盖表单「关联技能」下拉
+  assetsMock.listSkills.mockResolvedValue(SKILL_ROWS.map((row) => ({ ...row })))
 })
 
 describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
@@ -570,8 +600,8 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
     expect(wrapper.text()).toContain('translator')
     expect(wrapper.text()).toContain('planner')
 
-    // 7 列：名称 / 描述 / 何时使用 / 版本 / 工具数 / 模型 / 操作
-    expect(wrapper.findAll('.el-table-column-stub')).toHaveLength(7)
+    // 8 列：名称 / 描述 / 何时使用 / 版本 / 工具数 / 技能 / 模型 / 操作
+    expect(wrapper.findAll('.el-table-column-stub')).toHaveLength(8)
   })
 
   it('工具数列：null / 空数组 → 「—」；非空 → 「N 项」', async () => {
@@ -632,6 +662,7 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
       allowed_tools: ['duckduckgo_results_json', 'demo-stdio__add'],
       model: 'proxy/m3',
       max_turns: null,
+      skill_names: null,
     } satisfies SubAgentCreatePayload)
     expect(elMessageFn).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'success', message: '已保存：new-lab' }),
@@ -748,5 +779,113 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
     await findRowButton(wrapper, '删除', 1).trigger('click')
     await flushPromises()
     expect(apiMock.listSubAgentsPage).toHaveBeenCalledTimes(2)
+  })
+
+  // ---------------------------------------------------------------------------
+  // skill_names 字段（task-d3a SubAgent Skill 关联化改造）
+  // ---------------------------------------------------------------------------
+
+  it('技能列：null → 「继承」；[] → 「无」；非空 → 「N 项」', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    // null 行（search-helper / planner）至少 2 次「继承」
+    const inheritMatches = wrapper.text().match(/继承/g) ?? []
+    expect(inheritMatches.length).toBeGreaterThanOrEqual(2)
+    // [] 行（code-reviewer）→「无」
+    expect(wrapper.text()).toContain('无')
+    // 1 项行（translator）→「1 项」
+    expect(wrapper.text()).toContain('1 项')
+    // 2 项行（echo-runner）→「2 项」
+    expect(wrapper.text()).toContain('2 项')
+  })
+
+  it('挂载时拉 listSkills 填充「关联技能」下拉的 options', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    // listSkills 在 onMounted 异步加载中；推进等待
+    expect(assetsMock.listSkills).toHaveBeenCalled()
+    await flushPromises()
+    // 打开创建弹窗，el-select 渲染时 options 来自 skillOptions
+    await findButton(wrapper, '新建子代理').trigger('click')
+    await flushPromises()
+
+    const selects = wrapper.findAllComponents(ElSelectStub)
+    // 第三个 el-select 是「关联技能」多选下拉（顺序：allowed_tools / model / skill_names）
+    const skillSelect = selects.find((sel) => sel.props('multiple') === true && sel.props('placeholder')?.includes('继承'))
+    expect(skillSelect).toBeDefined()
+  })
+
+  it('创建：skill_names 非空 → payload 携带白名单数组', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '新建子代理').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('input[placeholder="小写字母、数字、连字符、下划线"]').setValue('pdf-runner')
+    await wrapper.find('input[placeholder="一句话说明这个子代理的职责"]').setValue('PDF 导出')
+    await wrapper
+      .find('input[placeholder="什么场景下让 AgentApp 委派给此子代理"]')
+      .setValue('导出 PDF')
+    await wrapper
+      .find('textarea[placeholder="子代理的角色设定与行为约束"]')
+      .setValue('你负责 PDF 导出。')
+    // 通过 getForm() 注入 skill_names（绕开 el-select 真实下拉交互）
+    const formDialog = wrapper.findComponent({ name: 'WebAgentFormDialog' })
+    const form = formDialog.vm.getForm() as Record<string, unknown>
+    form.skill_names = ['pdf-export', 'csv-clean']
+    await findButton(wrapper, '确定').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.createSubAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ skill_names: ['pdf-export', 'csv-clean'] }),
+    )
+  })
+
+  it('创建：skill_names 留空 → payload 携带 null（继承父 AgentApp）', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '新建子代理').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('input[placeholder="小写字母、数字、连字符、下划线"]').setValue('inherit-skills')
+    await wrapper.find('input[placeholder="一句话说明这个子代理的职责"]').setValue('d2')
+    await wrapper
+      .find('input[placeholder="什么场景下让 AgentApp 委派给此子代理"]')
+      .setValue('w2')
+    await wrapper
+      .find('textarea[placeholder="子代理的角色设定与行为约束"]')
+      .setValue('s2')
+    await findButton(wrapper, '确定').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.createSubAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ skill_names: null }),
+    )
+  })
+
+  it('编辑：skill_names 回填现有白名单，提交 patch 时一并替换', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    // 编辑 echo-runner（skill_names=['pdf-export', 'csv-clean']）
+    await findRowButton(wrapper, '编辑', 2).trigger('click')
+    await flushPromises()
+
+    // 通过 getForm() 改 skill_names 为单元素
+    const formDialog = wrapper.findComponent({ name: 'WebAgentFormDialog' })
+    const form = formDialog.vm.getForm() as Record<string, unknown>
+    expect(form.skill_names).toEqual(['pdf-export', 'csv-clean'])
+    form.skill_names = ['doc-writer']
+    await findButton(wrapper, '确定').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.patchSubAgent).toHaveBeenCalledWith(
+      'echo-runner',
+      expect.objectContaining({ skill_names: ['doc-writer'] }),
+    )
   })
 })
