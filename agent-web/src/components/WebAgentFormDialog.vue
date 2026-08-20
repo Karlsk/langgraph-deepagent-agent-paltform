@@ -96,6 +96,8 @@ defineExpose({ open, close, setSubmitting, getForm })
     :model-value="props.modelValue"
     :title="props.title"
     :width="props.width"
+    append-to-body
+    :close-on-click-modal="false"
     @update:model-value="emit('update:modelValue', $event)"
     @close="handleClose"
   >

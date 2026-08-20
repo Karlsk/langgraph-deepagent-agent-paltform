@@ -243,6 +243,23 @@ body {
   .page-view__actions {
     margin-left: 0;
   }
+
+  /* 窄屏下让 el-dialog 占满视口并保留安全边距，避免「确定」按钮贴边 */
+  :where(.el-dialog) {
+    --el-dialog-width: 95vw;
+    margin: 6vh auto 0;
+  }
+
+  :where(.el-dialog__body) {
+    padding: 16px 16px 8px;
+  }
+
+  /* footer 按钮在窄屏下换行展示，保证不被裁切 */
+  :where(.el-dialog__footer) {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px 16px;
+  }
 }
 
 :where(button, a, input, textarea, select, [tabindex]):focus-visible {

@@ -359,7 +359,10 @@ const SubAgentTestDialogStub = defineComponent({
 const ElSelectStub = defineComponent({
   name: 'ElSelect',
   props: {
-    modelValue: { type: undefined, default: undefined },
+    modelValue: {
+      type: [String, Number, Boolean, Array, Object] as unknown as () => unknown,
+      default: undefined,
+    },
     multiple: { type: Boolean, default: false },
     placeholder: String,
     loading: { type: Boolean, default: false },
@@ -368,8 +371,10 @@ const ElSelectStub = defineComponent({
   setup(props, { slots }) {
     return () => {
       const display = Array.isArray(props.modelValue)
-        ? props.modelValue.join(',')
-        : props.modelValue ?? ''
+        ? (props.modelValue as unknown[]).map((v) => String(v ?? '')).join(',')
+        : props.modelValue != null
+          ? String(props.modelValue)
+          : ''
       return h(
         'div',
         { class: 'el-select-stub', 'data-multiple': String(props.multiple), 'data-value': display },
@@ -381,7 +386,11 @@ const ElSelectStub = defineComponent({
 
 const ElOptionStub = defineComponent({
   name: 'ElOption',
-  props: { value: undefined, label: undefined },
+  props: {
+    value: { type: [String, Number, Boolean, Object, Array] as unknown as () => unknown, default: undefined },
+    label: { type: [String, Number] as unknown as () => string | number, default: undefined },
+    disabled: { type: Boolean, default: false },
+  },
   setup(props, { slots }) {
     return () =>
       h(

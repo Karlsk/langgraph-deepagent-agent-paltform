@@ -79,6 +79,7 @@ function durationLabel(seconds: number): string {
     :model-value="modelValue"
     :title="`测试子代理 — ${agentName}`"
     width="640px"
+    append-to-body
     :close-on-click-modal="false"
     @update:model-value="emit('update:modelValue', $event)"
   >
