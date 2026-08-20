@@ -142,11 +142,12 @@ LOG_FORMAT=console
 
 | 工具名 | 来源文件 | 说明 |
 |---|---|---|
-| `duckduckgo_search` | `duckduckgo_search.py` | DuckDuckGo 搜索，返回最多 10 条结果 |
+| `duckduckgo_results_json` | `duckduckgo_search.py` | DuckDuckGo 搜索（`DuckDuckGoSearchResults` 实例名，返回最多 10 条结果） |
 | `ask_human` | `ask_human.py` | HIL 工具：调用 `interrupt()` 暂停执行向用户提问 |
 
-后续创建 AgentApp / SubAgent 时的 `allowed_tools` 只能从「内置工具 + 已注册 MCP server 暴露的工具」中
-选取，发布（publish）时会对照实时工具目录做白名单校验（越界返回 422）。
+后续创建 AgentApp / SubAgent 时的 `allowed_tools` 只能从「内置工具（裸名）+ 已注册 MCP server 暴露的
+工具（`{server}__{tool}` 命名空间名）」中选取，发布（publish）时会对照实时工具目录做白名单校验
+（越界返回 422）。MCP 专项测试见 [mcp-manual-testing.md](mcp-manual-testing.md)。
 
 ### 0.5 自定义 LLM 端点（用不了 GPT 官方时）
 
@@ -552,9 +553,10 @@ curl -s "$BASE/tools/catalog" -H "Authorization: Bearer $TOKEN"
 ```
 
 **预期**：信封 `data` 数组中同时包含：
-- 内置工具：`{"name": "duckduckgo_search", "source": "builtin"}`、`{"name": "ask_human", "source": "builtin"}`；
-- MCP 工具：`{"name": "add", "source": "mcp", "server": "demo-stdio"}`、
-  `{"name": "echo", "source": "mcp", "server": "demo-stdio"}`。
+- 内置工具（裸名）：`{"name": "duckduckgo_results_json", "source": "builtin"}`、
+  `{"name": "ask_human", "source": "builtin"}`；
+- MCP 工具（`{server}__{tool}` 命名空间名）：`{"name": "demo-stdio__add", "source": "mcp", "server": "demo-stdio"}`、
+  `{"name": "demo-stdio__echo", "source": "mcp", "server": "demo-stdio"}`。
 
 **失败排查**：看不到 mcp 工具时查 `make docker-logs`，关注 `mcp_tools_pre_warm_failed_degraded`
 与 per-server 加载失败日志；常见原因是脚本路径在容器内不存在或 `mcp` 依赖缺失。
@@ -614,9 +616,9 @@ curl -s -X POST "$BASE/mcp-servers" \
 同理可验证 `python -c` 内联模式：把 `command` 改为 `"python"`、`args` 改为 `["-c", "print(1)"]`，
 预期 422 信封，`message` 为 `stdio args must not use inline execution modes (-c/-m)`。
 
-### 4.6 负向用例：重名工具被拒绝
+### 4.6 跨 server 同名工具并存（命名空间行为）
 
-再注册一个指向**同一脚本**的 server（工具名 `add`/`echo` 与 `demo-stdio` 冲突）：
+再注册一个指向**同一脚本**的 server（工具裸名同为 `add`/`echo`）：
 
 ```bash
 curl -s -X POST "$BASE/mcp-servers" \
@@ -630,8 +632,9 @@ curl -s -X POST "$BASE/mcp-servers" \
   }'
 ```
 
-**预期**：探活成功时返回 422 信封，`message` 指出工具名冲突（collision）。
-若探活失败/超时（返回 None），冲突检查会被跳过而创建成功（HTTP 201 信封）——此时查日志确认
+**预期**：HTTP **201**（工具目录按 `{server}__{tool}` 命名空间隔离，`demo-stdio__add` 与
+`demo-stdio-dup__add` 并存，不再报冲突；冲突检测按 namespaced 名与现有目录比对）。
+若探活失败/超时（返回 None），冲突检查被跳过同样创建成功——此时查日志确认
 `mcp_server_tool_probe_timeout` / `mcp_server_tool_probe_failed`，属于设计上的降级行为。
 
 > 另可用 `GET/PATCH/DELETE $BASE/mcp-servers/demo-stdio` 验证单条读改删；
@@ -840,7 +843,7 @@ curl -s -X POST "$BASE/apps" \
   -d '{
     "name": "demo-assistant",
     "system_prompt": "你是一个演示助理，可搜索网络、调用 demo 计算工具，并能委派搜索任务给子代理。",
-    "allowed_tools": ["duckduckgo_search", "add", "echo"],
+    "allowed_tools": ["duckduckgo_results_json", "demo-stdio__add", "demo-stdio__echo"],
     "skill_names": ["csv-report"],
     "subagent_names": ["search-helper"]
   }'
@@ -1029,9 +1032,9 @@ export HIL_APP_ID=$(curl -s -X POST "$BASE/apps" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "hil-demo",
-    "system_prompt": "你是一个演示助理。当用户要求搜索时，必须调用 duckduckgo_search 工具。",
-    "allowed_tools": ["duckduckgo_search"],
-    "interrupt_on": {"duckduckgo_search": true}
+    "system_prompt": "你是一个演示助理。当用户要求搜索时，必须调用 duckduckgo_results_json 工具。",
+    "allowed_tools": ["duckduckgo_results_json"],
+    "interrupt_on": {"duckduckgo_results_json": true}
   }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])')
 
 curl -s -X POST "$BASE/apps/$HIL_APP_ID/publish" -H "Authorization: Bearer $TOKEN"
