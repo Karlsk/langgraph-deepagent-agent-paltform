@@ -15,6 +15,7 @@ import time
 from collections.abc import Generator
 from typing import Any, ClassVar
 
+import httpx
 import pytest
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
@@ -70,6 +71,10 @@ class FakeClientSession:
     """In-memory stand-in for mcp.ClientSession (records lifecycle)."""
 
     instances: ClassVar[list["FakeClientSession"]] = []
+    # Cancellation script: when set, initialize() raises CancelledError the way
+    # a transport task group cancels the pending initialize while a sibling
+    # transport task has already failed (root cause surfaces on CM exit).
+    raise_cancel_in_initialize: ClassVar[bool] = False
 
     def __init__(self) -> None:
         """Initialize lifecycle flags and register the instance."""
@@ -79,12 +84,22 @@ class FakeClientSession:
         FakeClientSession.instances.append(self)
 
     async def initialize(self) -> None:
-        """Mark the session as initialized."""
+        """Mark the session as initialized, or raise the scripted transport cancel."""
+        if FakeClientSession.raise_cancel_in_initialize:
+            raise asyncio.CancelledError("Cancelled by cancel scope ffff69963100")
         self.initialized = True
 
 
 class FakeSessionCM:
     """Async-context-manager stand-in for the adapter session factory."""
+
+    # Cancellation exit script: how __aexit__ behaves when it receives a
+    # CancelledError (mirrors anyio task-group teardown):
+    # "replace_with_exception_group" -> raise ExceptionGroup[ConnectError]
+    # (root cause collected from the failed sibling transport task, the real
+    # streamable-http/stdio unwind behavior); None -> propagate the cancel
+    # untouched (genuine external cancellation, e.g. process shutdown).
+    cancel_exit_mode: ClassVar[str | None] = None
 
     def __init__(self, connection: dict[str, Any]) -> None:
         """Create the fake session and remember the connection it serves."""
@@ -103,9 +118,20 @@ class FakeSessionCM:
         exceptions raised *inside* the context get replaced by
         "unhandled errors in a TaskGroup" teardown errors. Reproducing that here
         guards request-level errors (422-class) from being swallowed into 502s.
+        A CancelledError is replaced the same way when
+        ``cancel_exit_mode == "replace_with_exception_group"`` (transport-level
+        cancel whose root cause is the failed sibling task); otherwise the
+        cancel propagates untouched (genuine external cancellation).
         """
         self.session.closed = True
-        if exc_info[0] is not None and exc_info[0] is not asyncio.CancelledError:
+        if exc_info[0] is not None and issubclass(exc_info[0], asyncio.CancelledError):
+            if FakeSessionCM.cancel_exit_mode == "replace_with_exception_group":
+                raise ExceptionGroup(
+                    "unhandled errors in a TaskGroup",
+                    [httpx.ConnectError("All connection attempts failed")],
+                ) from exc_info[1]
+            return False
+        if exc_info[0] is not None:
             raise RuntimeError("unhandled errors in a TaskGroup (1 sub-exception)") from exc_info[1]
         return False
 
@@ -141,6 +167,8 @@ async def _fake_load_mcp_tools(
 def _patch_adapters(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     """Replace the adapter entry points and reset all module/pool state."""
     FakeClientSession.instances = []
+    FakeClientSession.raise_cancel_in_initialize = False
+    FakeSessionCM.cancel_exit_mode = None
     _BEHAVIORS.clear()
     _load_calls.clear()
     monkeypatch.setattr(mcp_client, "create_session", _fake_create_session)
@@ -275,6 +303,50 @@ def test_load_error_is_not_cached() -> None:
     _BEHAVIORS["flaky"] = {"fail_times": 0, "tool_names": ["recover"]}
     tools = asyncio.run(mcp_client.load_server_tools(_stdio_spec("flaky")))
     assert [tool.name for tool in tools] == ["flaky__recover"]
+
+
+def test_transport_cancel_converted_and_degrades() -> None:
+    """A transport-level cancel injected into initialize() degrades, not crashes.
+
+    Mirrors the 2026-08-24 startup crash: an unreachable streamable-http server
+    fails its transport task, the task group cancels the pending initialize()
+    with CancelledError, and the CM exit replaces that cancel with the
+    root-cause ExceptionGroup (an Exception subclass). Tenacity then retries
+    like any other failure and load_server_tools degrades per-server instead
+    of the CancelledError piercing every guard up to the lifespan.
+    """
+    FakeClientSession.raise_cancel_in_initialize = True
+    FakeSessionCM.cancel_exit_mode = "replace_with_exception_group"
+
+    assert asyncio.run(mcp_client.load_server_tools(_http_spec("unreachable"))) is None
+
+    assert len(FakeClientSession.instances) == 3  # tenacity attempted exactly three times
+    assert all(instance.closed for instance in FakeClientSession.instances)
+    assert _counter_value(mcp_tools_loaded_total, server="unreachable", status="error") >= 1
+
+
+def test_genuine_cancel_propagates_undegraded() -> None:
+    """A genuine external cancellation propagates — never swallowed into degradation."""
+    FakeClientSession.raise_cancel_in_initialize = True
+    FakeSessionCM.cancel_exit_mode = None  # CM exit propagates the CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(mcp_client.load_server_tools(_http_spec("shutdown")))
+
+    assert len(FakeClientSession.instances) == 1  # genuine cancels are never retried
+    assert FakeClientSession.instances[0].closed
+
+
+def test_plain_failure_still_retries_and_never_caches_error() -> None:
+    """Plain (non-cancel) failures keep the current contract: retry, degrade, never cache."""
+    _BEHAVIORS["broken-stdio"] = {"fail_times": 99}
+
+    assert asyncio.run(mcp_client.load_server_tools(_stdio_spec("broken-stdio"))) is None
+    assert asyncio.run(mcp_client.load_server_tools(_stdio_spec("broken-stdio"))) is None
+
+    assert _load_calls["broken-stdio"] == 6  # three attempts per load, error never cached
+    assert all(instance.closed for instance in FakeClientSession.instances)
+    assert mcp_client._sessions == {}  # noqa: SLF001 — test introspection
 
 
 def test_unresolved_placeholder_load_returns_none_without_connecting(monkeypatch: pytest.MonkeyPatch) -> None:

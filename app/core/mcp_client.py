@@ -34,7 +34,7 @@ import json
 import os
 import re
 import time
-from contextlib import AbstractAsyncContextManager, suppress
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -297,20 +297,33 @@ async def _open_session_and_load(
 ) -> tuple[AbstractAsyncContextManager[ClientSession], ClientSession, list[BaseTool]]:
     """Open + initialize one session and load its raw tools (inside tenacity).
 
-    The session context manager is closed on failure before re-raising so a
-    retried attempt never leaks transports or stdio child processes.
+    On failure the session context manager is exited with the real exception
+    (never a clean exit): the adapter transports wrap an anyio task group
+    whose teardown replaces a transport-level CancelledError injected into
+    ``initialize()`` with the root-cause ``ExceptionGroup`` (an Exception
+    subclass -> retryable / degradable), while a genuine external cancellation
+    propagates unchanged. Either way a retried attempt never leaks transports
+    or stdio child processes.
 
     Raises:
-        Exception: Whatever the transport, initialize or tool listing raised.
+        Exception: Whatever the transport, initialize or tool listing raised
+            (a transport-level cancel surfaces as its root-cause group).
     """
     cm = create_session(connection)
     session = await cm.__aenter__()
     try:
         await session.initialize()
         raw_tools = await load_mcp_tools(session, server_name=spec.name)
-    except BaseException:
-        with suppress(Exception):
-            await cm.__aexit__(None, None, None)
+    except BaseException as exc:
+        try:
+            await cm.__aexit__(type(exc), exc, exc.__traceback__)
+        except BaseException as exit_exc:  # noqa: BLE001 — re-raised below with the original as cause
+            # Task-group teardown replaced the exception (transport cancel ->
+            # root-cause ExceptionGroup) or the exit itself was cancelled;
+            # the exit outcome is the authoritative error to propagate.
+            raise exit_exc from exc
+        # Clean CM exit (e.g. a cancel scope absorbing its own cancellation):
+        # keep the original exception.
         raise
     return cm, session, raw_tools
 
