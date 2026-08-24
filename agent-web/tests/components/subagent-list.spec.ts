@@ -141,6 +141,8 @@ const { apiMock } = vi.hoisted(() => {
     patchSubAgent: vi.fn(),
     deleteSubAgent: vi.fn(),
     testSubAgent: vi.fn(),
+    listSubAgentTestTraces: vi.fn(),
+    getSubAgentTestTrace: vi.fn(),
   }
   return { apiMock: mock }
 })
@@ -369,10 +371,55 @@ const SubAgentTestDialogStub = defineComponent({
     modelValue: { type: Boolean, default: false },
     agentName: { type: String, default: '' },
   },
+  emits: ['open-trace'],
+  setup(props, { emit }) {
+    return () =>
+      props.modelValue
+        ? h('div', {
+            class: 'subagent-test-dialog-stub',
+            'data-agent-name': props.agentName,
+            onClick: () => emit('open-trace', 7),
+          })
+        : null
+  },
+})
+
+/** 子组件 SubAgentTraceHistoryDialog 的简单 stub：点击上抛 open-detail */
+const SubAgentTraceHistoryDialogStub = defineComponent({
+  name: 'SubAgentTraceHistoryDialog',
+  props: {
+    modelValue: { type: Boolean, default: false },
+    agentName: { type: String, default: '' },
+  },
+  emits: ['open-detail'],
+  setup(props, { emit }) {
+    return () =>
+      props.modelValue
+        ? h('div', {
+            class: 'subagent-trace-history-dialog-stub',
+            'data-agent-name': props.agentName,
+            onClick: () => emit('open-detail', 42),
+          })
+        : null
+  },
+})
+
+/** 子组件 SubAgentTraceDetailDialog 的简单 stub：暴露 agentName 与 traceId 便于断言 */
+const SubAgentTraceDetailDialogStub = defineComponent({
+  name: 'SubAgentTraceDetailDialog',
+  props: {
+    modelValue: { type: Boolean, default: false },
+    agentName: { type: String, default: '' },
+    traceId: { type: Number as unknown as () => number | null, default: null },
+  },
   setup(props) {
     return () =>
       props.modelValue
-        ? h('div', { class: 'subagent-test-dialog-stub', 'data-agent-name': props.agentName })
+        ? h('div', {
+            class: 'subagent-trace-detail-dialog-stub',
+            'data-agent-name': props.agentName,
+            'data-trace-id': String(props.traceId ?? ''),
+          })
         : null
   },
 })
@@ -459,6 +506,8 @@ function mountPage(): VueWrapper {
         ElOptionGroup: ElOptionGroupStub,
         ElIcon: true,
         SubAgentTestDialog: SubAgentTestDialogStub,
+        SubAgentTraceHistoryDialog: SubAgentTraceHistoryDialogStub,
+        SubAgentTraceDetailDialog: SubAgentTraceDetailDialogStub,
       },
       directives: { loading: () => undefined },
     },
@@ -564,8 +613,11 @@ beforeEach(() => {
       turns: 1,
       duration_seconds: 1.42,
       model: 'default/default',
+      trace_id: 7,
     }),
   )
+  apiMock.listSubAgentTestTraces.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 10 })
+  apiMock.getSubAgentTestTrace.mockResolvedValue(null)
   // 工具目录默认返回 2 builtin + 2 mcp（覆盖 el-option-group 分组渲染路径）。
   // mcp 条目 name 与真实后端 build_tool_catalog 一致：已是 `${server}__${tool}`
   // 命名空间名（非裸名）——历史上 mock 写成裸名，掩盖了表单双重拼接 bug。
@@ -907,5 +959,53 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
       'echo-runner',
       expect.objectContaining({ skill_names: ['doc-writer'] }),
     )
+  })
+
+  // ---------------------------------------------------------------------------
+  // 测试历史与追踪详情（SubAgent 测试运行全链路追踪前端适配）
+  // ---------------------------------------------------------------------------
+
+  it('「历史」按钮打开历史弹窗并回填 agentName；行内详情上抛后打开详情弹窗', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findRowButton(wrapper, '历史', 1).trigger('click')
+    await flushPromises()
+
+    const historyStub = wrapper.findComponent(SubAgentTraceHistoryDialogStub)
+    expect(historyStub.exists()).toBe(true)
+    expect(historyStub.attributes('data-agent-name')).toBe('code-reviewer')
+    expect(historyStub.props('modelValue')).toBe(true)
+    expect(wrapper.find('.subagent-trace-detail-dialog-stub').exists()).toBe(false)
+
+    // 历史弹窗上抛 open-detail(42) → 详情弹窗打开并携带 agentName + traceId
+    await historyStub.trigger('click')
+    await flushPromises()
+
+    const detailStub = wrapper.findComponent(SubAgentTraceDetailDialogStub)
+    expect(detailStub.exists()).toBe(true)
+    expect(detailStub.attributes('data-agent-name')).toBe('code-reviewer')
+    expect(detailStub.attributes('data-trace-id')).toBe('42')
+  })
+
+  it('测试弹窗「查看执行详情」上抛 open-trace 后打开详情弹窗', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findRowButton(wrapper, '测试', 0).trigger('click')
+    await flushPromises()
+
+    const testStub = wrapper.findComponent(SubAgentTestDialogStub)
+    expect(testStub.exists()).toBe(true)
+    expect(wrapper.find('.subagent-trace-detail-dialog-stub').exists()).toBe(false)
+
+    // stub 点击上抛 open-trace(7) → 详情弹窗打开并携带 traceId
+    await testStub.trigger('click')
+    await flushPromises()
+
+    const detailStub = wrapper.findComponent(SubAgentTraceDetailDialogStub)
+    expect(detailStub.exists()).toBe(true)
+    expect(detailStub.attributes('data-agent-name')).toBe('search-helper')
+    expect(detailStub.attributes('data-trace-id')).toBe('7')
   })
 })

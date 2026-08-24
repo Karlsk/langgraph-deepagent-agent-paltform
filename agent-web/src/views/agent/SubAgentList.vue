@@ -35,6 +35,8 @@ import { notifySuccess } from '@/utils/notify'
 import type { PageQuery, PageResult } from '@/types'
 
 import SubAgentTestDialog from '@/views/agent/SubAgentTestDialog.vue'
+import SubAgentTraceHistoryDialog from '@/views/agent/SubAgentTraceHistoryDialog.vue'
+import SubAgentTraceDetailDialog from '@/views/agent/SubAgentTraceDetailDialog.vue'
 
 const columns: TableColumnConfig[] = [
   { label: '名称', prop: 'name', width: 160, slot: 'name' },
@@ -44,7 +46,7 @@ const columns: TableColumnConfig[] = [
   { label: '工具数', prop: 'allowed_tools', width: 90, slot: 'toolCount' },
   { label: '技能', prop: 'skill_names', width: 90, slot: 'skillNames' },
   { label: '模型', prop: 'model', width: 180, slot: 'model' },
-  { label: '操作', prop: 'actions', width: 220, slot: 'actions' },
+  { label: '操作', prop: 'actions', width: 260, slot: 'actions' },
 ]
 
 /** 表格数据源：直接透传到 listSubAgentsPage，由后端做分页 / 关键字过滤 */
@@ -63,6 +65,24 @@ const testDialogAgentName = ref<string | null>(null)
 function openTestDialog(row: SubAgentRow): void {
   testDialogAgentName.value = row.name
   testDialogVisible.value = true
+}
+
+/** 测试历史弹窗状态 */
+const historyDialogVisible = ref(false)
+const historyDialogAgentName = ref<string | null>(null)
+function openHistoryDialog(row: SubAgentRow): void {
+  historyDialogAgentName.value = row.name
+  historyDialogVisible.value = true
+}
+
+/** 追踪详情弹窗状态：由历史弹窗「详情」或测试弹窗「查看执行详情」触发 */
+const detailDialogVisible = ref(false)
+const detailDialogAgentName = ref<string | null>(null)
+const detailTraceId = ref<number | null>(null)
+function openDetailDialog(agentName: string, traceId: number): void {
+  detailDialogAgentName.value = agentName
+  detailTraceId.value = traceId
+  detailDialogVisible.value = true
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +395,9 @@ function modelLabel(row: SubAgentRow): string {
           <el-button link type="primary" size="small" @click="openTestDialog(row as SubAgentRow)">
             测试
           </el-button>
+          <el-button link type="primary" size="small" @click="openHistoryDialog(row as SubAgentRow)">
+            历史
+          </el-button>
           <el-button link type="primary" size="small" @click="handleEdit(row as SubAgentRow)">
             编辑
           </el-button>
@@ -494,6 +517,21 @@ function modelLabel(row: SubAgentRow): string {
       v-if="testDialogAgentName"
       v-model="testDialogVisible"
       :agent-name="testDialogAgentName"
+      @open-trace="(traceId) => openDetailDialog(testDialogAgentName!, traceId)"
+    />
+
+    <SubAgentTraceHistoryDialog
+      v-if="historyDialogAgentName"
+      v-model="historyDialogVisible"
+      :agent-name="historyDialogAgentName"
+      @open-detail="(traceId) => openDetailDialog(historyDialogAgentName!, traceId)"
+    />
+
+    <SubAgentTraceDetailDialog
+      v-if="detailDialogAgentName"
+      v-model="detailDialogVisible"
+      :agent-name="detailDialogAgentName"
+      :trace-id="detailTraceId"
     />
   </div>
 </template>

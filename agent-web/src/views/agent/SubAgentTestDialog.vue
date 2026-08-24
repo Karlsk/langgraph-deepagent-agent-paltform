@@ -5,6 +5,8 @@
  * - 入参：单行 prompt（textarea）；
  * - 调用：POST /subagents/{name}/test（testSubAgent），⚠️ 消耗 LLM token；
  * - 结果：final_message（可滚动展示）/ turns / duration_seconds / model；
+ *   结果区附「查看执行详情」入口（trace_id 非空时），上抛 `open-trace` 由父级
+ *   打开追踪详情弹窗；
  * - 失败：由 request.ts 全局拦截器 ElMessage.error 提示；本组件不重复 toast；
  * - 受 RATE_LIMIT_SUBAGENT_TEST 限流（默认 5 次/分钟）。
  */
@@ -24,6 +26,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
+  'open-trace': [traceId: number]
 }>()
 
 /* -------------------------------------------------------------------------- */
@@ -72,6 +75,13 @@ function durationLabel(seconds: number): string {
   if (seconds < 1) return `${Math.round(seconds * 1000)}ms`
   return `${seconds.toFixed(2)}s`
 }
+
+/** trace 落盘成功时上抛详情入口；落盘失败（trace_id 为 null）不展示按钮 */
+function handleOpenTrace(): void {
+  if (result.value?.trace_id != null) {
+    emit('open-trace', result.value.trace_id)
+  }
+}
 </script>
 
 <template>
@@ -103,6 +113,15 @@ function durationLabel(seconds: number): string {
           <span>轮次：{{ result.turns }}</span>
           <span>耗时：{{ durationLabel(result.duration_seconds) }}</span>
           <span>模型：{{ result.model }}</span>
+          <el-button
+            v-if="result.trace_id != null"
+            link
+            type="primary"
+            size="small"
+            @click="handleOpenTrace"
+          >
+            查看执行详情
+          </el-button>
         </div>
         <div class="subagent-test-dialog__field-label">final_message</div>
         <pre class="subagent-test-dialog__message">{{ result.final_message }}</pre>
