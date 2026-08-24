@@ -196,7 +196,8 @@ export function callMcpServerTool(
  *
  * SubAgent 允许的工具下拉选项与后端 {@code allowed_tools} 字段命名空间一致：
  * - builtin：`entry.name`（裸名，如 `duckduckgo_results_json`）
- * - mcp：`${entry.server}__${entry.name}`（如 `demo-stdio__echo`）
+ * - mcp：`entry.name` 已是 `${server}__${tool}` 命名空间名（如 `demo-stdio__echo`），
+ *   直接作为 allowed_tools 取值，勿再拼接前缀（否则产生双前缀失效名）
  *
  * 响应内容由后端 `build_tool_catalog` 服务函数实时聚合，不读缓存；
  * tool 注册状态变化后调用本接口可拿到最新快照。

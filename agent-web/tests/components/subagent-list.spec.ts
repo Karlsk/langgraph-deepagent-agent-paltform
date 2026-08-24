@@ -566,12 +566,14 @@ beforeEach(() => {
       model: 'default/default',
     }),
   )
-  // 工具目录默认返回 2 builtin + 2 mcp（覆盖 el-option-group 分组渲染路径）
+  // 工具目录默认返回 2 builtin + 2 mcp（覆盖 el-option-group 分组渲染路径）。
+  // mcp 条目 name 与真实后端 build_tool_catalog 一致：已是 `${server}__${tool}`
+  // 命名空间名（非裸名）——历史上 mock 写成裸名，掩盖了表单双重拼接 bug。
   mcpMock.listToolCatalog.mockResolvedValue([
     { name: 'duckduckgo_results_json', source: 'builtin', server: null },
     { name: 'echo', source: 'builtin', server: null },
-    { name: 'add', source: 'mcp', server: 'demo-stdio' },
-    { name: 'greet', source: 'mcp', server: 'demo-stdio' },
+    { name: 'demo-stdio__add', source: 'mcp', server: 'demo-stdio' },
+    { name: 'demo-stdio__greet', source: 'mcp', server: 'demo-stdio' },
   ])
   // 模型聚合默认返回 3 条（覆盖 el-select filterable 路径 + 跨 provider）
   providerMock.listAllProviderModels.mockResolvedValue([
@@ -815,6 +817,24 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
     // 第三个 el-select 是「关联技能」多选下拉（顺序：allowed_tools / model / skill_names）
     const skillSelect = selects.find((sel) => sel.props('multiple') === true && sel.props('placeholder')?.includes('继承'))
     expect(skillSelect).toBeDefined()
+  })
+
+  it('工具下拉 value：mcp 条目直接用命名空间名，不得二次拼接前缀', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '新建子代理').trigger('click')
+    await flushPromises()
+
+    // 回归守卫：catalog 的 mcp 条目 name 已是 `${server}__${tool}`，
+    // projectCatalog 若再拼一层会产生 `demo-stdio__demo-stdio__add` 双前缀
+    // 失效名（与运行时 tool_index 键不匹配，resolve_tools 直接 ValueError）。
+    const optionValues = wrapper
+      .findAll('.el-option-stub')
+      .map((option) => option.attributes('data-value'))
+    expect(optionValues).toContain('demo-stdio__add')
+    expect(optionValues).toContain('demo-stdio__greet')
+    expect(optionValues.join('\n')).not.toContain('demo-stdio__demo-stdio__')
   })
 
   it('创建：skill_names 非空 → payload 携带白名单数组', async () => {

@@ -95,15 +95,15 @@ interface SkillOption {
 const skillOptions = ref<SkillOption[]>([])
 const optionsLoading = ref(false)
 
-/** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 + 命名空间化 value */
+/** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 */
 function projectCatalog(entries: ToolCatalogEntry[]): ToolOption[] {
   return entries.map((entry) => {
     if (entry.source === 'mcp' && entry.server) {
-      return {
-        value: `${entry.server}__${entry.name}`,
-        label: `${entry.server} / ${entry.name}`,
-        group: 'mcp',
-      }
+      // 后端 entry.name 已是 `${server}__${tool}` 命名空间名，直接作为 value；
+      // label 拆掉命名空间前缀，保持「server / 裸工具名」展示
+      const prefix = `${entry.server}__`
+      const bareName = entry.name.startsWith(prefix) ? entry.name.slice(prefix.length) : entry.name
+      return { value: entry.name, label: `${entry.server} / ${bareName}`, group: 'mcp' }
     }
     return { value: entry.name, label: entry.name, group: 'builtin' }
   })
