@@ -117,6 +117,40 @@ export function deleteSkill(name: string): Promise<null> {
   return del<null>(`/skills/${encodeURIComponent(name)}`)
 }
 
+/** 单个 skill 的磁盘刷新结果（对应后端 SkillRefreshEntry.action 四态） */
+export type SkillRefreshAction = 'rewritten' | 'unchanged' | 'backfilled' | 'missing'
+
+/** 磁盘刷新结果条目（对应后端 SkillRefreshEntry） */
+export interface SkillRefreshEntry {
+  name: string
+  action: SkillRefreshAction
+}
+
+/** 磁盘刷新报告（对应后端 SkillRefreshReport）：per-skill 明细 + 四态计数 */
+export interface SkillRefreshReport {
+  items: SkillRefreshEntry[]
+  total: number
+  rewritten: number
+  unchanged: number
+  backfilled: number
+  missing: number
+}
+
+/**
+ * 全量刷新磁盘副本：POST /skills/refresh。
+ * DB 正文是真相源，磁盘 SKILL.md 是运行副本；content_hash 一致的条目不动
+ * （unchanged），缺失/漂移的从 DB 重写（rewritten），legacy NULL-body 行从
+ * 磁盘回填 DB（backfilled），双丢条目报告为 missing。
+ */
+export function refreshAllSkills(): Promise<SkillRefreshReport> {
+  return post<SkillRefreshReport>('/skills/refresh')
+}
+
+/** 单条刷新磁盘副本：POST /skills/{name}/refresh（DB 无行时后端 404） */
+export function refreshSkill(name: string): Promise<SkillRefreshReport> {
+  return post<SkillRefreshReport>(`/skills/${encodeURIComponent(name)}/refresh`)
+}
+
 /**
  * LLM 草稿生成 payload（POST /skills/generate）。
  * 与后端 SkillGenerateRequest 对齐：description 必填，hint 可选。

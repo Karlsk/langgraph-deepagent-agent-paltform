@@ -21,17 +21,22 @@ import WebAgentTable from '@/components/WebAgentTable.vue'
 import type { TableColumnConfig } from '@/components/WebAgentTable.vue'
 import SkillContentDialog from '@/views/skill/SkillContentDialog.vue'
 import SkillGenerateDialog from '@/views/skill/SkillGenerateDialog.vue'
+import SkillRefreshReportDialog from '@/views/skill/SkillRefreshReportDialog.vue'
 import {
   createSkill,
   deleteSkill,
   getSkillContent,
   listSkillsPage,
   patchSkill,
+  refreshAllSkills,
+  refreshSkill,
   type SkillCreatePayload,
   type SkillPatchPayload,
+  type SkillRefreshReport,
   type SkillRow,
 } from '@/api/assets'
 import { useConfirm } from '@/composables/useConfirm'
+import { useRequest } from '@/composables/useRequest'
 import { notifySuccess } from '@/utils/notify'
 import type { PageQuery, PageResult } from '@/types'
 
@@ -43,7 +48,7 @@ const columns: TableColumnConfig[] = [
   { label: '描述', prop: 'description', slot: 'description' },
   { label: '版本', prop: 'version', width: 80 },
   { label: '创建者', prop: 'created_by', width: 140 },
-  { label: '操作', prop: 'actions', width: 260, slot: 'actions' },
+  { label: '操作', prop: 'actions', width: 320, slot: 'actions' },
 ]
 
 /** 表格数据源：直接透传到 listSkillsPage，由后端做分页 / 关键字过滤 */
@@ -79,6 +84,42 @@ const contentDialogName = ref<string | null>(null)
 
 /** 自动生成正文弹窗状态 */
 const generateDialogVisible = ref(false)
+
+/** 磁盘同步报告弹窗状态：report 先写入再开弹窗（v-if 保证弹窗拿到非空报告） */
+const refreshDialogVisible = ref(false)
+const refreshReport = ref<SkillRefreshReport | null>(null)
+
+/**
+ * 同步请求托管：loading/error 由 useRequest 收敛，execute 失败返回 null
+ * 不外抛（错误提示由统一请求层拦截器弹出）。
+ */
+const { execute: executeRefreshAll, loading: refreshingAll } = useRequest(() => refreshAllSkills())
+const { execute: executeRefreshRow } = useRequest((name: string) => refreshSkill(name))
+
+/**
+ * 打开报告弹窗（全量 / 单条共用）：先写报告再开弹窗。
+ * 关闭时保留 report（v-if 已卸载弹窗，下次打开前必然被新报告覆盖）。
+ */
+function openRefreshReport(report: SkillRefreshReport): void {
+  refreshReport.value = report
+  refreshDialogVisible.value = true
+}
+
+/** 工具栏「同步磁盘」：全量从 DB 刷新磁盘副本并展示报告 */
+async function handleRefreshAll(): Promise<void> {
+  const report = await executeRefreshAll()
+  if (report) {
+    openRefreshReport(report)
+  }
+}
+
+/** 行内「同步」：单条从 DB 刷新磁盘副本并展示报告 */
+async function handleRefreshRow(row: SkillRow): Promise<void> {
+  const report = await executeRefreshRow(row.name)
+  if (report) {
+    openRefreshReport(report)
+  }
+}
 
 /** 创建场景下当前填写的 description（用于「自动生成」按钮回填 LLM 输入） */
 const currentDescription = ref('')
@@ -243,6 +284,13 @@ function truncatedDescription(text: string): string {
             <el-icon><Search /></el-icon>
           </template>
         </el-input>
+        <el-button
+          class="app-btn app-btn--secondary skill-toolbar__refresh"
+          :loading="refreshingAll"
+          @click="handleRefreshAll"
+        >
+          同步磁盘
+        </el-button>
       </div>
 
       <WebAgentTable
@@ -265,6 +313,9 @@ function truncatedDescription(text: string): string {
           </el-button>
           <el-button link type="primary" size="small" @click="handleEdit(row as SkillRow)">
             编辑
+          </el-button>
+          <el-button link type="success" size="small" @click="handleRefreshRow(row as SkillRow)">
+            同步
           </el-button>
           <el-button link type="danger" size="small" @click="handleDelete(row as SkillRow)">
             删除
@@ -332,6 +383,12 @@ function truncatedDescription(text: string): string {
       :description="currentDescription"
       @generated="handleGenerateDraft"
     />
+
+    <SkillRefreshReportDialog
+      v-if="refreshReport"
+      v-model="refreshDialogVisible"
+      :report="refreshReport"
+    />
   </div>
 </template>
 
@@ -348,6 +405,9 @@ function truncatedDescription(text: string): string {
 }
 .skill-toolbar__search {
   width: 280px;
+}
+.skill-toolbar__refresh {
+  margin-left: 12px;
 }
 .skill-body-toolbar {
   display: flex;

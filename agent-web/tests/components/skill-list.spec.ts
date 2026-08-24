@@ -22,6 +22,7 @@ import type {
   SkillGeneratePayload,
   SkillGenerateResponse,
   SkillPatchPayload,
+  SkillRefreshReport,
   SkillRow,
 } from '@/api/assets'
 import type { PageResult } from '@/types'
@@ -104,6 +105,8 @@ const { apiMock } = vi.hoisted(() => {
     patchSkill: vi.fn(),
     deleteSkill: vi.fn(),
     generateSkill: vi.fn(),
+    refreshAllSkills: vi.fn(),
+    refreshSkill: vi.fn(),
     // 占位：防止测试时触发真实网络或运行期 import 副作用
     listSubAgents: vi.fn(),
     listSubAgentsPage: vi.fn(),
@@ -262,6 +265,16 @@ const ElEmptyStub = defineComponent({
   },
 })
 
+/** ElTag stub：渲染默认插槽文案并透传 type（报告弹窗四态结果标签） */
+const ElTagStub = defineComponent({
+  name: 'ElTag',
+  props: { type: String, size: String },
+  setup(props, { slots }) {
+    return () =>
+      h('span', { class: 'el-tag-stub', 'data-type': props.type }, slots.default?.())
+  },
+})
+
 function mountPage(): VueWrapper {
   return mount(SkillList, {
     global: {
@@ -270,7 +283,7 @@ function mountPage(): VueWrapper {
         ElTableColumn: ElTableColumnStub,
         ElPagination: ElPaginationStub,
         ElEmpty: ElEmptyStub,
-        ElTag: true,
+        ElTag: ElTagStub,
         ElButton: ElButtonStub,
         ElDialog: ElDialogStub,
         ElForm: ElFormStub,
@@ -354,6 +367,28 @@ beforeEach(() => {
     },
   )
   apiMock.deleteSkill.mockResolvedValue(null)
+  apiMock.refreshAllSkills.mockImplementation(
+    async () =>
+      ({
+        items: [],
+        total: 0,
+        rewritten: 0,
+        unchanged: 0,
+        backfilled: 0,
+        missing: 0,
+      }) satisfies SkillRefreshReport,
+  )
+  apiMock.refreshSkill.mockImplementation(
+    async (name: string) =>
+      ({
+        items: [{ name, action: 'unchanged' }],
+        total: 1,
+        rewritten: 0,
+        unchanged: 1,
+        backfilled: 0,
+        missing: 0,
+      }) satisfies SkillRefreshReport,
+  )
   apiMock.listSkills.mockResolvedValue([])
   apiMock.getSkill.mockImplementation(async (name: string) => {
     const row = ROWS.find((r) => r.name === name)
@@ -718,5 +753,77 @@ describe('SkillList 技能管理页（task-4e6 CRUD 前端适配）', () => {
         body: expect.stringContaining('这是由 LLM 起草的示例正文'),
       } satisfies SkillCreatePayload),
     )
+  })
+
+  it('工具栏「同步磁盘」：调 refreshAllSkills 并在报告弹窗渲染四态明细', async () => {
+    apiMock.refreshAllSkills.mockResolvedValue({
+      items: [
+        { name: 'pdf-reader', action: 'rewritten' },
+        { name: 'ghost-skill', action: 'missing' },
+      ],
+      total: 2,
+      rewritten: 1,
+      unchanged: 0,
+      backfilled: 0,
+      missing: 1,
+    } satisfies SkillRefreshReport)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '同步磁盘').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.refreshAllSkills).toHaveBeenCalledTimes(1)
+    const reportDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '磁盘同步报告')
+    expect(reportDialog).toBeDefined()
+    const text = reportDialog!.text()
+    // 汇总行：总数 + 不可恢复计数高亮
+    expect(text).toContain('共 2 项')
+    expect(text).toContain('不可恢复 1')
+    // 明细行：名称 + 四态标签文案
+    expect(text).toContain('pdf-reader')
+    expect(text).toContain('ghost-skill')
+    expect(text).toContain('已重建')
+    expect(text).toContain('双丢不可恢复')
+  })
+
+  it('行内「同步」：以行名调 refreshSkill 并展示单条报告（不动全量接口）', async () => {
+    apiMock.refreshSkill.mockResolvedValue({
+      items: [{ name: 'pdf-reader', action: 'unchanged' }],
+      total: 1,
+      rewritten: 0,
+      unchanged: 1,
+      backfilled: 0,
+      missing: 0,
+    } satisfies SkillRefreshReport)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findRowButton(wrapper, '同步', 0).trigger('click')
+    await flushPromises()
+
+    expect(apiMock.refreshSkill).toHaveBeenCalledWith('pdf-reader')
+    expect(apiMock.refreshAllSkills).not.toHaveBeenCalled()
+    const reportDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '磁盘同步报告')
+    expect(reportDialog).toBeDefined()
+    expect(reportDialog!.text()).toContain('已是最新')
+  })
+
+  it('同步失败：报告弹窗不打开（错误提示由统一拦截器承担）', async () => {
+    apiMock.refreshAllSkills.mockRejectedValue(new Error('network down'))
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '同步磁盘').trigger('click')
+    await flushPromises()
+
+    const reportDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '磁盘同步报告')
+    expect(reportDialog).toBeUndefined()
   })
 })
