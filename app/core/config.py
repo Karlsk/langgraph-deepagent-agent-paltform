@@ -182,6 +182,12 @@ class Settings:
         # adapters' default 300s sse_read_timeout so we recycle first.
         self.MCP_SESSION_IDLE_TTL = float(os.getenv("MCP_SESSION_IDLE_TTL", "240"))
 
+        # Grace period (seconds) awaiting a pooled session worker's graceful
+        # exit on close/shutdown before force-cancelling it (the fallback
+        # cancel is still delivered inside the worker task, preserving anyio
+        # cancel-scope task affinity).
+        self.MCP_SESSION_STOP_TIMEOUT = float(os.getenv("MCP_SESSION_STOP_TIMEOUT", "10"))
+
         # Root directory of stdio MCP manifests (one JSON file per server;
         # Docker deployments mount ./mcp-servers here and sync via API).
         self.MCP_STDIO_ROOT = os.getenv("MCP_STDIO_ROOT", "./mcp-servers")

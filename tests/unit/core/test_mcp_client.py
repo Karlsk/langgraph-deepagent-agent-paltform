@@ -5,9 +5,10 @@ Zero real network / zero real MCP processes: the module-level
 fakes via monkeypatch; tenacity backoff sleep is stubbed to a no-op.
 
 Coverage: connection building (three transports + placeholder resolution),
-the process-level per-server session pool (reuse / rebuild / invalidation /
-idle TTL / singleflight / shutdown), namespaced wrappers with self-healing
-retries, and the one-shot helpers (probe / list / call).
+the process-level per-server session pool (worker ownership model: reuse /
+rebuild / invalidation / idle TTL / singleflight across waiter cancellations
+/ shutdown / anyio cancel-scope task affinity), namespaced wrappers with
+self-healing retries, and the one-shot helpers (probe / list / call).
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import time
 from collections.abc import Generator
 from typing import Any, ClassVar
 
+import anyio
 import httpx
 import pytest
 from langchain_core.tools import BaseTool, StructuredTool
@@ -23,7 +25,7 @@ from pydantic import BaseModel
 from app.core import mcp_client
 from app.core.config import settings
 from app.core.mcp_client import MCPServerSpec
-from app.core.metrics import mcp_client_rebuild_total, mcp_tools_loaded_total
+from app.core.metrics import mcp_client_rebuild_total, mcp_session_stop_total, mcp_tools_loaded_total
 
 pytestmark = pytest.mark.unit
 
@@ -100,6 +102,10 @@ class FakeSessionCM:
     # streamable-http/stdio unwind behavior); None -> propagate the cancel
     # untouched (genuine external cancellation, e.g. process shutdown).
     cancel_exit_mode: ClassVar[str | None] = None
+    # Close-hang script: when set, __aexit__ parks before returning so only
+    # the pool's stop-timeout fallback (force-cancel inside the worker) can
+    # finish the stop.
+    hang_on_close: ClassVar[bool] = False
 
     def __init__(self, connection: dict[str, Any]) -> None:
         """Create the fake session and remember the connection it serves."""
@@ -124,6 +130,8 @@ class FakeSessionCM:
         cancel propagates untouched (genuine external cancellation).
         """
         self.session.closed = True
+        if FakeSessionCM.hang_on_close:
+            await asyncio.sleep(30)
         if exc_info[0] is not None and issubclass(exc_info[0], asyncio.CancelledError):
             if FakeSessionCM.cancel_exit_mode == "replace_with_exception_group":
                 raise ExceptionGroup(
@@ -136,8 +144,50 @@ class FakeSessionCM:
         return False
 
 
-def _fake_create_session(connection: dict[str, Any]) -> FakeSessionCM:
+class TaskGroupSessionCM:
+    """Session CM backed by a real anyio task group (task-affinity guard).
+
+    anyio cancel scopes must be exited in the task that entered them. A pool
+    implementation that exits the session CM from any task other than its
+    worker makes the task-group exit raise RuntimeError("Attempted to exit
+    cancel scope in a different task ...") — before ``session.closed`` is
+    set — turning the 2026-08-24 production incident into a deterministic
+    assertion: the session only closes cleanly when its own worker unwinds
+    the context.
+    """
+
+    def __init__(self, connection: dict[str, Any]) -> None:
+        """Create the fake session wrapped by a real (pending) task group."""
+        self.connection = connection
+        self.session = FakeClientSession()
+        self.session.connection = connection
+        self._task_group: Any = None
+
+    async def __aenter__(self) -> FakeClientSession:
+        """Enter a real anyio task group in the calling task."""
+        self._task_group = anyio.create_task_group()
+        await self._task_group.__aenter__()
+        return self.session
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        """Exit the task group in the calling task; close only on clean exit."""
+        assert self._task_group is not None
+        suppressed = await self._task_group.__aexit__(*exc_info)
+        self.session.closed = True  # only reached when the scope exited cleanly
+        return suppressed
+
+
+class FakeSessionFactory:
+    """Switches for the fake session factory (reset by the autouse fixture)."""
+
+    # Selects the task-group-backed CM for task-affinity regression tests.
+    use_task_group: ClassVar[bool] = False
+
+
+def _fake_create_session(connection: dict[str, Any]) -> Any:
     """Session factory fake (mirrors langchain_mcp_adapters.sessions.create_session)."""
+    if FakeSessionFactory.use_task_group:
+        return TaskGroupSessionCM(connection)
     return FakeSessionCM(connection)
 
 
@@ -169,6 +219,8 @@ def _patch_adapters(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, No
     FakeClientSession.instances = []
     FakeClientSession.raise_cancel_in_initialize = False
     FakeSessionCM.cancel_exit_mode = None
+    FakeSessionCM.hang_on_close = False
+    FakeSessionFactory.use_task_group = False
     _BEHAVIORS.clear()
     _load_calls.clear()
     monkeypatch.setattr(mcp_client, "create_session", _fake_create_session)
@@ -188,6 +240,8 @@ def _reset_pool() -> None:
     mcp_client._sessions.clear()  # noqa: SLF001 — test introspection
     mcp_client._server_hashes.clear()  # noqa: SLF001 — test introspection
     mcp_client._locks.clear()  # noqa: SLF001 — test introspection
+    mcp_client._building.clear()  # noqa: SLF001 — test introspection
+    mcp_client._finalize_tasks.clear()  # noqa: SLF001 — test introspection
 
 
 def _stdio_spec(name: str = "srv", command: str = "python", args: list[str] | None = None, env: dict[str, str] | None = None) -> MCPServerSpec:
@@ -275,14 +329,19 @@ def test_load_server_tools_namespaces_tools_and_reuses_session() -> None:
     """Two loads share one pooled session and one underlying load call."""
     _BEHAVIORS["srv"] = {"tool_names": ["alpha", "beta"]}
 
-    first = asyncio.run(mcp_client.load_server_tools(_stdio_spec()))
-    second = asyncio.run(mcp_client.load_server_tools(_stdio_spec()))
+    async def _scenario() -> list[BaseTool] | None:
+        first = await mcp_client.load_server_tools(_stdio_spec())
+        second = await mcp_client.load_server_tools(_stdio_spec())
+        assert second is first  # same pooled entry => same tool list instance
+        assert len(FakeClientSession.instances) == 1
+        assert FakeClientSession.instances[0].initialized
+        assert not FakeClientSession.instances[0].closed
+        assert _load_calls["srv"] == 1
+        return first
 
+    first = asyncio.run(_scenario())
+    assert first is not None
     assert [tool.name for tool in first] == ["srv__alpha", "srv__beta"]
-    assert second is first  # same pooled entry => same tool list instance
-    assert len(FakeClientSession.instances) == 1
-    assert FakeClientSession.instances[0].initialized
-    assert _load_calls["srv"] == 1
     assert _counter_value(mcp_tools_loaded_total, server="srv", status="success") >= 1
 
 
@@ -368,12 +427,15 @@ def test_config_change_closes_old_session_and_rebuilds() -> None:
     new_before = _counter_value(mcp_client_rebuild_total, reason="new")
     changed_before = _counter_value(mcp_client_rebuild_total, reason="config_changed")
 
-    asyncio.run(mcp_client.load_server_tools(_stdio_spec(args=["-m", "v1"])))
-    asyncio.run(mcp_client.load_server_tools(_stdio_spec(args=["-m", "v2"])))
+    async def _scenario() -> None:
+        await mcp_client.load_server_tools(_stdio_spec(args=["-m", "v1"]))
+        await mcp_client.load_server_tools(_stdio_spec(args=["-m", "v2"]))
+        assert len(FakeClientSession.instances) == 2
+        assert FakeClientSession.instances[0].closed
+        assert not FakeClientSession.instances[1].closed
 
-    assert len(FakeClientSession.instances) == 2
-    assert FakeClientSession.instances[0].closed
-    assert not FakeClientSession.instances[1].closed
+    asyncio.run(_scenario())
+
     assert _counter_value(mcp_client_rebuild_total, reason="new") == new_before + 1
     assert _counter_value(mcp_client_rebuild_total, reason="config_changed") == changed_before + 1
 
@@ -381,28 +443,37 @@ def test_config_change_closes_old_session_and_rebuilds() -> None:
 def test_idle_ttl_expiry_lazily_rebuilds() -> None:
     """An idle-expired entry is closed and rebuilt on the next acquire."""
     _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
-    asyncio.run(mcp_client.load_server_tools(_stdio_spec()))
-    entry = mcp_client._sessions["srv"]  # noqa: SLF001 — test introspection
-    _expire_idle(entry)
 
-    asyncio.run(mcp_client.load_server_tools(_stdio_spec()))
+    async def _scenario() -> None:
+        await mcp_client.load_server_tools(_stdio_spec())
+        entry = mcp_client._sessions["srv"]  # noqa: SLF001 — test introspection
+        _expire_idle(entry)
 
-    assert len(FakeClientSession.instances) == 2
-    assert FakeClientSession.instances[0].closed
+        await mcp_client.load_server_tools(_stdio_spec())
+
+        assert len(FakeClientSession.instances) == 2
+        assert FakeClientSession.instances[0].closed
+        assert not FakeClientSession.instances[1].closed
+
+    asyncio.run(_scenario())
 
 
 def test_shutdown_mcp_sessions_closes_everything() -> None:
     """Shutdown closes every pooled session and clears pool state."""
     _BEHAVIORS["a"] = {"tool_names": ["t"]}
     _BEHAVIORS["b"] = {"tool_names": ["t"]}
-    asyncio.run(mcp_client.load_server_tools(_stdio_spec("a")))
-    asyncio.run(mcp_client.load_server_tools(_http_spec("b")))
 
-    asyncio.run(mcp_client.shutdown_mcp_sessions())
+    async def _scenario() -> None:
+        await mcp_client.load_server_tools(_stdio_spec("a"))
+        await mcp_client.load_server_tools(_http_spec("b"))
+        await mcp_client.shutdown_mcp_sessions()
+        assert all(instance.closed for instance in FakeClientSession.instances)
 
-    assert all(instance.closed for instance in FakeClientSession.instances)
+    asyncio.run(_scenario())
+
     assert mcp_client._sessions == {}  # noqa: SLF001 — test introspection
     assert mcp_client._server_hashes == {}  # noqa: SLF001 — test introspection
+    assert mcp_client._building == {}  # noqa: SLF001 — test introspection
 
 
 def test_concurrent_loads_singleflight_to_one_session() -> None:
@@ -424,6 +495,134 @@ def test_concurrent_loads_singleflight_to_one_session() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Worker ownership: anyio task affinity, cancellation, timeouts
+# ---------------------------------------------------------------------------
+
+
+def test_ttl_recycle_exits_cm_in_owner_worker_task() -> None:
+    """TTL recycle closes the session inside its worker task — never across tasks.
+
+    Regression test for the 2026-08-24 incident: anyio cancel scopes must not
+    be exited from a foreign task ("Attempted to exit cancel scope in a
+    different task than it was entered in", which also cancelled the lifespan
+    task). The real task-group-backed CM makes any cross-task exit fail
+    loudly; the session only closes cleanly when its own worker unwinds the
+    context.
+    """
+    FakeSessionFactory.use_task_group = True
+    _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
+
+    async def _scenario() -> None:
+        await mcp_client.load_server_tools(_http_spec("srv"))
+        entry = mcp_client._sessions["srv"]  # noqa: SLF001 — test introspection
+        _expire_idle(entry)
+
+        await mcp_client.load_server_tools(_http_spec("srv"))
+
+        assert len(FakeClientSession.instances) == 2
+        assert FakeClientSession.instances[0].closed  # closed by its own worker
+        assert not FakeClientSession.instances[1].closed
+
+    asyncio.run(_scenario())
+
+
+def test_shutdown_exits_cm_in_owner_worker_task() -> None:
+    """Shutdown closes every session inside its worker task (task affinity)."""
+    FakeSessionFactory.use_task_group = True
+    _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
+
+    async def _scenario() -> None:
+        await mcp_client.load_server_tools(_http_spec("srv"))
+        await mcp_client.shutdown_mcp_sessions()
+        assert FakeClientSession.instances[0].closed
+        assert mcp_client._sessions == {}  # noqa: SLF001 — test introspection
+
+    asyncio.run(_scenario())
+
+
+def test_cancelled_waiter_build_survives_and_is_reused() -> None:
+    """A waiter cancellation never kills the in-flight build (no orphans).
+
+    The shielded wait detaches the build from the waiter: the next load
+    reuses the very same build (singleflight across cancellations) and the
+    finished session is pooled even when its only waiter vanished.
+    """
+    _BEHAVIORS["srv"] = {"tool_names": ["alpha"], "delay": 0.2}
+
+    async def _scenario() -> None:
+        first = asyncio.create_task(mcp_client.load_server_tools(_stdio_spec("srv")))
+        await asyncio.sleep(0.02)  # the waiter reached the shielded ready wait
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        # The cancelled waiter's build survives: the next load reuses it.
+        tools = await mcp_client.load_server_tools(_stdio_spec("srv"))
+        assert tools is not None
+        assert len(FakeClientSession.instances) == 1
+        assert _load_calls["srv"] == 1
+        assert "srv" in mcp_client._sessions  # noqa: SLF001 — test introspection
+
+    asyncio.run(_scenario())
+
+
+def test_close_timeout_falls_back_to_worker_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker hanging on close is force-cancelled inside its own task."""
+    _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
+    FakeSessionCM.hang_on_close = True
+    monkeypatch.setattr(settings, "MCP_SESSION_STOP_TIMEOUT", 0.05)
+    before = _counter_value(mcp_session_stop_total, outcome="timeout_cancelled")
+
+    async def _scenario() -> None:
+        await mcp_client.load_server_tools(_stdio_spec("srv"))
+        entry = mcp_client._sessions["srv"]  # noqa: SLF001 — test introspection
+        _expire_idle(entry)
+        await mcp_client.load_server_tools(_stdio_spec("srv"))  # recycles the hung session
+        # Un-hang: the parked replacement worker's teardown (on asyncio.run
+        # cleanup) must not re-enter the 30s close-hang.
+        FakeSessionCM.hang_on_close = False
+
+    asyncio.run(_scenario())
+
+    assert _counter_value(mcp_session_stop_total, outcome="timeout_cancelled") == before + 1
+    assert FakeClientSession.instances[0].closed
+
+
+def test_stale_entry_from_dead_loop_is_rebuilt() -> None:
+    """A pooled entry owned by a dead event loop is dropped and rebuilt.
+
+    Defensive cross-loop behavior: sessions outlive their loop only in
+    exotic setups (or tests); the pool never serves or awaits them.
+    """
+    _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
+
+    asyncio.run(mcp_client.load_server_tools(_stdio_spec("srv")))  # loop A dies with the parked worker
+
+    tools = asyncio.run(mcp_client.load_server_tools(_stdio_spec("srv")))  # loop B
+
+    assert tools is not None
+    assert len(FakeClientSession.instances) == 2
+
+
+def test_shutdown_cancels_inflight_builds() -> None:
+    """Shutdown stops builds that are still opening (cancel + bounded await)."""
+    _BEHAVIORS["slow"] = {"tool_names": ["alpha"], "delay": 5.0}
+
+    async def _scenario() -> None:
+        loader = asyncio.create_task(mcp_client.load_server_tools(_stdio_spec("slow")))
+        await asyncio.sleep(0.05)  # the build is now opening inside its worker
+        await mcp_client.shutdown_mcp_sessions()
+        with pytest.raises(asyncio.CancelledError):
+            await loader
+
+    asyncio.run(_scenario())
+
+    assert all(instance.closed for instance in FakeClientSession.instances)
+    assert mcp_client._sessions == {}  # noqa: SLF001 — test introspection
+    assert mcp_client._building == {}  # noqa: SLF001 — test introspection
+
+
+# ---------------------------------------------------------------------------
 # Pooled wrappers: self-healing call path
 # ---------------------------------------------------------------------------
 
@@ -431,29 +630,34 @@ def test_concurrent_loads_singleflight_to_one_session() -> None:
 def test_call_failure_invalidates_and_retries_on_rebuilt_session() -> None:
     """A transport-level call failure rebuilds the session and retries once."""
     _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
-    tools = asyncio.run(mcp_client.load_server_tools(_stdio_spec()))
-    assert tools is not None
-    _BEHAVIORS["srv"]["call_fail_next"] = True
 
-    result = asyncio.run(tools[0].ainvoke({}))
+    async def _scenario() -> Any:
+        tools = await mcp_client.load_server_tools(_stdio_spec())
+        assert tools is not None
+        _BEHAVIORS["srv"]["call_fail_next"] = True
 
-    assert result == "srv::alpha"
-    assert len(FakeClientSession.instances) == 2  # invalidated + rebuilt
-    assert FakeClientSession.instances[0].closed
-    assert not FakeClientSession.instances[1].closed
-    assert _load_calls["srv"] == 2  # tool cache refreshed with the rebuild
+        result = await tools[0].ainvoke({})
+
+        assert result == "srv::alpha"
+        assert len(FakeClientSession.instances) == 2  # invalidated + rebuilt
+        assert FakeClientSession.instances[0].closed
+        assert not FakeClientSession.instances[1].closed
+        assert _load_calls["srv"] == 2  # tool cache refreshed with the rebuild
+        return tools
+
+    asyncio.run(_scenario())
 
 
 def test_concurrent_calls_share_one_session() -> None:
     """Two concurrent calls on the same pooled session both succeed."""
     _BEHAVIORS["srv"] = {"tool_names": ["alpha"]}
-    tools = asyncio.run(mcp_client.load_server_tools(_stdio_spec()))
-    assert tools is not None
 
-    async def _call_twice() -> list[Any]:
+    async def _scenario() -> list[Any]:
+        tools = await mcp_client.load_server_tools(_stdio_spec())
+        assert tools is not None
         return await asyncio.gather(tools[0].ainvoke({}), tools[0].ainvoke({}))
 
-    first, second = asyncio.run(_call_twice())
+    first, second = asyncio.run(_scenario())
 
     assert sorted([first, second]) == ["srv::alpha", "srv::alpha"]
     assert len(FakeClientSession.instances) == 1

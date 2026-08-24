@@ -179,6 +179,8 @@ def _reset_state() -> None:
     mcp_client._sessions.clear()  # noqa: SLF001 — test introspection
     mcp_client._server_hashes.clear()  # noqa: SLF001 — test introspection
     mcp_client._locks.clear()  # noqa: SLF001 — test introspection
+    mcp_client._building.clear()  # noqa: SLF001 — test introspection
+    mcp_client._finalize_tasks.clear()  # noqa: SLF001 — test introspection
     mcp_manager._catalog_cache.clear()  # noqa: SLF001 — test introspection
 
 
@@ -391,12 +393,20 @@ def test_missing_env_placeholder_excludes_server(monkeypatch: pytest.MonkeyPatch
 
 
 def test_session_pool_reuses_one_session_across_loads() -> None:
-    """Same effective config reuses one pooled session and one underlying load."""
+    """Same effective config reuses one pooled session and one underlying load.
+
+    Both loads run inside one event loop: pooled session workers cannot
+    outlive their loop, so cross-loop reuse would falsely trigger rebuilds.
+    """
     _BEHAVIORS["weather"] = {"tool_names": ["get_forecast"]}
     session = FakeSession([_stdio_server("weather", "sha256:w1")])
 
-    first = asyncio.run(mcp_manager.get_mcp_tools(session))
-    second = asyncio.run(mcp_manager.get_mcp_tools(session))
+    async def _scenario() -> tuple[list[BaseTool], list[BaseTool]]:
+        first = await mcp_manager.get_mcp_tools(session)
+        second = await mcp_manager.get_mcp_tools(session)
+        return first, second
+
+    first, second = asyncio.run(_scenario())
 
     assert len(FakeClientSession.instances) == 1
     assert _load_calls["weather"] == 1  # second call served from the pooled session

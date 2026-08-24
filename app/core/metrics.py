@@ -84,6 +84,12 @@ mcp_client_rebuild_total = Counter(
     ["reason"],
 )
 
+mcp_session_stop_total = Counter(
+    "mcp_session_stop_total",
+    "Total pooled MCP session worker stops",
+    ["outcome"],  # "graceful" | "timeout_cancelled" | "crashed" | "cancelled" | "foreign_loop"
+)
+
 
 def setup_metrics(app):
     """Set up Prometheus metrics middleware and endpoints.

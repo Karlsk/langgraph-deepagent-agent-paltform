@@ -53,6 +53,7 @@ export TOKEN=<chat-session-token>
 | ---------------------------- | --------------------- | --------------------------------------------------------------- |
 | `MCP_STDIO_ALLOWED_COMMANDS` | `python,node,uvx,npx` | stdio 命令 basename 白名单；shell 解释器无条件禁止                            |
 | `MCP_SESSION_IDLE_TTL`       | `240`                 | 池化 session 空闲回收秒数（刻意小于 SSE 300s read timeout）                   |
+| `MCP_SESSION_STOP_TIMEOUT`   | `10`                  | 关闭/关机时等待 session worker 优雅退出的宽限秒数，超时兜底 cancel（亲和性安全）          |
 | `MCP_STDIO_ROOT`             | `./mcp-servers`       | stdio manifest 目录（compose 已挂载 `./mcp-servers:/app/mcp-servers`） |
 | `RATE_LIMIT_MCP_TOOLS_DEBUG` | `30 per minute`       | 调试端点限流                                                          |
 
@@ -352,6 +353,14 @@ curl -s -X POST "$BASE/mcp-servers/stdio-sync" -H "Authorization: Bearer $TOKEN"
 被全部 agent 共享；调用失败自动失效→重建→重试一次；空闲超过 `MCP_SESSION_IDLE_TTL`
 （默认 240s）在下一次使用时惰性回收；配置变更（PATCH/同步/删除）整体失效缓存。
 
+**Worker 所有权模型**（2026-08-24 事故修复，详见
+[changelog](changelog/2026-08-24-mcp-session-worker-ownership.md)）：每个池化 session 由
+专属长驻任务 `mcp-session-{server}` 持有，session 上下文的打开与关闭只发生在该任务内
+（anyio cancel scope / task group 禁止跨任务退出）。所有关闭路径（TTL 回收 / 配置变更 /
+失效重建 / 关机）只设置 stop 事件并等待 worker 自行退出（宽限
+`MCP_SESSION_STOP_TIMEOUT` 秒，超时兜底 cancel 仍在 worker 任务内投递）；工具调用仍由
+调用方直连 session（跨任务安全，无代理层）。
+
 ### 6.1 复用验证（日志）
 
 连续请求两次工具目录，观察日志（docker：`make docker-logs`；本地直跑看控制台）：
@@ -383,6 +392,23 @@ mcp_client_rebuild_total{reason="recovered"} <K>
 
 `reason` 语义：`new` 首次/缓存被清空后重建；`config_changed` content\_hash 变化；
 `recovered` 失效后自愈重建。注意：PATCH / stdio-sync / DELETE 会清空整池，之后的重建计 `new`。
+
+### 6.3 session 停止指标（/metrics）
+
+```bash
+curl -s http://localhost:8000/metrics | grep mcp_session_stop_total
+```
+
+**预期**（正常运行期不增长；TTL 回收 / 关机时递增）：
+
+```
+mcp_session_stop_total{outcome="graceful"} <N>
+mcp_session_stop_total{outcome="timeout_cancelled"} <M>
+```
+
+`outcome` 语义：`graceful` worker 收到 stop 后自行干净退出；`timeout_cancelled` 关闭
+挂死被兜底 cancel（应关注并排查上游 server）；`crashed` / `cancelled` / `foreign_loop`
+为罕见兜底路径。正常关机（Ctrl-C）后每台 server 至少一次 `graceful`。
 
 ***
 

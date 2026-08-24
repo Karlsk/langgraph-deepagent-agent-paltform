@@ -296,6 +296,8 @@ def fake_mcp(monkeypatch: pytest.MonkeyPatch) -> Generator[dict[str, list[Any]],
     mcp_client._sessions.clear()  # noqa: SLF001 — process cache hygiene
     mcp_client._server_hashes.clear()  # noqa: SLF001
     mcp_client._locks.clear()  # noqa: SLF001
+    mcp_client._building.clear()  # noqa: SLF001
+    mcp_client._finalize_tasks.clear()  # noqa: SLF001
     mcp_manager._catalog_cache.clear()  # noqa: SLF001
 
 
