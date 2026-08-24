@@ -233,6 +233,46 @@ class SkillContentRead(BaseModel):
     content: str = Field(..., description="Full SKILL.md content")
 
 
+class SkillRefreshEntry(BaseModel):
+    """One skill's outcome of a disk-refresh-from-DB operation.
+
+    Attributes:
+        name: Globally unique skill name
+        action: What the refresh did:
+            ``rewritten`` — disk file was missing or drifted from the DB
+            hash and has been rewritten from the DB body;
+            ``unchanged`` — disk hash matched, file left untouched;
+            ``backfilled`` — legacy NULL-body row populated from its disk
+            file (the only surviving copy), hash resynced;
+            ``missing`` — both copies lost, skill is unrecoverable.
+    """
+
+    name: str = Field(..., description="Globally unique skill name")
+    action: Literal["rewritten", "unchanged", "backfilled", "missing"] = Field(
+        ..., description="Refresh outcome for this skill"
+    )
+
+
+class SkillRefreshReport(BaseModel):
+    """Aggregated report of a disk-refresh-from-DB operation.
+
+    Attributes:
+        items: Per-skill outcome entries.
+        total: Number of skills inspected.
+        rewritten: Files rewritten from the DB body.
+        unchanged: Files already matching the DB hash.
+        backfilled: Legacy NULL-body rows populated from disk.
+        missing: Skills lost from both stores.
+    """
+
+    items: list[SkillRefreshEntry] = Field(default_factory=list, description="Per-skill outcomes")
+    total: int = Field(..., description="Number of skills inspected")
+    rewritten: int = Field(..., description="Files rewritten from the DB body")
+    unchanged: int = Field(..., description="Files already matching the DB hash")
+    backfilled: int = Field(..., description="Legacy rows populated from disk")
+    missing: int = Field(..., description="Skills lost from both stores")
+
+
 class SkillGenerateRequest(BaseModel):
     """Request model for LLM-assisted skill draft generation.
 

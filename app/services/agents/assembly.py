@@ -443,7 +443,7 @@ async def compile_agent_app(
     effective_skill_names = sorted(
         set(app_cfg.skill_names) | {n for cfg in subagent_cfgs for n in (cfg.skill_names or [])}
     )
-    await sync_user_skills(user_id, effective_skill_names)
+    await sync_user_skills(session, user_id, effective_skill_names)
 
     catalog = await build_tool_catalog(session)
     mcp_tools = await get_mcp_tools(session)

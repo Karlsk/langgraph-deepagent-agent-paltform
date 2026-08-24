@@ -1,5 +1,17 @@
 """Skill file service: manages SKILL.md assets on disk plus their DB metadata.
 
+Dual-store architecture (DB = source of truth, disk = runtime copy):
+
+- The full SKILL.md body lives in ``SkillAsset.body`` (DB) and in the
+  ``{SKILLS_ROOT}/global/<name>/SKILL.md`` file. Writes go to both; reads
+  are disk-first with a DB self-heal fallback (``read_global``), so a lost
+  disk copy (e.g. container rebuild without a ``./data`` bind mount) is
+  recovered transparently from the DB.
+- ``SkillAsset.content_hash`` is the rewrite trigger for
+  ``refresh_disk_from_db``: a disk file whose sha256 matches the row hash is
+  left untouched, anything else is rewritten from the DB body. Legacy rows
+  with ``body IS NULL`` are backfilled from disk (their only copy).
+
 Directory conventions (rooted at ``settings.SKILLS_ROOT``):
 
 - Global skills: ``{SKILLS_ROOT}/global/<name>/SKILL.md``
@@ -212,8 +224,16 @@ async def create_global(
 
     # DB-first ordering: the metadata row is committed before any disk write,
     # so a uniqueness conflict (concurrent create of the same name) can never
-    # leave an orphaned SKILL.md behind a lost insert race.
-    asset = SkillAsset(name=name, description=description, content_hash=_sha256(body), created_by=created_by)
+    # leave an orphaned SKILL.md behind a lost insert race. The full body is
+    # stored in the row (dual-store source of truth); the disk file is the
+    # runtime copy consumed by FilesystemBackend.
+    asset = SkillAsset(
+        name=name,
+        description=description,
+        body=body,
+        content_hash=_sha256(body),
+        created_by=created_by,
+    )
     session.add(asset)
     try:
         session.commit()
@@ -256,14 +276,16 @@ async def update_global(
     if description is None and body is None:
         raise ValueError("nothing to update: provide description and/or body")
 
-    # DB-first ordering (mirrors create_global): the new hash/version is
+    # DB-first ordering (mirrors create_global): the new hash/version/body is
     # committed before the file rewrite; on disk failure the row is reverted
-    # so ``content_hash`` never drifts from the on-disk content.
+    # so ``content_hash``/``body`` never drift from the on-disk content.
     previous_hash = asset.content_hash
     previous_version = asset.version
     previous_description = asset.description
+    previous_body = asset.body
     if body is not None:
         asset.content_hash = _sha256(body)
+        asset.body = body
     if description is not None:
         asset.description = description
     asset.version += 1
@@ -277,6 +299,7 @@ async def update_global(
             asset.content_hash = previous_hash
             asset.version = previous_version
             asset.description = previous_description
+            asset.body = previous_body
             session.add(asset)
             session.commit()
             raise
@@ -362,30 +385,45 @@ async def list_global_page(
     )
 
 
-async def read_global(name: str) -> str:
-    """Read the raw SKILL.md body of a global skill.
+async def read_global(session: Session, name: str) -> str:
+    """Read the raw SKILL.md body of a global skill (disk-first, DB self-heal).
+
+    Dual-store read path: the disk file is the fast path; when it is missing
+    (e.g. lost on a container rebuild) the body is recovered from the DB row
+    and the disk file is rewritten so subsequent reads hit the fast path
+    again. Only when both copies are gone (or the row predates dual-store
+    with ``body IS NULL``) is the skill genuinely not found.
 
     Args:
+        session: SQLModel DB session (self-heal fallback source).
         name: Skill name.
 
     Returns:
         The markdown body.
 
     Raises:
-        ValueError: If the name is invalid or the skill file does not exist.
+        ValueError: If the name is invalid or the skill exists neither on
+            disk nor as a DB row with a body.
     """
     path = _global_skill_file(name)
-    if not path.exists():
-        raise ValueError(f"skill {name!r} not found")
-    return await asyncio.to_thread(path.read_text, "utf-8")
+    if path.exists():
+        return await asyncio.to_thread(path.read_text, "utf-8")
+
+    asset = session.get(SkillAsset, name)
+    if asset is not None and asset.body is not None:
+        await asyncio.to_thread(_atomic_write, path, asset.body)
+        logger.warning("skill_disk_selfhealed_from_db", name=name)
+        return asset.body
+    raise ValueError(f"skill {name!r} not found")
 
 
-async def materialize_for_user(user_id: str, skill_names: Sequence[str]) -> None:
+async def materialize_for_user(session: Session, user_id: str, skill_names: Sequence[str]) -> None:
     """Copy the given global skills into a user's skill directory.
 
     Existing user copies are overwritten with the fresh global content.
 
     Args:
+        session: SQLModel DB session (passed through to ``read_global``).
         user_id: Target user identifier.
         skill_names: Names of global skills to copy.
 
@@ -395,12 +433,14 @@ async def materialize_for_user(user_id: str, skill_names: Sequence[str]) -> None
     uid = _validate_user_id(user_id)
     names = list(skill_names)
     for name in names:
-        body = await read_global(name)
+        body = await read_global(session, name)
         await asyncio.to_thread(_atomic_write, _user_skill_file(uid, name), body)
     logger.info("skills_materialized_for_user", user_id=uid, skill_count=len(names))
 
 
-async def materialize_into_directory(target_dir: Path, skill_names: Sequence[str]) -> None:
+async def materialize_into_directory(
+    session: Session, target_dir: Path, skill_names: Sequence[str]
+) -> None:
     """Copy the given global skills into ``<target_dir>/<name>/SKILL.md``.
 
     Unlike :func:`materialize_for_user`, the destination directory is supplied
@@ -412,16 +452,17 @@ async def materialize_into_directory(target_dir: Path, skill_names: Sequence[str
     sub-directories are created on demand.
 
     Args:
+        session: SQLModel DB session (passed through to ``read_global``).
         target_dir: Destination root directory; created when missing.
         skill_names: Names of global skills to copy.
 
     Raises:
-        ValueError: If any skill name is invalid or the global file is
-            missing.
+        ValueError: If any skill name is invalid or the skill exists neither
+            on disk nor in the DB (dual-store miss).
     """
     for name in skill_names:
         _validate_skill_name(name)
-        body = await read_global(name)
+        body = await read_global(session, name)
         await asyncio.to_thread(_atomic_write, target_dir / name / _SKILL_FILE_NAME, body)
     logger.info(
         "skills_materialized_into_directory",
@@ -430,7 +471,7 @@ async def materialize_into_directory(target_dir: Path, skill_names: Sequence[str
     )
 
 
-async def sync_user_skills(user_id: str, associated_names: Sequence[str]) -> None:
+async def sync_user_skills(session: Session, user_id: str, associated_names: Sequence[str]) -> None:
     """Reassemble a user's skill directory to match the association set.
 
     Semantics: every associated skill is re-copied from global (freshness
@@ -438,6 +479,7 @@ async def sync_user_skills(user_id: str, associated_names: Sequence[str]) -> Non
     Success/failure is counted in ``skill_sync_total{result}``.
 
     Args:
+        session: SQLModel DB session (passed through to ``read_global``).
         user_id: Target user identifier.
         associated_names: The full desired set of skill names.
 
@@ -448,7 +490,7 @@ async def sync_user_skills(user_id: str, associated_names: Sequence[str]) -> Non
     uid = _validate_user_id(user_id)
     names = list(associated_names)
     try:
-        await materialize_for_user(uid, names)
+        await materialize_for_user(session, uid, names)
         await asyncio.to_thread(_prune_stale_user_skills, uid, set(names))
     except (OSError, ValueError):
         skill_sync_total.labels(result="error").inc()
@@ -456,6 +498,83 @@ async def sync_user_skills(user_id: str, associated_names: Sequence[str]) -> Non
         raise
     skill_sync_total.labels(result="success").inc()
     logger.info("user_skill_sync_succeeded", user_id=uid, skill_count=len(names))
+
+
+async def refresh_disk_from_db(session: Session, name: str | None = None) -> list[dict[str, str]]:
+    """Refresh the disk SKILL.md copies from the DB bodies (DB is truth).
+
+    ``content_hash`` is the rewrite trigger: a disk file whose sha256 equals
+    the row's ``content_hash`` is left untouched (``unchanged``); anything
+    else (missing or drifted) is rewritten from the DB body
+    (``rewritten``). Legacy rows with ``body IS NULL`` (created before
+    dual-store) are backfilled from their disk file — the only surviving
+    copy — and their ``content_hash`` is resynced to it (``backfilled``);
+    when both copies are gone the entry is reported ``missing``.
+
+    Args:
+        session: SQLModel DB session.
+        name: Refresh only this skill; ``None`` refreshes every row.
+
+    Returns:
+        Per-skill report entries ``{"name": ..., "action": ...}`` with action
+        one of ``rewritten`` / ``unchanged`` / ``backfilled`` / ``missing``.
+
+    Raises:
+        ValueError: When ``name`` is given but no DB row exists for it.
+    """
+    if name is not None:
+        _validate_skill_name(name)
+        asset = session.get(SkillAsset, name)
+        if asset is None:
+            raise ValueError(f"skill {name!r} not found")
+        assets = [asset]
+    else:
+        assets = list(session.exec(select(SkillAsset)).all())
+
+    report: list[dict[str, str]] = []
+    for asset in assets:
+        path = _global_skill_file(asset.name)
+        if asset.body is None:
+            # Legacy pre-dual-store row: the disk file is the only copy.
+            if path.exists():
+                disk_body = await asyncio.to_thread(path.read_text, "utf-8")
+                resynced_hash = _sha256(disk_body)
+                if resynced_hash != asset.content_hash:
+                    logger.warning(
+                        "skill_legacy_hash_resynced_from_disk",
+                        name=asset.name,
+                        old_hash=asset.content_hash,
+                    )
+                    asset.content_hash = resynced_hash
+                asset.body = disk_body
+                session.add(asset)
+                session.commit()
+                report.append({"name": asset.name, "action": "backfilled"})
+            else:
+                logger.error("skill_unrecoverable_body_and_disk_lost", name=asset.name)
+                report.append({"name": asset.name, "action": "missing"})
+            continue
+
+        disk_hash: str | None = None
+        if path.exists():
+            disk_body = await asyncio.to_thread(path.read_text, "utf-8")
+            disk_hash = _sha256(disk_body)
+        if disk_hash == asset.content_hash:
+            report.append({"name": asset.name, "action": "unchanged"})
+        else:
+            await asyncio.to_thread(_atomic_write, path, asset.body)
+            logger.info("skill_disk_refreshed_from_db", name=asset.name)
+            report.append({"name": asset.name, "action": "rewritten"})
+
+    logger.info(
+        "skills_disk_refresh_completed",
+        total=len(report),
+        rewritten=sum(1 for entry in report if entry["action"] == "rewritten"),
+        unchanged=sum(1 for entry in report if entry["action"] == "unchanged"),
+        backfilled=sum(1 for entry in report if entry["action"] == "backfilled"),
+        missing=sum(1 for entry in report if entry["action"] == "missing"),
+    )
+    return report
 
 
 async def generate_skill_draft(*, description: str, hint: str) -> str:

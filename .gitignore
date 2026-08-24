@@ -37,3 +37,8 @@ node_modules/
 # must NOT be committed (see mcp-servers/README.md).
 mcp-servers/*.json
 mcp-servers/*.py
+
+# Skills runtime store (SKILLS_ROOT=./data/skills, bind-mounted into the
+# app container): machine-local SKILL.md copies; the DB body column is the
+# source of truth, so this directory must NOT be committed.
+data/

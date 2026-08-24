@@ -446,6 +446,79 @@ def test_get_skill_content_unknown_name_404(client: TestClient) -> None:
     assert client.get("/skills/ghost/content").status_code == 404
 
 
+def test_get_skill_content_selfheals_lost_disk_file(
+    client: TestClient, isolated_skills_root: str
+) -> None:
+    """GET /skills/{name}/content rebuilds a lost disk file from the DB body."""
+    client.post("/skills", json=_skill_body())
+    (Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md").unlink()
+
+    response = client.get("/skills/pdf-export/content")
+
+    assert response.status_code == 200
+    payload = unwrap(response)
+    assert payload["content"] == "# pdf-export\n\n## Steps\n1. render\n"
+    assert (Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md").exists()
+
+
+def test_refresh_all_skills_rewrites_lost_and_drifted_files(
+    client: TestClient, isolated_skills_root: str
+) -> None:
+    """POST /skills/refresh rebuilds lost/drifted disk files from the DB bodies."""
+    client.post("/skills", json=_skill_body())
+    client.post("/skills", json=_skill_body(name="csv-clean", description="Clean CSV"))
+    # pdf-export: disk file lost entirely; csv-clean: drifted content
+    (Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md").unlink()
+    (Path(isolated_skills_root) / "global" / "csv-clean" / "SKILL.md").write_text("drifted", encoding="utf-8")
+
+    response = client.post("/skills/refresh")
+
+    assert response.status_code == 200
+    report = unwrap(response)
+    by_name = {entry["name"]: entry["action"] for entry in report["items"]}
+    assert by_name == {"pdf-export": "rewritten", "csv-clean": "rewritten"}
+    assert report["rewritten"] == 2
+    body = _skill_body()["body"]
+    assert (Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md").read_text(encoding="utf-8") == body
+    assert (Path(isolated_skills_root) / "global" / "csv-clean" / "SKILL.md").read_text(encoding="utf-8") == body
+
+
+def test_refresh_all_reports_unchanged_for_healthy_files(client: TestClient) -> None:
+    """POST /skills/refresh marks matching disk files as unchanged."""
+    client.post("/skills", json=_skill_body())
+
+    response = client.post("/skills/refresh")
+
+    assert response.status_code == 200
+    report = unwrap(response)
+    assert report["items"] == [{"name": "pdf-export", "action": "unchanged"}]
+    assert report["unchanged"] == 1
+
+
+def test_refresh_single_skill_rewrites_lost_file(
+    client: TestClient, isolated_skills_root: str
+) -> None:
+    """POST /skills/{name}/refresh rebuilds one skill's disk file from the DB."""
+    client.post("/skills", json=_skill_body())
+    skill_file = Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md"
+    skill_file.unlink()
+
+    response = client.post("/skills/pdf-export/refresh")
+
+    assert response.status_code == 200
+    report = unwrap(response)
+    assert report["items"] == [{"name": "pdf-export", "action": "rewritten"}]
+    assert skill_file.read_text(encoding="utf-8") == _skill_body()["body"]
+
+
+def test_refresh_single_unknown_skill_404(client: TestClient) -> None:
+    """POST /skills/{name}/refresh on a missing DB row returns 404."""
+    response = client.post("/skills/ghost/refresh")
+
+    assert response.status_code == 404
+
+
+
 def test_delete_skill_removes_row(client: TestClient) -> None:
     """DELETE removes the skill; subsequent reads 404."""
     client.post("/skills", json=_skill_body())

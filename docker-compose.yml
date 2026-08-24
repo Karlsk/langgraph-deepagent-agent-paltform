@@ -73,6 +73,11 @@ services:
       # stdio MCP manifest directory: drop *.json manifests on the host and
       # sync them via POST /mcp-servers/stdio-sync (see mcp-servers/README.md)
       - ./mcp-servers:/app/mcp-servers
+      # Skills filesystem store (SKILLS_ROOT=./data/skills): without this bind
+      # mount, SKILL.md bodies created at runtime live only in the container
+      # layer and are lost on every rebuild while their DB metadata rows
+      # survive in the postgres volume (read_global then fails "not found").
+      - ./data:/app/data
     env_file:
       - .env.${APP_ENV:-development}
     environment:

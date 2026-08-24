@@ -113,7 +113,7 @@ async def run_subagent_once(
                 raise ValueError(
                     f"tmp_skills_root is required when subagent '{cfg.name}' declares skill_names={cfg.skill_names!r}"
                 )
-            await materialize_into_directory(tmp_skills_root, skills)
+            await materialize_into_directory(session, tmp_skills_root, skills)
 
         graph = compile_standalone_subagent(
             cfg,

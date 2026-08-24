@@ -6,7 +6,7 @@ Phase-1 scope: no per-user isolation, all assets are globally shared;
 
 from typing import Optional
 
-from sqlalchemy import JSON, Column
+from sqlalchemy import JSON, Column, Text
 from sqlmodel import Field
 
 from app.models.base import BaseModel
@@ -55,12 +55,16 @@ class SubAgentConfig(BaseModel, table=True):
 
 
 class SkillAsset(BaseModel, table=True):
-    """Reusable skill asset (markdown skill content metadata).
+    """Reusable skill asset (dual-store: DB body + disk SKILL.md copy).
 
     Attributes:
         name: Globally unique skill name, primary key
         description: Human-readable description of the skill
-        content_hash: Hash of the skill content (used for publish/versioning)
+        body: Full SKILL.md content stored in the DB (source of truth).
+            ``None`` only on legacy rows created before dual-store; those
+            rows are backfilled from disk by ``refresh_disk_from_db``.
+        content_hash: Hash of the body; on refresh it is the trigger that
+            decides whether the disk copy needs rewriting
         created_by: Audit-only creator identifier
         version: Monotonic configuration version counter
     """
@@ -69,6 +73,7 @@ class SkillAsset(BaseModel, table=True):
 
     name: str = Field(primary_key=True)
     description: str
+    body: Optional[str] = Field(default=None, sa_column=Column(Text))
     content_hash: str
     created_by: Optional[str] = Field(default=None)
     version: int = Field(default=1)

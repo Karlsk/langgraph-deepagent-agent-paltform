@@ -8,7 +8,7 @@ Error semantics: missing resources return 404; name collisions and validation
 failures return 422; unexpected failures return 500 after ``logger.exception``.
 """
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session as DBSession
@@ -32,6 +32,8 @@ from app.schemas.agent_apps import (
     SkillGenerateRequest,
     SkillGenerateResponse,
     SkillRead,
+    SkillRefreshEntry,
+    SkillRefreshReport,
     SkillUpdate,
 )
 from app.schemas.base import ApiResponse, PageResult
@@ -171,6 +173,86 @@ async def generate_skill(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/skills/refresh", response_model=ApiResponse[SkillRefreshReport])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
+async def refresh_all_skills(
+    request: Request,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[SkillRefreshReport]:
+    """Refresh every skill's disk SKILL.md copy from its DB body.
+
+    ``content_hash`` is the rewrite trigger: a disk file whose sha256 matches
+    the row hash is left untouched; missing or drifted files are rewritten
+    from the DB body (DB is the source of truth). Legacy rows created before
+    dual-store (``body IS NULL``) are backfilled from their disk file.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a per-skill refresh report.
+    """
+    try:
+        entries = await skills_store.refresh_disk_from_db(db)
+        return ApiResponse.success(_build_refresh_report(entries))
+    except Exception as exc:
+        logger.exception("skill_disk_refresh_all_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/skills/{name}/refresh", response_model=ApiResponse[SkillRefreshReport])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
+async def refresh_skill(
+    request: Request,
+    name: str,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[SkillRefreshReport]:
+    """Refresh one skill's disk SKILL.md copy from its DB body.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: Skill primary key.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a single-entry refresh report.
+
+    Raises:
+        HTTPException: 404 when the skill has no DB row.
+    """
+    try:
+        entries = await skills_store.refresh_disk_from_db(db, name=name)
+        return ApiResponse.success(_build_refresh_report(entries))
+    except ValueError as exc:
+        logger.warning("skill_disk_refresh_rejected", name=name, error=str(exc))
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found") from exc
+    except Exception as exc:
+        logger.exception("skill_disk_refresh_failed", name=name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _build_refresh_report(entries: list[dict[str, str]]) -> SkillRefreshReport:
+    """Aggregate raw refresh entries into the API report model.
+
+    ``action`` values come from ``refresh_disk_from_db`` which only ever
+    emits the four literal outcomes, so the str -> Literal narrowing is safe.
+    """
+    items = [SkillRefreshEntry(name=entry["name"], action=cast(Any, entry["action"])) for entry in entries]
+    return SkillRefreshReport(
+        items=items,
+        total=len(items),
+        rewritten=sum(1 for item in items if item.action == "rewritten"),
+        unchanged=sum(1 for item in items if item.action == "unchanged"),
+        backfilled=sum(1 for item in items if item.action == "backfilled"),
+        missing=sum(1 for item in items if item.action == "missing"),
+    )
+
+
 @router.get("/skills/{name}", response_model=ApiResponse[SkillRead])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
 async def get_skill(
@@ -210,13 +292,19 @@ async def get_skill(
 async def get_skill_content(
     request: Request,
     name: str,
+    db: DBSession = Depends(get_db_session),
     current_session: ChatSession = Depends(get_current_session),
 ) -> ApiResponse[Any]:
     """Fetch the raw SKILL.md body of a global skill by name.
 
+    Dual-store read: the disk file is served directly; when it is missing
+    (e.g. lost on a container rebuild) the body is recovered from the DB row
+    and the disk file is rewritten on the fly.
+
     Args:
         request: The FastAPI request object for rate limiting.
         name: Skill primary key.
+        db: Request-scoped DB session (self-heal fallback source).
         current_session: Authenticated chat session.
 
     Returns:
@@ -226,7 +314,7 @@ async def get_skill_content(
         HTTPException: 404 when the skill does not exist.
     """
     try:
-        content = await skills_store.read_global(name)
+        content = await skills_store.read_global(db, name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=f"skill '{name}' not found") from exc
     except Exception as exc:

@@ -235,8 +235,8 @@ def test_update_global_file_write_failure_reverts_row(
 def test_delete_global_cascades_user_copies(skills_root: Path, db: FakeDBSession) -> None:
     """delete_global removes the global dir, every user copy and the DB row."""
     asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="v1"))
-    asyncio.run(skills_store.materialize_for_user("user-1", ["greet"]))
-    asyncio.run(skills_store.materialize_for_user("user-2", ["greet"]))
+    asyncio.run(skills_store.materialize_for_user(db, "user-1", ["greet"]))
+    asyncio.run(skills_store.materialize_for_user(db, "user-2", ["greet"]))
 
     asyncio.run(skills_store.delete_global(db, name="greet"))
 
@@ -302,13 +302,13 @@ def test_read_global_returns_body(skills_root: Path, db: FakeDBSession) -> None:
     """read_global returns the raw SKILL.md body."""
     asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="hello body"))
 
-    assert asyncio.run(skills_store.read_global("greet")) == "hello body"
+    assert asyncio.run(skills_store.read_global(db, "greet")) == "hello body"
 
 
-def test_read_global_missing_raises(skills_root: Path) -> None:
-    """Reading an unknown skill raises a business error."""
+def test_read_global_missing_raises(skills_root: Path, db: FakeDBSession) -> None:
+    """Reading a skill missing from both disk and DB raises a business error."""
     with pytest.raises(ValueError, match="not found"):
-        asyncio.run(skills_store.read_global("ghost"))
+        asyncio.run(skills_store.read_global(db, "ghost"))
 
 
 # ---------------------------------------------------------------------------
@@ -319,18 +319,18 @@ def test_read_global_missing_raises(skills_root: Path) -> None:
 def test_materialize_overwrites_stale_user_copy(skills_root: Path, db: FakeDBSession) -> None:
     """materialize_for_user overwrites an outdated user copy with fresh content."""
     asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="v1"))
-    asyncio.run(skills_store.materialize_for_user("user-1", ["greet"]))
+    asyncio.run(skills_store.materialize_for_user(db, "user-1", ["greet"]))
 
     asyncio.run(skills_store.update_global(db, name="greet", body="v2"))
-    asyncio.run(skills_store.materialize_for_user("user-1", ["greet"]))
+    asyncio.run(skills_store.materialize_for_user(db, "user-1", ["greet"]))
 
     assert _user_skill_file(skills_root, "user-1", "greet").read_text(encoding="utf-8") == "v2"
 
 
-def test_materialize_missing_global_skill_raises(skills_root: Path) -> None:
+def test_materialize_missing_global_skill_raises(skills_root: Path, db: FakeDBSession) -> None:
     """Materializing an unknown global skill raises a business error."""
     with pytest.raises(ValueError, match="not found"):
-        asyncio.run(skills_store.materialize_for_user("user-1", ["ghost"]))
+        asyncio.run(skills_store.materialize_for_user(db, "user-1", ["ghost"]))
 
 
 def test_sync_user_skills_refreshes_and_prunes_stale(skills_root: Path, db: FakeDBSession) -> None:
@@ -338,13 +338,13 @@ def test_sync_user_skills_refreshes_and_prunes_stale(skills_root: Path, db: Fake
     asyncio.run(skills_store.create_global(db, name="keep", description="k", body="keep-body"))
     asyncio.run(skills_store.create_global(db, name="fresh", description="f", body="fresh-v2"))
     # seed a stale user copy of "keep" plus a now-unassociated leftover "old"
-    asyncio.run(skills_store.materialize_for_user("user-1", ["keep", "fresh"]))
+    asyncio.run(skills_store.materialize_for_user(db, "user-1", ["keep", "fresh"]))
     leftover_dir = skills_root / "users" / "user-1" / "old"
     leftover_dir.mkdir(parents=True)
     (leftover_dir / "SKILL.md").write_text("stale", encoding="utf-8")
     asyncio.run(skills_store.update_global(db, name="fresh", body="fresh-v3"))
 
-    asyncio.run(skills_store.sync_user_skills("user-1", ["keep", "fresh"]))
+    asyncio.run(skills_store.sync_user_skills(db, "user-1", ["keep", "fresh"]))
 
     assert _user_skill_file(skills_root, "user-1", "fresh").read_text(encoding="utf-8") == "fresh-v3"
     assert _user_skill_file(skills_root, "user-1", "keep").read_text(encoding="utf-8") == "keep-body"
@@ -354,11 +354,140 @@ def test_sync_user_skills_refreshes_and_prunes_stale(skills_root: Path, db: Fake
 def test_sync_user_skills_empty_set_clears_all(skills_root: Path, db: FakeDBSession) -> None:
     """Syncing with an empty association set clears every user skill copy."""
     asyncio.run(skills_store.create_global(db, name="keep", description="k", body="keep-body"))
-    asyncio.run(skills_store.materialize_for_user("user-1", ["keep"]))
+    asyncio.run(skills_store.materialize_for_user(db, "user-1", ["keep"]))
 
-    asyncio.run(skills_store.sync_user_skills("user-1", []))
+    asyncio.run(skills_store.sync_user_skills(db, "user-1", []))
 
     assert not (skills_root / "users" / "user-1" / "keep").exists()
+
+
+# ---------------------------------------------------------------------------
+# Dual-store: DB body persistence + disk self-heal + refresh_disk_from_db
+# ---------------------------------------------------------------------------
+
+
+def test_create_global_persists_body_in_db(skills_root: Path, db: FakeDBSession) -> None:
+    """create_global stores the full body in the DB row (source of truth)."""
+    asset = asyncio.run(
+        skills_store.create_global(db, name="greet", description="greets", body="# hello\n\nbody")
+    )
+
+    assert asset.body == "# hello\n\nbody"
+    assert db.rows["greet"].body == "# hello\n\nbody"
+
+
+def test_update_global_persists_body_in_db(skills_root: Path, db: FakeDBSession) -> None:
+    """update_global refreshes the DB-stored body alongside the disk file."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="v1"))
+
+    asset = asyncio.run(skills_store.update_global(db, name="greet", body="v2"))
+
+    assert asset.body == "v2"
+    assert db.rows["greet"].body == "v2"
+
+
+def test_read_global_selfheals_disk_from_db(skills_root: Path, db: FakeDBSession) -> None:
+    """A lost disk file is rebuilt from the DB body (container-rebuild scenario)."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="heal me"))
+    _global_skill_file(skills_root, "greet").unlink()
+
+    assert asyncio.run(skills_store.read_global(db, "greet")) == "heal me"
+    assert _global_skill_file(skills_root, "greet").read_text(encoding="utf-8") == "heal me"
+
+
+def test_read_global_legacy_row_without_body_and_disk_raises(
+    skills_root: Path, db: FakeDBSession
+) -> None:
+    """A legacy NULL-body row whose disk file is gone is a genuine not-found."""
+    db.rows["legacy"] = SkillAsset(
+        name="legacy", description="d", content_hash="deadbeef", created_by=None, version=1
+    )
+
+    with pytest.raises(ValueError, match="not found"):
+        asyncio.run(skills_store.read_global(db, "legacy"))
+
+
+def test_materialize_into_directory_selfheals_from_db(skills_root: Path, db: FakeDBSession, tmp_path: Path) -> None:
+    """materialize_into_directory survives a lost global disk copy via the DB body."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="v1"))
+    _global_skill_file(skills_root, "greet").unlink()
+
+    target = tmp_path / "standalone-skills"
+    asyncio.run(skills_store.materialize_into_directory(db, target, ["greet"]))
+
+    assert (target / "greet" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+
+
+# ---------------------------------------------------------------------------
+# refresh_disk_from_db
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_rewrites_stale_disk_file(skills_root: Path, db: FakeDBSession) -> None:
+    """Refresh rewrites the disk file when its hash differs from the DB hash."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="db body"))
+    _global_skill_file(skills_root, "greet").write_text("drifted", encoding="utf-8")
+
+    report = asyncio.run(skills_store.refresh_disk_from_db(db))
+
+    assert report == [{"name": "greet", "action": "rewritten"}]
+    assert _global_skill_file(skills_root, "greet").read_text(encoding="utf-8") == "db body"
+
+
+def test_refresh_rewrites_missing_disk_file(skills_root: Path, db: FakeDBSession) -> None:
+    """Refresh rebuilds a lost disk file from the DB body."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="db body"))
+    _global_skill_file(skills_root, "greet").unlink()
+
+    report = asyncio.run(skills_store.refresh_disk_from_db(db, name="greet"))
+
+    assert report == [{"name": "greet", "action": "rewritten"}]
+    assert _global_skill_file(skills_root, "greet").read_text(encoding="utf-8") == "db body"
+
+
+def test_refresh_skips_unchanged_file(skills_root: Path, db: FakeDBSession) -> None:
+    """A disk file already matching the DB hash is left untouched (unchanged)."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="same"))
+    before = _global_skill_file(skills_root, "greet").stat().st_mtime_ns
+
+    report = asyncio.run(skills_store.refresh_disk_from_db(db))
+
+    assert report == [{"name": "greet", "action": "unchanged"}]
+    assert _global_skill_file(skills_root, "greet").stat().st_mtime_ns == before
+
+
+def test_refresh_backfills_legacy_row_from_disk(skills_root: Path, db: FakeDBSession) -> None:
+    """A legacy NULL-body row is backfilled from its disk file (hash resynced)."""
+    skill_dir = skills_root / "global" / "legacy"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# legacy\n\non disk only", encoding="utf-8")
+    db.rows["legacy"] = SkillAsset(
+        name="legacy", description="d", content_hash="stale-hash", created_by=None, version=3
+    )
+
+    report = asyncio.run(skills_store.refresh_disk_from_db(db))
+
+    assert report == [{"name": "legacy", "action": "backfilled"}]
+    assert db.rows["legacy"].body == "# legacy\n\non disk only"
+    assert db.rows["legacy"].content_hash == hashlib.sha256("# legacy\n\non disk only".encode()).hexdigest()
+    assert db.rows["legacy"].version == 3
+
+
+def test_refresh_reports_missing_when_body_and_disk_lost(skills_root: Path, db: FakeDBSession) -> None:
+    """A legacy NULL-body row with no disk file is reported missing (unrecoverable)."""
+    db.rows["ghost"] = SkillAsset(
+        name="ghost", description="d", content_hash="deadbeef", created_by=None, version=1
+    )
+
+    report = asyncio.run(skills_store.refresh_disk_from_db(db))
+
+    assert report == [{"name": "ghost", "action": "missing"}]
+
+
+def test_refresh_single_unknown_name_raises(skills_root: Path, db: FakeDBSession) -> None:
+    """Refreshing a single skill that has no DB row raises a business error."""
+    with pytest.raises(ValueError, match="not found"):
+        asyncio.run(skills_store.refresh_disk_from_db(db, name="ghost"))
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +512,7 @@ def test_invalid_user_id_rejected(skills_root: Path, db: FakeDBSession) -> None:
     asyncio.run(skills_store.create_global(db, name="greet", description="greets", body="v1"))
 
     with pytest.raises(ValueError, match="invalid user id"):
-        asyncio.run(skills_store.materialize_for_user("../escape", ["greet"]))
+        asyncio.run(skills_store.materialize_for_user(db, "../escape", ["greet"]))
 
 
 # ---------------------------------------------------------------------------
