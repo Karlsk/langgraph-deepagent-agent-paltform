@@ -78,6 +78,55 @@ def test_subagent_test_unknown_name_404(client: TestClient, user_headers: dict[s
     assert_error_envelope(response, code=404, message="subagent 'ghost' not found")
 
 
+def test_subagent_test_run_persists_queryable_trace(
+    client: TestClient, user_headers: dict[str, str], scripted_model: Any
+) -> None:
+    """A one-shot run persists a structured trace retrievable via the trace APIs."""
+    headers = _auth(client, user_headers)
+    created = client.post(
+        f"{API}/subagents",
+        json={
+            "name": "traceable",
+            "description": "Traceable helper",
+            "when_to_use": "When tracing matters",
+            "system_prompt": "You help.",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+
+    scripted_model.responses = [AIMessage(content="traced reply")]
+    result = client.post(f"{API}/subagents/traceable/test", json={"prompt": "trace me"}, headers=headers)
+    assert result.status_code == 200, result.text
+    payload = unwrap(result)
+    trace_id = payload["trace_id"]
+    assert trace_id is not None
+
+    # The list endpoint exposes the run as a summary (no event stream).
+    listing = client.get(f"{API}/subagents/traceable/test-traces", headers=headers)
+    assert listing.status_code == 200, listing.text
+    page = unwrap(listing)
+    assert page["total"] == 1
+    summary = page["items"][0]
+    assert summary["id"] == trace_id
+    assert summary["status"] == "success"
+    assert summary["prompt"] == "trace me"
+    assert "events" not in summary
+
+    # The detail endpoint carries the full structured event stream.
+    detail = client.get(f"{API}/subagents/traceable/test-traces/{trace_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    trace = unwrap(detail)
+    types = [event["type"] for event in trace["events"]]
+    assert "llm_call" in types
+    assert types[-1] == "run_finished"
+    llm_event = next(event for event in trace["events"] if event["type"] == "llm_call")
+    assert llm_event["model"] == settings.DEFAULT_LLM_MODEL
+    assert llm_event["output_text"] == "traced reply"
+    assert trace["final_message"] == "traced reply"
+    assert trace["created_by"]  # audit creator recorded from the chat session
+
+
 def test_skill_delete_cascades_user_copies(
     client: TestClient, user_headers: dict[str, str], scripted_model: Any, memory_checkpointer: Any
 ) -> None:

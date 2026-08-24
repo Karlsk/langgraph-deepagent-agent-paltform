@@ -8,6 +8,7 @@ catalog builder, client shutdown) is monkeypatched.
 """
 
 from collections.abc import Generator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -39,6 +40,7 @@ from app.core.limiter import limiter
 from app.core.mcp_client import MCPUpstreamError, ToolSummary
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.models.session import Session as ChatSession
+from app.models.subagent_trace import SubAgentTestTrace
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents import skills_store
 from pydantic import ValidationError
@@ -335,18 +337,28 @@ def test_subagent_test_invokes_run_subagent_once(
     """POST /subagents/{name}/test delegates to run_subagent_once."""
     client.post("/subagents", json=_subagent_body())
     run_once = AsyncMock(
-        return_value=SubAgentTestResult(final_message="done", turns=2, duration_seconds=1.5, model="gpt-5-mini")
+        return_value=SubAgentTestResult(
+            final_message="done", turns=2, duration_seconds=1.5, model="gpt-5-mini", trace_id=42
+        )
     )
     monkeypatch.setattr(subagents_module, "run_subagent_once", run_once)
 
     response = client.post("/subagents/researcher/test", json={"prompt": "hello"})
     assert response.status_code == 200
-    assert unwrap(response) == {"final_message": "done", "turns": 2, "duration_seconds": 1.5, "model": "gpt-5-mini"}
+    assert unwrap(response) == {
+        "final_message": "done",
+        "turns": 2,
+        "duration_seconds": 1.5,
+        "model": "gpt-5-mini",
+        "trace_id": 42,
+    }
     run_once.assert_awaited_once()
     kwargs = run_once.await_args.kwargs
     assert kwargs["name"] == "researcher"
     assert kwargs["prompt"] == "hello"
     assert kwargs["session"] is db_session
+    # The audit creator is forwarded so the persisted trace records the user.
+    assert kwargs["created_by"] == "ann"
 
 
 def test_subagent_test_unknown_name_404(client: TestClient) -> None:
@@ -361,6 +373,105 @@ def test_subagent_test_runner_failure_500(client: TestClient, monkeypatch: pytes
     monkeypatch.setattr(subagents_module, "run_subagent_once", AsyncMock(side_effect=RuntimeError("boom")))
     response = client.post("/subagents/researcher/test", json={"prompt": "hello"})
     assert response.status_code == 500
+
+
+# ---------------------------------------------------------------------------
+# SubAgent test-run traces (list + detail)
+# ---------------------------------------------------------------------------
+
+
+def _seed_trace(db_session: DBSession, **overrides: Any) -> SubAgentTestTrace:
+    """Persist a SubAgentTestTrace row with sensible defaults for API tests."""
+    defaults: dict[str, Any] = {
+        "name": "researcher",
+        "status": "success",
+        "prompt": "hello",
+        "model": "gpt-5-mini",
+        "turns": 1,
+        "duration_seconds": 1.25,
+        "final_message": "done",
+        "events": [{"seq": 1, "type": "run_finished", "status": "success"}],
+        "error": None,
+        "created_by": "ann",
+    }
+    defaults.update(overrides)
+    trace = SubAgentTestTrace(**defaults)
+    db_session.add(trace)
+    db_session.commit()
+    db_session.refresh(trace)
+    return trace
+
+
+def test_list_test_traces_returns_summaries_newest_first(client: TestClient, db_session: DBSession) -> None:
+    """GET /subagents/{name}/test-traces paginates summaries without events."""
+    client.post("/subagents", json=_subagent_body())
+    base = datetime(2026, 8, 24, 8, 0, 0, tzinfo=UTC)
+    older = _seed_trace(db_session, prompt="first", created_at=base)
+    newer = _seed_trace(
+        db_session, prompt="second", status="error", error="RuntimeError: boom", created_at=base.replace(hour=9)
+    )
+
+    response = client.get("/subagents/researcher/test-traces")
+    assert response.status_code == 200
+    payload = unwrap(response)
+    assert payload["total"] == 2
+    assert payload["page"] == 1
+    assert payload["pageSize"] == 10
+    # Newest first; summaries carry no event stream.
+    assert [row["id"] for row in payload["items"]] == [newer.id, older.id]
+    assert "events" not in payload["items"][0]
+    assert payload["items"][0]["status"] == "error"
+    assert payload["items"][0]["error"] == "RuntimeError: boom"
+    assert payload["items"][0]["created_by"] == "ann"
+
+
+def test_list_test_traces_filters_by_subagent_name(client: TestClient, db_session: DBSession) -> None:
+    """Only traces of the addressed sub-agent are returned."""
+    client.post("/subagents", json=_subagent_body())
+    client.post("/subagents", json=_subagent_body(name="writer"))
+    _seed_trace(db_session)  # researcher
+    _seed_trace(db_session, name="writer")
+
+    response = client.get("/subagents/researcher/test-traces")
+    payload = unwrap(response)
+    assert payload["total"] == 1
+    assert payload["items"][0]["prompt"] == "hello"
+
+
+def test_list_test_traces_unknown_subagent_404(client: TestClient) -> None:
+    """Listing traces of a missing sub-agent returns 404."""
+    assert client.get("/subagents/ghost/test-traces").status_code == 404
+
+
+def test_get_test_trace_detail_includes_events(client: TestClient, db_session: DBSession) -> None:
+    """GET /subagents/{name}/test-traces/{trace_id} returns the full event stream."""
+    client.post("/subagents", json=_subagent_body())
+    trace = _seed_trace(
+        db_session,
+        events=[
+            {"seq": 1, "type": "llm_call", "status": "success", "output_text": "done"},
+            {"seq": 2, "type": "run_finished", "status": "success"},
+        ],
+    )
+
+    response = client.get(f"/subagents/researcher/test-traces/{trace.id}")
+    assert response.status_code == 200
+    payload = unwrap(response)
+    assert payload["id"] == trace.id
+    assert payload["final_message"] == "done"
+    assert [event["type"] for event in payload["events"]] == ["llm_call", "run_finished"]
+
+
+def test_get_test_trace_unknown_id_or_owner_404(client: TestClient, db_session: DBSession) -> None:
+    """A missing trace id or an owner mismatch returns 404."""
+    client.post("/subagents", json=_subagent_body())
+    client.post("/subagents", json=_subagent_body(name="writer"))
+    trace = _seed_trace(db_session, name="writer")
+
+    assert client.get("/subagents/researcher/test-traces/9999").status_code == 404
+    # The trace exists but belongs to "writer", not "researcher".
+    assert client.get(f"/subagents/researcher/test-traces/{trace.id}").status_code == 404
+    assert client.get("/subagents/ghost/test-traces/1").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -446,9 +557,7 @@ def test_get_skill_content_unknown_name_404(client: TestClient) -> None:
     assert client.get("/skills/ghost/content").status_code == 404
 
 
-def test_get_skill_content_selfheals_lost_disk_file(
-    client: TestClient, isolated_skills_root: str
-) -> None:
+def test_get_skill_content_selfheals_lost_disk_file(client: TestClient, isolated_skills_root: str) -> None:
     """GET /skills/{name}/content rebuilds a lost disk file from the DB body."""
     client.post("/skills", json=_skill_body())
     (Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md").unlink()
@@ -461,9 +570,7 @@ def test_get_skill_content_selfheals_lost_disk_file(
     assert (Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md").exists()
 
 
-def test_refresh_all_skills_rewrites_lost_and_drifted_files(
-    client: TestClient, isolated_skills_root: str
-) -> None:
+def test_refresh_all_skills_rewrites_lost_and_drifted_files(client: TestClient, isolated_skills_root: str) -> None:
     """POST /skills/refresh rebuilds lost/drifted disk files from the DB bodies."""
     client.post("/skills", json=_skill_body())
     client.post("/skills", json=_skill_body(name="csv-clean", description="Clean CSV"))
@@ -495,9 +602,7 @@ def test_refresh_all_reports_unchanged_for_healthy_files(client: TestClient) -> 
     assert report["unchanged"] == 1
 
 
-def test_refresh_single_skill_rewrites_lost_file(
-    client: TestClient, isolated_skills_root: str
-) -> None:
+def test_refresh_single_skill_rewrites_lost_file(client: TestClient, isolated_skills_root: str) -> None:
     """POST /skills/{name}/refresh rebuilds one skill's disk file from the DB."""
     client.post("/skills", json=_skill_body())
     skill_file = Path(isolated_skills_root) / "global" / "pdf-export" / "SKILL.md"
@@ -516,7 +621,6 @@ def test_refresh_single_unknown_skill_404(client: TestClient) -> None:
     response = client.post("/skills/ghost/refresh")
 
     assert response.status_code == 404
-
 
 
 def test_delete_skill_removes_row(client: TestClient) -> None:

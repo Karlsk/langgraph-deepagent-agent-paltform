@@ -9,6 +9,7 @@ Asset ``model`` fields reference a model config as ``"<provider>/<model>"``
 ``app.schemas.providers``.
 """
 
+from datetime import datetime
 from typing import Any, Literal, Optional, Self
 
 from pydantic import BaseModel, Field, model_validator
@@ -164,12 +165,55 @@ class SubAgentTestResult(BaseModel):
         turns: Number of agent turns consumed
         duration_seconds: Wall-clock duration of the run
         model: LLM model that executed the run
+        trace_id: Id of the persisted execution trace (queryable via
+            ``GET /subagents/{name}/test-traces/{trace_id}``); None only
+            when trace persistence failed
     """
 
     final_message: str = Field(..., description="Final assistant message produced by the run")
     turns: int = Field(..., description="Number of agent turns consumed")
     duration_seconds: float = Field(..., description="Wall-clock duration of the run")
     model: str = Field(..., description="LLM model that executed the run")
+    trace_id: Optional[int] = Field(default=None, description="Id of the persisted execution trace")
+
+
+class SubAgentTraceSummary(BaseModel):
+    """Summary row of a persisted sub-agent test run trace (no event stream).
+
+    Attributes:
+        id: Trace primary key
+        status: Run outcome (success|error)
+        prompt: User prompt the sub-agent was invoked with
+        model: LLM model id that executed the run
+        turns: Number of model turns consumed
+        duration_seconds: Wall-clock duration of the run
+        final_message: Final assistant message (empty on failed runs)
+        error: Stringified failure reason (None on success)
+        created_by: Audit-only identifier of the user who triggered the run
+        created_at: Timestamp at which the trace was recorded
+    """
+
+    id: int = Field(..., description="Trace primary key")
+    status: str = Field(..., description="Run outcome (success|error)")
+    prompt: str = Field(..., description="User prompt the sub-agent was invoked with")
+    model: str = Field(..., description="LLM model id that executed the run")
+    turns: int = Field(..., description="Number of model turns consumed")
+    duration_seconds: float = Field(..., description="Wall-clock duration of the run")
+    final_message: str = Field(default="", description="Final assistant message (empty on failed runs)")
+    error: Optional[str] = Field(default=None, description="Stringified failure reason (None on success)")
+    created_by: Optional[str] = Field(default=None, description="Audit-only identifier of the triggering user")
+    created_at: datetime = Field(..., description="Timestamp at which the trace was recorded")
+
+
+class SubAgentTraceDetail(SubAgentTraceSummary):
+    """Full trace of one sub-agent test run, including the event stream.
+
+    Attributes:
+        events: Structured trace event stream (llm_call / tool_call /
+            run_finished entries; see app.services.agents.run_tracer)
+    """
+
+    events: list[dict[str, Any]] = Field(default_factory=list, description="Structured trace event stream")
 
 
 # ---------------------------------------------------------------------------

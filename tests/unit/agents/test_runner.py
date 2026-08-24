@@ -16,12 +16,13 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool, tool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.config import settings
 from app.core.metrics import agent_test_runs_total, subagent_task_duration_seconds
 from app.models.agent_assets import SubAgentConfig, SkillAsset
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
+from app.models.subagent_trace import SubAgentTestTrace
 from app.services.agents import test_runner
 
 pytestmark = pytest.mark.unit
@@ -373,13 +374,17 @@ def test_run_subagent_once_passes_langfuse_callback_when_tracing_enabled(
     result = asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="hi"))
 
     assert result.final_message == "ok"
-    assert captured["config"]["callbacks"] == [sentinel]
+    callbacks = captured["config"]["callbacks"]
+    assert callbacks[0] is sentinel
+    # The RunTracer is always attached after the optional Langfuse handler.
+    assert isinstance(callbacks[1], test_runner.RunTracer)
+    assert len(callbacks) == 2
 
 
 def test_run_subagent_once_omits_callback_when_tracing_disabled(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Tracing disabled -> no callbacks are passed (test isolation)."""
+    """Tracing disabled -> only the RunTracer is passed (no Langfuse handler)."""
     _seed_config(db_session)
     _patch_registry(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="ok")]))
     monkeypatch.setattr(settings, "LANGFUSE_TRACING_ENABLED", False)
@@ -387,7 +392,9 @@ def test_run_subagent_once_omits_callback_when_tracing_disabled(
 
     asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="hi"))
 
-    assert captured["config"]["callbacks"] == []
+    callbacks = captured["config"]["callbacks"]
+    assert len(callbacks) == 1
+    assert isinstance(callbacks[0], test_runner.RunTracer)
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +512,127 @@ def test_run_subagent_once_without_skill_names_skips_tmp_root(
     # assembly treats ``cfg.skill_names is None`` as ``[]`` and binds no skills.
     assert captured_kwargs["skills_dir"] == tmp_path / "unused"
     assert not (tmp_path / "unused").exists(), "materialise skipped -> no directory created"
+
+
+# ---------------------------------------------------------------------------
+# Execution trace persistence (SubAgentTestTrace)
+# ---------------------------------------------------------------------------
+
+
+class ExplodingChatModel(BaseChatModel):
+    """Scripted model that always raises (failure-path trace tests)."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "exploding"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "ExplodingChatModel":
+        """Accept the bound tool set; the next generation still explodes."""
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: Any = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Fail every generation deterministically."""
+        raise RuntimeError("model exploded")
+
+
+def _traces_for(session: Session, name: str) -> list[SubAgentTestTrace]:
+    """Fetch every persisted trace row recorded for ``name``."""
+    return list(session.exec(select(SubAgentTestTrace).where(SubAgentTestTrace.name == name)).all())
+
+
+def test_run_subagent_once_persists_success_trace(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful run persists a trace row and returns its id."""
+    _seed_config(db_session)
+    _patch_registry(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="done helping")]))
+
+    result = asyncio.run(
+        test_runner.run_subagent_once(db_session, name="helper", prompt="help me", created_by="tester")
+    )
+
+    assert result.trace_id is not None
+    trace = db_session.get(SubAgentTestTrace, result.trace_id)
+    assert trace is not None
+    assert trace.name == "helper"
+    assert trace.status == "success"
+    assert trace.prompt == "help me"
+    assert trace.model == settings.DEFAULT_LLM_MODEL
+    assert trace.final_message == "done helping"
+    assert trace.turns == 1
+    assert trace.error is None
+    assert trace.created_by == "tester"
+
+    types = [event["type"] for event in trace.events]
+    assert "llm_call" in types
+    assert types[-1] == "run_finished"
+    llm_event = next(event for event in trace.events if event["type"] == "llm_call")
+    assert llm_event["model"] == settings.DEFAULT_LLM_MODEL
+    assert llm_event["status"] == "success"
+    assert llm_event["output_text"] == "done helping"
+    # The initial HumanMessage reaches the model as recorded input (deepagents
+    # prepends the system prompt, so look it up by role instead of index).
+    human_inputs = [message for message in llm_event["input_messages"] if message["type"] == "human"]
+    assert human_inputs and human_inputs[0]["content"] == "help me"
+
+
+def test_run_subagent_once_trace_captures_tool_chain_in_order(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool-calling turn produces llm_call -> tool_call -> llm_call events."""
+    _seed_config(db_session, allowed_tools=["echo"], max_turns=5)
+    tool_call = AIMessage(
+        content="", tool_calls=[{"name": "echo", "args": {"text": "hi"}, "id": "s1", "type": "tool_call"}]
+    )
+    model = ScriptedChatModel(responses=[tool_call, AIMessage(content="all done")])
+    _patch_registry(monkeypatch, model)
+
+    result = asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="echo hi"))
+
+    trace = db_session.get(SubAgentTestTrace, result.trace_id)
+    assert trace is not None
+    types = [event["type"] for event in trace.events]
+    assert types == ["llm_call", "tool_call", "llm_call", "run_finished"]
+
+    tool_event = next(event for event in trace.events if event["type"] == "tool_call")
+    assert tool_event["tool"] == "echo"
+    assert tool_event["arguments"] == {"text": "hi"}
+    assert tool_event["output"] == "echo: hi"
+    assert tool_event["status"] == "success"
+
+    # The second LLM call saw the tool result in its input messages.
+    second_llm = [event for event in trace.events if event["type"] == "llm_call"][1]
+    input_types = [message["type"] for message in second_llm["input_messages"]]
+    assert "tool" in input_types
+
+
+def test_run_subagent_once_persists_error_trace_and_reraises(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing model still persists a status=error trace, then re-raises."""
+    _seed_config(db_session)
+    _patch_registry(monkeypatch, ExplodingChatModel())
+    error_before = _run_counter("error")
+
+    with pytest.raises(RuntimeError, match="model exploded"):
+        asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="hi", created_by="tester"))
+
+    assert _run_counter("error") == error_before + 1
+    traces = _traces_for(db_session, "helper")
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace.status == "error"
+    assert trace.error is not None and "model exploded" in trace.error
+    assert trace.final_message == ""
+    assert trace.turns == 1  # one LLM call observed before the failure
+    assert trace.created_by == "tester"
+
+    types = [event["type"] for event in trace.events]
+    assert types == ["llm_call", "run_finished"]
+    assert trace.events[0]["status"] == "error"
+    assert "model exploded" in str(trace.events[0]["error"])
+    assert trace.events[-1]["status"] == "error"

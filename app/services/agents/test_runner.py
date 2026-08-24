@@ -27,9 +27,11 @@ from app.core.logging import logger
 from app.core.metrics import agent_test_runs_total, subagent_task_duration_seconds
 from app.core.observability import langfuse_callback_handler
 from app.models.agent_assets import SubAgentConfig
+from app.models.subagent_trace import SubAgentTestTrace
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents.assembly import compile_standalone_subagent, resolve_tools
 from app.services.agents.mcp_manager import build_tool_catalog, get_mcp_tools
+from app.services.agents.run_tracer import RunTracer
 from app.services.agents.skills_store import materialize_into_directory
 from app.services.llm.llm_store import build_chat_model, load_model_config
 
@@ -49,12 +51,62 @@ def _load_config(session: Session, name: str) -> SubAgentConfig | None:
     return session.exec(select(SubAgentConfig).where(SubAgentConfig.name == name)).first()
 
 
+def _persist_trace(
+    session: Session,
+    *,
+    name: str,
+    status: str,
+    prompt: str,
+    model: str,
+    turns: int,
+    duration_seconds: float,
+    final_message: str,
+    events: list[dict[str, Any]],
+    error: str | None,
+    created_by: str | None,
+) -> int | None:
+    """Persist the collected trace row; never mask the caller's outcome.
+
+    Returns:
+        The persisted trace id, or None when persistence itself failed (the
+        failure is logged but the test run's own result/exception wins).
+    """
+    try:
+        trace = SubAgentTestTrace(
+            name=name,
+            status=status,
+            prompt=prompt,
+            model=model,
+            turns=turns,
+            duration_seconds=duration_seconds,
+            final_message=final_message,
+            events=events,
+            error=error,
+            created_by=created_by,
+        )
+        session.add(trace)
+        session.commit()
+        session.refresh(trace)
+        logger.info(
+            "subagent_test_trace_persisted", name=name, status=status, trace_id=trace.id, event_count=len(events)
+        )
+        return trace.id
+    except Exception:  # noqa: BLE001 — trace persistence must never mask the run outcome
+        logger.exception("subagent_test_trace_persist_failed", name=name, status=status)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001, S110 — best-effort rollback, original outcome wins
+            pass
+        return None
+
+
 async def run_subagent_once(
     session: Session,
     *,
     name: str,
     prompt: str,
     tmp_skills_root: Path | None = None,
+    created_by: str | None = None,
 ) -> SubAgentTestResult:
     """Execute one isolated one-shot test run of a sub-agent configuration.
 
@@ -67,16 +119,20 @@ async def run_subagent_once(
             ``cfg.skill_names`` is non-empty; the caller is responsible for
             the directory's lifecycle (typically a ``tmp_path`` fixture) so
             no state leaks back to ``settings.SKILLS_ROOT``.
+        created_by: Audit-only identifier of the user triggering the run,
+            recorded on the persisted ``SubAgentTestTrace`` row.
 
     Returns:
         SubAgentTestResult with the final AIMessage text, the number of model
-        turns consumed (AIMessage count), wall-clock duration and the upstream
-        model id of the resolved model config.
+        turns consumed (AIMessage count), wall-clock duration, the upstream
+        model id of the resolved model config and the ``trace_id`` of the
+        persisted execution trace (None only if trace persistence failed).
 
     Raises:
         ValueError: When no SubAgentConfig exists under ``name``, its model
             reference cannot be resolved, or a bound skill is missing.
-        Exception: Re-raised after error counting and structured logging.
+        Exception: Re-raised after error counting, trace persistence and
+            structured logging.
     """
     cfg = _load_config(session, name)
     if cfg is None:
@@ -91,6 +147,9 @@ async def run_subagent_once(
         logger.exception("subagent_test_model_unresolvable", name=name)
         raise
     model_name = model_cfg.model_id
+    # Structured execution trace (LLM/tool events) collected via callbacks and
+    # persisted on both success and failure for offline behaviour review.
+    tracer = RunTracer(model_name=model_name)
     started = time.perf_counter()
     try:
         # The catalog validates MCP server health and mirrors what the API
@@ -123,20 +182,54 @@ async def run_subagent_once(
             skills_dir=tmp_skills_root,
         )
         # Tracing parity with the chat runtime (_build_config): the Langfuse
-        # callback is attached only when tracing is enabled.
+        # callback is attached only when tracing is enabled; the RunTracer is
+        # always attached to collect the structured execution trace.
         invoke_config: RunnableConfig = {
-            "callbacks": [langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []
+            "callbacks": [
+                *([langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []),
+                tracer,
+            ]
         }
         state = await graph.ainvoke({"messages": [HumanMessage(content=prompt)]}, config=invoke_config)
-    except Exception:
+    except Exception as exc:
         agent_test_runs_total.labels(status="error").inc()
         logger.exception("subagent_test_run_failed", name=name, model=model_name)
+        duration = time.perf_counter() - started
+        turns = tracer.llm_call_count
+        _persist_trace(
+            session,
+            name=name,
+            status="error",
+            prompt=prompt,
+            model=model_name,
+            turns=turns,
+            duration_seconds=duration,
+            final_message="",
+            events=tracer.finish(
+                "error", [], turns=turns, duration_seconds=duration, error=f"{type(exc).__name__}: {exc}"
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+            created_by=created_by,
+        )
         raise
 
     duration = time.perf_counter() - started
     messages: list[Any] = list(state["messages"])
     ai_messages = [message for message in messages if isinstance(message, AIMessage)]
     final_message = _message_text(ai_messages[-1]) if ai_messages else ""
+    trace_id = _persist_trace(
+        session,
+        name=name,
+        status="success",
+        prompt=prompt,
+        model=model_name,
+        turns=len(ai_messages),
+        duration_seconds=duration,
+        final_message=final_message,
+        events=tracer.finish("success", messages, turns=len(ai_messages), duration_seconds=duration),
+        error=None,
+        created_by=created_by,
+    )
 
     agent_test_runs_total.labels(status="success").inc()
     subagent_task_duration_seconds.labels(subagent=name).observe(duration)
@@ -149,10 +242,12 @@ async def run_subagent_once(
         tool_count=len(tools),
         skill_count=len(skills),
         duration_seconds=duration,
+        trace_id=trace_id,
     )
     return SubAgentTestResult(
         final_message=final_message,
         turns=len(ai_messages),
         duration_seconds=duration,
         model=model_name,
+        trace_id=trace_id,
     )

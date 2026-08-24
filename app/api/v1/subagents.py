@@ -1,4 +1,4 @@
-"""Admin API for sub-agent assets (CRUD + one-shot test).
+"""Admin API for sub-agent assets (CRUD + one-shot test + test-run traces).
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
 every endpoint only authenticates via ``get_current_session`` and records the
@@ -29,11 +29,14 @@ from app.core.limiter import limiter
 from app.core.logging import logger
 from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.session import Session as ChatSession
+from app.models.subagent_trace import SubAgentTestTrace
 from app.schemas.agent_apps import (
     SubAgentCreate,
     SubAgentRead,
     SubAgentTestRequest,
     SubAgentTestResult,
+    SubAgentTraceDetail,
+    SubAgentTraceSummary,
     SubAgentUpdate,
 )
 from app.schemas.base import ApiResponse, PageResult
@@ -356,7 +359,11 @@ async def test_subagent(
         try:
             return ApiResponse.success(
                 await run_subagent_once(
-                    session=db, name=name, prompt=payload.prompt, tmp_skills_root=Path(tmp_skills_root)
+                    session=db,
+                    name=name,
+                    prompt=payload.prompt,
+                    tmp_skills_root=Path(tmp_skills_root),
+                    created_by=_creator(current_session),
                 )
             )
         finally:
@@ -367,4 +374,97 @@ async def test_subagent(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("subagent_test_failed", name=name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Test run traces
+# ---------------------------------------------------------------------------
+
+
+@router.get("/subagents/{name}/test-traces", response_model=ApiResponse[PageResult[SubAgentTraceSummary]])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
+async def list_subagent_test_traces(
+    request: Request,
+    name: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """List persisted test-run traces of a sub-agent, newest first.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: Sub-agent primary key.
+        page: 1-based page number.
+        page_size: Rows per page (exposed as ``pageSize``).
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying a PageResult of trace summaries (no event streams).
+
+    Raises:
+        HTTPException: 404 when the sub-agent does not exist.
+    """
+    try:
+        if db.get(SubAgentConfig, name) is None:
+            raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
+        result = paginate_by_name(
+            db,
+            SubAgentTestTrace,
+            page=page,
+            page_size=page_size,
+            keyword=None,
+            order_by=col(SubAgentTestTrace.created_at).desc(),
+            extra_where=[col(SubAgentTestTrace.name) == name],
+        )
+        items = [SubAgentTraceSummary.model_validate(row, from_attributes=True) for row in result.items]
+        return ApiResponse.success(
+            PageResult(items=items, total=result.total, page=result.page, page_size=result.page_size)
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("subagent_test_trace_list_failed", name=name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/subagents/{name}/test-traces/{trace_id}", response_model=ApiResponse[SubAgentTraceDetail])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
+async def get_subagent_test_trace(
+    request: Request,
+    name: str,
+    trace_id: int,
+    db: DBSession = Depends(get_db_session),
+    current_session: ChatSession = Depends(get_current_session),
+) -> ApiResponse[Any]:
+    """Fetch one persisted test-run trace including its full event stream.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        name: Sub-agent primary key.
+        trace_id: Trace row primary key.
+        db: Request-scoped DB session.
+        current_session: Authenticated chat session.
+
+    Returns:
+        Envelope carrying the trace detail (summary fields + events).
+
+    Raises:
+        HTTPException: 404 when the sub-agent or the trace does not exist,
+            or the trace belongs to a different sub-agent.
+    """
+    try:
+        if db.get(SubAgentConfig, name) is None:
+            raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
+        trace = db.get(SubAgentTestTrace, trace_id)
+        if trace is None or trace.name != name:
+            raise HTTPException(status_code=404, detail=f"trace {trace_id} not found for subagent '{name}'")
+        return ApiResponse.success(SubAgentTraceDetail.model_validate(trace, from_attributes=True))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("subagent_test_trace_read_failed", name=name, trace_id=trace_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
