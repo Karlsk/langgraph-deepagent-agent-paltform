@@ -76,15 +76,24 @@ def test_lifespan_warmup_degrades_without_external_services(
 
 
 def test_import_app_main_smoke() -> None:
-    """The application module imports cleanly (no side-effect failures)."""
+    """The application module imports cleanly (no side-effect failures).
+
+    Phase 1 G1 retirement assertions: the chatbot routes and the chat-session
+    auth routes must no longer be registered (clients get 404).
+    """
     if "app.main" in sys.modules:
         main_module = sys.modules["app.main"]
     else:
         main_module = importlib.import_module("app.main")
     assert main_module.app is not None
     routes = {getattr(route, "path", None) for route in main_module.app.routes}
-    assert f"{API}/chatbot/chat" in routes
     assert f"{API}/apps/published" in routes
+    # Retired routes (Phase 1 G1 single-layer auth):
+    assert f"{API}/chatbot/chat" not in routes
+    assert f"{API}/chatbot/chat/stream" not in routes
+    assert f"{API}/chatbot/messages" not in routes
+    assert f"{API}/auth/session" not in routes
+    assert f"{API}/auth/sessions" not in routes
 
 
 def test_lifespan_shutdown_closes_shared_checkpoint_pool(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -90,6 +90,28 @@ mcp_session_stop_total = Counter(
     ["outcome"],  # "graceful" | "timeout_cancelled" | "crashed" | "cancelled" | "foreign_loop"
 )
 
+# Auth metrics — Phase 1 G1 single-layer auth with refresh tokens
+auth_refresh_total = Counter(
+    "auth_refresh_total",
+    "Total /auth/refresh calls",
+    ["status"],  # "success" | "replay_detected" | "invalid" | "expired"
+)
+
+auth_refresh_replay_total = Counter(
+    "auth_refresh_replay_total",
+    "Refresh token replay attempts (alert when > 0)",
+)
+
+auth_logout_total = Counter(
+    "auth_logout_total",
+    "Total /auth/logout calls",
+)
+
+refresh_token_active_count = Gauge(
+    "refresh_token_active_count",
+    "Currently active (non-revoked, non-expired) refresh tokens",
+)
+
 
 def setup_metrics(app):
     """Set up Prometheus metrics middleware and endpoints.

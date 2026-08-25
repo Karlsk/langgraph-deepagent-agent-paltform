@@ -53,7 +53,6 @@ from app.services.agents import test_runner as test_runner_module
 from app.services.database import database_service
 from app.services.memory import memory_service
 from app.utils.auth import create_access_token
-from tests.conftest import unwrap
 
 
 # ---------------------------------------------------------------------------
@@ -385,33 +384,10 @@ async def collect_stream(runtime_obj: Any, *args: Any, **kwargs: Any) -> list[An
     return chunks
 
 
-def parse_sse_events(body: str) -> list[dict[str, Any]]:
-    """Parse SSE data frames emitted by /chatbot/chat/stream."""
-    import json  # noqa: PLC0415 — fixture-local utility
-
-    events: list[dict[str, Any]] = []
-    for line in body.splitlines():
-        if line.startswith("data: "):
-            events.append(json.loads(line.removeprefix("data: ")))
-    return events
-
-
-async def create_chat_session(client: TestClient, headers: dict[str, str], agent_app_id: int | None) -> dict[str, Any]:
-    """POST /auth/session and return the unwrapped session payload."""
-    payload: dict[str, Any] = {}
-    if agent_app_id is not None:
-        payload["agent_app_id"] = agent_app_id
-    response = client.post(f"{settings.API_V1_STR}/auth/session", json=payload, headers=headers)
-    assert response.status_code == 200, response.text
-    return unwrap(response)
-
-
 __all__ = [
     "FakeMcpState",
     "ScriptedChatModel",
     "assert_error_envelope",
     "collect_stream",
-    "create_chat_session",
     "make_mcp_tool",
-    "parse_sse_events",
 ]

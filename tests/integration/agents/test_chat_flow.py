@@ -1,136 +1,44 @@
-"""Scenario 5 + 8: session-bound chat round trips and default-app fallback.
+"""Phase 1 G1 auth round trips + chatbot/session-route retirement assertions.
 
-Full chain under test: ``POST /auth/session`` binds a published AgentApp ->
-the four chat endpoints (/chat, /chat/stream, GET /messages, DELETE /messages)
-run through the real runtime path (scripted model, in-memory checkpointer):
-ainvoke round trip, SSE frame discipline (chunk frames + source + done final
-frame), history projection and clear semantics. Sessions without a binding
-fall back to the bootstrapped ``name="default"`` app.
+The chatbot runtime (``POST /chatbot/chat``, ``/chatbot/chat/stream``,
+``GET|DELETE /chatbot/messages``) and the chat-session token endpoints
+(``POST /auth/session``, ``GET /auth/sessions``) were retired together with
+``get_current_session``: clients calling those paths now receive a 404
+envelope. What remains verifiable end-to-end here:
+
+- register -> login round trip issuing the single-layer ``LoginResponse``
+  (access_token + refresh_token);
+- refresh rotation + replay detection + logout through the real endpoints;
+- 404 retirement assertions for every retired route.
 """
 
-import asyncio
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
-from prometheus_client import REGISTRY
-from sqlmodel import Session as DBSession
 
 from app.core.config import settings
-from app.services.agents.bootstrap import ensure_default_agent_app
 from tests.conftest import unwrap
 
-from .conftest import assert_error_envelope, parse_sse_events
+from .conftest import assert_error_envelope
 
 pytestmark = pytest.mark.integration
 
 API = settings.API_V1_STR
 
 
-def _publish_app(client: TestClient, headers: dict[str, str], name: str = "chat-app") -> int:
-    """Create and publish a minimal AgentApp, returning its id."""
-    created = client.post(f"{API}/apps", json={"name": name, "system_prompt": "You are chat."}, headers=headers)
-    assert created.status_code == 201, created.text
-    app_id = unwrap(created, expected_code=201)["id"]
-    published = client.post(f"{API}/apps/{app_id}/publish", headers=headers)
-    assert published.status_code == 200, published.text
-    return app_id
-
-
-def _session_headers(client: TestClient, user_headers: dict[str, str], agent_app_id: int | None) -> dict[str, str]:
-    """Create a chat session and return its bearer headers."""
-    payload: dict[str, Any] = {}
-    if agent_app_id is not None:
-        payload["agent_app_id"] = agent_app_id
-    response = client.post(f"{API}/auth/session", json=payload, headers=user_headers)
-    assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {unwrap(response)['token']['access_token']}"}
-
-
-def _management_headers(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
-    """Exchange a user token for a chat-session token (management APIs need it)."""
-    response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
-    assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {unwrap(response)['token']['access_token']}"}
-
-
-def test_chat_endpoints_round_trip_via_runtime(
-    client: TestClient,
-    user_headers: dict[str, str],
-    scripted_model: Any,
-    memory_checkpointer: Any,
-) -> None:
-    """A session bound to a published app chats, streams, reads and clears history."""
-    management = _management_headers(client, user_headers)
-    app_id = _publish_app(client, management)
-    headers = _session_headers(client, user_headers, app_id)
-
-    # -- POST /chat: ainvoke round trip -------------------------------------
-    scripted_model.responses = [AIMessage(content="hello from runtime")]
-    response = client.post(
-        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=headers
-    )
-    assert response.status_code == 200, response.text
-    messages = unwrap(response)["messages"]
-    assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"] == "hello from runtime"
-
-    # -- POST /chat/stream: chunk frames carry source, final frame done -----
-    scripted_model.responses = [AIMessage(content="streamed reply")]
-    stream_response = client.post(
-        f"{API}/chatbot/chat/stream", json={"messages": [{"role": "user", "content": "hi"}]}, headers=headers
-    )
-    assert stream_response.status_code == 200, stream_response.text
-    assert stream_response.headers["content-type"].startswith("text/event-stream")
-    events = parse_sse_events(stream_response.text)
-    assert events, "expected at least one SSE frame"
-    assert all(event["done"] is False for event in events[:-1])
-    assert any(event["content"] == "streamed reply" for event in events[:-1])
-    assert all(event.get("source") in ("coordinator", "system") for event in events[:-1])
-    final = events[-1]
-    assert final["done"] is True
-    assert final["content"] == ""
-
-    # -- GET /messages: history projection from the checkpoint --------------
-    history = client.get(f"{API}/chatbot/messages", headers=headers)
-    assert history.status_code == 200, history.text
-    history_messages = unwrap(history)["messages"]
-    roles = [message["role"] for message in history_messages]
-    contents = [message["content"] for message in history_messages]
-    assert roles.count("user") >= 2
-    assert "hello from runtime" in contents
-
-    # -- DELETE /messages: clears the thread --------------------------------
-    cleared = client.delete(f"{API}/chatbot/messages", headers=headers)
-    assert cleared.status_code == 200, cleared.text
-    empty = client.get(f"{API}/chatbot/messages", headers=headers)
-    assert empty.status_code == 200
-    assert unwrap(empty)["messages"] == []
-
-
-def test_session_binding_rejects_unpublished_app(client: TestClient, user_headers: dict[str, str]) -> None:
-    """Binding a session to a draft AgentApp fails; missing ids fail with 404."""
-    management = _management_headers(client, user_headers)
-    created = client.post(f"{API}/apps", json={"name": "draft-app", "system_prompt": "Draft."}, headers=management)
-    assert created.status_code == 201, created.text
-    draft_id = unwrap(created, expected_code=201)["id"]
-
-    denied = client.post(f"{API}/auth/session", json={"agent_app_id": draft_id}, headers=user_headers)
-    assert_error_envelope(denied, code=422, message="Agent app is not published")
-
-    missing = client.post(f"{API}/auth/session", json={"agent_app_id": 999999}, headers=user_headers)
-    assert_error_envelope(missing, code=404, message="Agent app not found")
-
-
-def test_register_login_session_round_trip(client: TestClient) -> None:
-    """Full auth round trip: register -> login -> create session with the token."""
+def test_register_login_refresh_logout_round_trip(client: TestClient) -> None:
+    """Full single-layer auth round trip: register -> login -> refresh -> logout."""
     registered = client.post(
         f"{API}/auth/register",
         json={"email": "bob@example.com", "password": "Passw0rd!Strong", "username": "bob"},
     )
     assert registered.status_code == 200, registered.text
-    assert unwrap(registered)["email"] == "bob@example.com"
+    registered_payload = unwrap(registered)
+    assert registered_payload["access_token"]
+    assert registered_payload["refresh_token"]
+    assert registered_payload["token_type"] == "bearer"  # noqa: S105 — test constant, not a credential
+    assert registered_payload["expires_at"]
 
     # Duplicate registration is rejected with an error envelope.
     duplicate = client.post(
@@ -139,13 +47,15 @@ def test_register_login_session_round_trip(client: TestClient) -> None:
     )
     assert_error_envelope(duplicate, code=400, message="Email already registered")
 
-    # Login with the real credentials issues a user token.
+    # Login with the real credentials issues the same LoginResponse shape.
     login = client.post(
         f"{API}/auth/login",
         data={"email": "bob@example.com", "password": "Passw0rd!Strong", "grant_type": "password"},
     )
     assert login.status_code == 200, login.text
-    user_headers = {"Authorization": f"Bearer {unwrap(login)['access_token']}"}
+    login_payload = unwrap(login)
+    access_token = login_payload["access_token"]
+    refresh_token = login_payload["refresh_token"]
 
     bad_login = client.post(
         f"{API}/auth/login",
@@ -153,93 +63,63 @@ def test_register_login_session_round_trip(client: TestClient) -> None:
     )
     assert_error_envelope(bad_login, code=401, message="Incorrect email or password")
 
-    # The token authenticates session creation.
-    session = client.post(f"{API}/auth/session", json={}, headers=user_headers)
-    assert session.status_code == 200, session.text
-    assert unwrap(session)["session_id"]
+    # The user access token authenticates management APIs directly.
+    user_headers = {"Authorization": f"Bearer {access_token}"}
+    listed = client.get(f"{API}/apps", headers=user_headers)
+    assert listed.status_code == 200, listed.text
+
+    # Refresh rotates the token pair.
+    refreshed = client.post(f"{API}/auth/refresh", json={"refresh_token": refresh_token})
+    assert refreshed.status_code == 200, refreshed.text
+    rotated = unwrap(refreshed)
+    assert rotated["access_token"]
+    assert rotated["refresh_token"] != refresh_token
+
+    # Replaying the rotated (now revoked) token is detected and bulk-revokes.
+    replay = client.post(f"{API}/auth/refresh", json={"refresh_token": refresh_token})
+    assert_error_envelope(replay, code=401, message="REFRESH_TOKEN_REPLAY")
+
+    # The replayed family is fully revoked: even the rotated token is dead.
+    dead = client.post(f"{API}/auth/refresh", json={"refresh_token": rotated["refresh_token"]})
+    assert_error_envelope(dead, code=401, message="REFRESH_TOKEN_REPLAY")
+
+    # Logout is best-effort idempotent on unknown tokens.
+    logout = client.post(f"{API}/auth/logout", json={"refresh_token": rotated["refresh_token"]})
+    assert logout.status_code == 200, logout.text
+    assert unwrap(logout) is None
+    unknown_logout = client.post(f"{API}/auth/logout", json={"refresh_token": "x" * 64})
+    assert unknown_logout.status_code == 200, unknown_logout.text
 
 
-def test_default_agent_app_out_of_the_box(
+def test_refresh_unknown_and_logout_unknown_are_safe(client: TestClient) -> None:
+    """Unknown refresh tokens 401 with INVALID_REFRESH_TOKEN; logout stays 200."""
+    unknown = client.post(f"{API}/auth/refresh", json={"refresh_token": "y" * 64})
+    assert_error_envelope(unknown, code=401, message="INVALID_REFRESH_TOKEN")
+
+    logout = client.post(f"{API}/auth/logout", json={"refresh_token": "z" * 64})
+    assert logout.status_code == 200, logout.text
+
+
+def test_retired_chatbot_and_session_routes_return_404(
     client: TestClient,
     user_headers: dict[str, str],
-    db_engine: Any,
-    scripted_model: Any,
-    memory_checkpointer: Any,
 ) -> None:
-    """Sessions without agent_app_id fall back to the bootstrapped default app."""
-    with DBSession(db_engine) as db_session:
-        default_app = asyncio.run(ensure_default_agent_app(db_session))
-    assert default_app.name == "default"
-    assert default_app.status == "published"
-
-    headers = _session_headers(client, user_headers, agent_app_id=None)
-    scripted_model.responses = [AIMessage(content="default app reply")]
-    response = client.post(
-        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hello default"}]}, headers=headers
-    )
-    assert response.status_code == 200, response.text
-    assert unwrap(response)["messages"][-1]["content"] == "default app reply"
-
-
-def test_chat_stream_observes_subagent_task_duration(
-    client: TestClient,
-    user_headers: dict[str, str],
-    scripted_model: Any,
-    memory_checkpointer: Any,
-) -> None:
-    """Streaming a delegating chat observes subagent_task_duration_seconds{subagent}."""
-    management = _management_headers(client, user_headers)
-    created_sub = client.post(
-        f"{API}/subagents",
-        json={
-            "name": "researcher",
-            "description": "Research helper",
-            "when_to_use": "When research is needed",
-            "system_prompt": "You research.",
-        },
-        headers=management,
-    )
-    assert created_sub.status_code == 201, created_sub.text
-
-    created = client.post(
-        f"{API}/apps",
-        json={"name": "delegating-app", "system_prompt": "You delegate.", "subagent_names": ["researcher"]},
-        headers=management,
-    )
-    assert created.status_code == 201, created.text
-    app_id = unwrap(created, expected_code=201)["id"]
-    assert client.post(f"{API}/apps/{app_id}/publish", headers=management).status_code == 200
-    headers = _session_headers(client, user_headers, app_id)
-
-    # Coordinator delegates via the task tool; the subagent answers; coordinator wraps.
-    scripted_model.responses = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "task",
-                    "args": {"description": "research it", "subagent_type": "researcher", "task": "research it"},
-                    "id": "task-1",
-                    "type": "tool_call",
-                }
-            ],
-        ),
-        AIMessage(content="subagent result"),
-        AIMessage(content="wrapped final"),
+    """Every retired chatbot/session route must now 404 (retired, not 401/403)."""
+    retired_gets = [
+        f"{API}/chatbot/messages",
+        f"{API}/auth/sessions",
     ]
+    for path in retired_gets:
+        response = client.get(path, headers=user_headers)
+        assert_error_envelope(response, code=404)
 
-    before = REGISTRY.get_sample_value("subagent_task_duration_seconds_count", {"subagent": "researcher"}) or 0.0
-    stream_response = client.post(
-        f"{API}/chatbot/chat/stream",
-        json={"messages": [{"role": "user", "content": "research this"}]},
-        headers=headers,
-    )
-    assert stream_response.status_code == 200, stream_response.text
-    events = parse_sse_events(stream_response.text)
+    retired_posts: list[tuple[str, dict[str, Any]]] = [
+        (f"{API}/auth/session", {}),
+        (f"{API}/chatbot/chat", {"messages": [{"role": "user", "content": "hi"}]}),
+    ]
+    for path, body in retired_posts:
+        response = client.post(path, json=body, headers=user_headers)
+        assert_error_envelope(response, code=404)
 
-    # Subagent chunks carry their own source; the coordinator frames survive too.
-    assert any(event.get("source") == "researcher" for event in events[:-1])
-    assert any(event.get("content") == "wrapped final" for event in events[:-1])
-
-    after = REGISTRY.get_sample_value("subagent_task_duration_seconds_count", {"subagent": "researcher"}) or 0.0
-    assert after == before + 1
+    retired_delete = client.delete(f"{API}/chatbot/messages", headers=user_headers)
+    assert_error_envelope(retired_delete, code=404)

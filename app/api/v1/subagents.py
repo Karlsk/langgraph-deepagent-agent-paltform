@@ -1,7 +1,7 @@
 """Admin API for sub-agent assets (CRUD + one-shot test + test-run traces).
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
-every endpoint only authenticates via ``get_current_session`` and records the
+every endpoint only authenticates via ``get_current_user`` and records the
 creator in the audit-only ``created_by`` field.
 
 Error semantics: missing resources return 404; name collisions and validation
@@ -17,19 +17,18 @@ from sqlmodel import col, select
 
 from app.api.v1.agent_assets_common import (
     _canonical_sha256,
-    _creator,
     _read_patch_body,
     _validate_payload,
     get_db_session,
     paginate_by_name,
 )
-from app.api.v1.auth import get_current_session
+from app.api.v1.auth import get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
 from app.models.agent_assets import AgentApp, SubAgentConfig
-from app.models.session import Session as ChatSession
 from app.models.subagent_trace import SubAgentTestTrace
+from app.models.user import User
 from app.schemas.agent_apps import (
     SubAgentCreate,
     SubAgentRead,
@@ -87,14 +86,14 @@ def _subagent_owners(db: DBSession, subagent_name: str) -> list[str]:
 async def list_subagents(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List every stored sub-agent configuration.
 
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying all sub-agent rows ordered by name.
@@ -114,7 +113,7 @@ async def list_subagents_page(
     page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
     keyword: str | None = Query(None, max_length=200),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List sub-agent configurations with server-side pagination.
 
@@ -124,7 +123,7 @@ async def list_subagents_page(
         page_size: Rows per page (exposed as ``pageSize``).
         keyword: Optional case-insensitive substring matched against name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying a PageResult of sub-agent rows ordered by name.
@@ -151,7 +150,7 @@ async def create_subagent(
     request: Request,
     payload: SubAgentCreate,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Create a reusable sub-agent configuration.
 
@@ -159,7 +158,7 @@ async def create_subagent(
         request: The FastAPI request object for rate limiting.
         payload: The sub-agent definition.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session (audit only).
+        user: Authenticated user used for audit attribution.
 
     Returns:
         Envelope carrying the persisted sub-agent row.
@@ -182,7 +181,7 @@ async def create_subagent(
             max_turns=payload.max_turns,
             skill_names=payload.skill_names,
             content_hash="",
-            created_by=_creator(current_session),
+            created_by=user.username or str(user.id),
         )
         subagent.content_hash = _subagent_content_hash(subagent)
         db.add(subagent)
@@ -203,7 +202,7 @@ async def get_subagent(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Fetch one sub-agent configuration by name.
 
@@ -211,7 +210,7 @@ async def get_subagent(
         request: The FastAPI request object for rate limiting.
         name: Sub-agent primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the matching sub-agent row.
@@ -237,7 +236,7 @@ async def update_subagent(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Partially update a sub-agent (name is immutable).
 
@@ -245,7 +244,7 @@ async def update_subagent(
         request: The FastAPI request object for rate limiting.
         name: Sub-agent primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the updated sub-agent row (refreshed hash, bumped version).
@@ -286,7 +285,7 @@ async def delete_subagent(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[None]:
     """Delete a sub-agent configuration.
 
@@ -294,7 +293,7 @@ async def delete_subagent(
         request: The FastAPI request object for rate limiting.
         name: Sub-agent primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope with a null data payload.
@@ -331,7 +330,7 @@ async def test_subagent(
     name: str,
     payload: SubAgentTestRequest,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[SubAgentTestResult]:
     """Run one isolated one-shot test of a sub-agent configuration.
 
@@ -340,7 +339,7 @@ async def test_subagent(
         name: Sub-agent primary key.
         payload: The test prompt.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the test run result (final message, turns, duration, model).
@@ -351,7 +350,7 @@ async def test_subagent(
     try:
         if db.get(SubAgentConfig, name) is None:
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
-        logger.info("subagent_test_requested", name=name, user_id=current_session.user_id)
+        logger.info("subagent_test_requested", name=name, user_id=user.id)
         # ``run_subagent_once`` materialises bound skills into this tmp dir
         # so the standalone graph can read them without touching the live
         # ``settings.SKILLS_ROOT`` (test isolation contract).
@@ -363,7 +362,7 @@ async def test_subagent(
                     name=name,
                     prompt=payload.prompt,
                     tmp_skills_root=Path(tmp_skills_root),
-                    created_by=_creator(current_session),
+                    created_by=user.username or str(user.id),
                 )
             )
         finally:
@@ -390,7 +389,7 @@ async def list_subagent_test_traces(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List persisted test-run traces of a sub-agent, newest first.
 
@@ -400,7 +399,7 @@ async def list_subagent_test_traces(
         page: 1-based page number.
         page_size: Rows per page (exposed as ``pageSize``).
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying a PageResult of trace summaries (no event streams).
@@ -438,7 +437,7 @@ async def get_subagent_test_trace(
     name: str,
     trace_id: int,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Fetch one persisted test-run trace including its full event stream.
 
@@ -447,7 +446,7 @@ async def get_subagent_test_trace(
         name: Sub-agent primary key.
         trace_id: Trace row primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the trace detail (summary fields + events).

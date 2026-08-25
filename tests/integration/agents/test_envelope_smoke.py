@@ -35,10 +35,13 @@ def _assert_envelope(body: Any, *, code: int) -> dict[str, Any]:
 
 
 def _management_headers(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
-    """Exchange a user token for a chat-session token (management APIs need it)."""
-    response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
-    assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {unwrap(response)['token']['access_token']}"}
+    """Management APIs authenticate with the user access token directly.
+
+    Phase 1 G1: the ``POST /auth/session`` exchange is retired; management
+    endpoints resolve ``get_current_user`` from the same user token.
+    """
+    del client  # kept for signature symmetry with the retired exchange flow
+    return user_headers
 
 
 def test_create_endpoint_envelope_code_mirrors_201(client: TestClient, user_headers: dict[str, str]) -> None:
@@ -76,14 +79,20 @@ def test_read_list_and_delete_endpoints_carry_200_envelope(client: TestClient, u
 
 
 def test_auth_register_envelope_and_health_exemption(client: TestClient) -> None:
-    """Auth register is enveloped; the exempt /health endpoint stays raw."""
+    """Auth register is enveloped; the exempt /health endpoint stays raw.
+
+    Phase 1 G1: register returns ``LoginResponse`` (access + refresh pair),
+    so the envelope data carries the token fields instead of a user profile.
+    """
     registered = client.post(
         f"{API}/auth/register",
         json={"email": "smoke@example.com", "password": "Passw0rd!Strong", "username": "smoke"},
     )
     assert registered.status_code == 200
     data = _assert_envelope(registered.json(), code=200)
-    assert data["email"] == "smoke@example.com"
+    assert data["access_token"]
+    assert data["refresh_token"]
+    assert data["token_type"] == "bearer"  # noqa: S105 — test constant, not a credential
 
     health = client.get(f"{API}/health")
     assert health.status_code == 200

@@ -1,14 +1,18 @@
 """API v1 router configuration.
 
-This module sets up the main API router and includes all sub-routers for different
-endpoints like authentication and chatbot functionality.
+This module sets up the main API router and includes all sub-routers for
+business endpoints.
+
+Phase 1 G1: the legacy ``/chatbot/*`` router and ``/auth/session*`` chat-session
+endpoints were retired together with the chatbot runtime (see
+``docs/authentication.md``). They are no longer registered here, so clients
+calling those paths receive a 404 response.
 """
 
 from fastapi import APIRouter
 
 from app.api.v1.apps import router as apps_router
 from app.api.v1.auth import router as auth_router
-from app.api.v1.chatbot import router as chatbot_router
 from app.api.v1.mcp_servers import router as mcp_servers_router
 from app.api.v1.providers import router as providers_router
 from app.api.v1.skills import router as skills_router
@@ -20,7 +24,6 @@ api_router = APIRouter()
 
 # Include routers
 api_router.include_router(auth_router, prefix="/auth", tags=["Auth"])
-api_router.include_router(chatbot_router, prefix="/chatbot", tags=["Chatbot"])
 api_router.include_router(subagents_router, tags=["SubAgents"])
 api_router.include_router(skills_router, tags=["Skills"])
 api_router.include_router(apps_router, tags=["Agent Apps"])

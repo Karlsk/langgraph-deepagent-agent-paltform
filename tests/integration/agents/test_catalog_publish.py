@@ -4,16 +4,23 @@ Full chain under test: admin API creates an http MCP server with ``${ENV_VAR}``
 placeholder headers -> the merged tool catalog exposes builtin + mcp entries
 with source labels -> an AgentApp bound to skill/subagent/MCP tool publishes
 after whitelist validation and appears in ``GET /apps/published``.
+
+Phase 1 G1: management APIs authenticate with the user access token directly
+(the ``POST /auth/session`` exchange is retired); skill re-materialisation is
+driven through ``runtime_module.get_runtime`` instead of the retired chat
+endpoint.
 """
 
+import asyncio
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
+from sqlmodel import Session as DBSession
 
 from app.core.config import settings
 from app.services.agents import assembly
+from app.services.agents import runtime as runtime_module
 from tests.conftest import unwrap
 
 from .conftest import assert_error_envelope, make_mcp_tool
@@ -21,14 +28,6 @@ from .conftest import assert_error_envelope, make_mcp_tool
 pytestmark = pytest.mark.integration
 
 API = settings.API_V1_STR
-
-
-def _auth(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
-    """Exchange a user token for a chat-session token (management APIs need it)."""
-    response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
-    assert response.status_code == 200, response.text
-    token = unwrap(response)["token"]["access_token"]
-    return {"Authorization": f"Bearer {token}"}
 
 
 def _create_mcp_server(
@@ -52,7 +51,7 @@ def test_mcp_server_registration_feeds_tool_catalog(
     client: TestClient, user_headers: dict[str, str], fake_mcp: dict[str, list[Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Creating an http MCP server makes its tools appear in the merged catalog."""
-    headers = _auth(client, user_headers)
+    headers = user_headers
 
     # Baseline: only builtin entries, all labelled source=builtin.
     baseline = client.get(f"{API}/tools/catalog", headers=headers)
@@ -86,7 +85,7 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Create -> out-of-whitelist publish 422 -> fix -> publish -> visible in /apps/published."""
-    headers = _auth(client, user_headers)
+    headers = user_headers
     _create_mcp_server(client, headers, fake_mcp, monkeypatch)
 
     # Global skill (direct input) + subagent with inherited fields left blank.
@@ -157,9 +156,14 @@ def test_skill_content_refreshed_on_reassembly(
     user_headers: dict[str, str],
     scripted_model: Any,
     memory_checkpointer: Any,
+    db_engine: Any,
 ) -> None:
-    """Updating a global skill changes the user copy after the next assembly."""
-    headers = _auth(client, user_headers)
+    """Updating a global skill changes the user copy after the next assembly.
+
+    Phase 1 G1: assembly is triggered via ``get_runtime`` (the same compile
+    seam the retired chat endpoint used), not via ``POST /chatbot/chat``.
+    """
+    headers = user_headers
     skill = client.post(
         f"{API}/skills",
         json={"name": "style-guide", "description": "Style", "body": "# style-guide\n\nversion-1\n"},
@@ -176,16 +180,9 @@ def test_skill_content_refreshed_on_reassembly(
     app_id = unwrap(app, expected_code=201)["id"]
     assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
-    session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
-    assert session.status_code == 200, session.text
-    session_token = {"Authorization": f"Bearer {unwrap(session)['token']['access_token']}"}
-
-    # First chat compiles the app: the user copy carries version-1.
-    scripted_model.responses = [AIMessage(content="styled answer")]
-    chat = client.post(
-        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=session_token
-    )
-    assert chat.status_code == 200, chat.text
+    # First compile materialises the user copy carrying version-1.
+    with DBSession(db_engine) as db_session:
+        asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
 
     skills_root = settings.SKILLS_ROOT
     user_copy = f"{skills_root}/users/system/style-guide/SKILL.md"
@@ -196,16 +193,11 @@ def test_skill_content_refreshed_on_reassembly(
     updated = client.patch(f"{API}/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers)
     assert updated.status_code == 200, updated.text
 
-    # Clear caches to model a restart, then chat again (reassembly path).
+    # Clear caches to model a restart, then compile again (reassembly path).
     assembly.clear_compile_cache()
-    from app.services.agents import runtime as runtime_module
-
     runtime_module.clear_runtime_cache()
 
-    scripted_model.responses = [AIMessage(content="styled answer v2")]
-    chat2 = client.post(
-        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi again"}]}, headers=session_token
-    )
-    assert chat2.status_code == 200, chat2.text
+    with DBSession(db_engine) as db_session:
+        asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
     with open(user_copy, encoding="utf-8") as handle:
         assert "version-2" in handle.read()

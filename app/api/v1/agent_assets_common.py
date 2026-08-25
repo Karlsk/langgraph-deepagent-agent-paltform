@@ -1,7 +1,7 @@
 """Shared helpers for the agent-asset admin API modules.
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
-every endpoint only authenticates via ``get_current_session`` and records the
+every endpoint only authenticates via ``get_current_user`` and records the
 creator in the audit-only ``created_by`` field.
 
 Error semantics: missing resources return 404; name collisions, validation
@@ -23,7 +23,6 @@ from sqlmodel import col, select
 
 from app.core.logging import logger
 from app.models.agent_assets import AgentApp, SubAgentConfig
-from app.models.session import Session as ChatSession
 from app.schemas.base import PageResult
 from app.services.database import database_service
 
@@ -50,9 +49,19 @@ def get_db_session() -> Generator[DBSession, Any, None]:
 # ---------------------------------------------------------------------------
 
 
-def _creator(current_session: ChatSession) -> str:
-    """Derive the audit-only creator identifier from the chat session."""
-    return current_session.username or str(current_session.user_id)
+def _creator(current_session: object) -> str:
+    """Derive the audit-only creator identifier from a session/user row.
+
+    Phase 1 G1: business endpoints switched to ``get_current_user`` and now inline
+    the expression ``user.username or str(user.id)`` directly (see
+    ``app/api/v1/{subagents,skills,apps,mcp_servers,providers}.py``).
+    This helper is **retained** for any legacy chatbot-era caller that still
+    hands in a chat ``Session``; Phase 3 will retire the helper together with
+    the broader ``ChatSession`` concept.
+    """
+    username = getattr(current_session, "username", None)
+    user_id = getattr(current_session, "user_id", None) or getattr(current_session, "id", None)
+    return username or str(user_id)
 
 
 def _canonical_sha256(payload: dict[str, Any]) -> str:

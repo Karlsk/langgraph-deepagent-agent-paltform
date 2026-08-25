@@ -4,7 +4,7 @@ CRUD + security validation, the tool catalog, stdio manifest discovery and
 tool debug endpoints.
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
-every endpoint only authenticates via ``get_current_session`` and records the
+every endpoint only authenticates via ``get_current_user`` and records the
 creator in the audit-only ``created_by`` field.
 
 Error semantics: missing resources return 404; name collisions, validation
@@ -29,19 +29,18 @@ from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
 from app.api.v1.agent_assets_common import (
-    _creator,
     _read_patch_body,
     _validate_payload,
     get_db_session,
     paginate_by_name,
 )
-from app.api.v1.auth import get_current_session
+from app.api.v1.auth import get_current_user
 from app.core import mcp_client
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
 from app.models.agent_assets import McpServerConfig
-from app.models.session import Session as ChatSession
+from app.models.user import User
 from app.schemas.agent_apps import (
     McpServerCreate,
     McpServerRead,
@@ -176,14 +175,14 @@ def _get_server_or_404(db: DBSession, name: str) -> McpServerConfig:
 async def list_mcp_servers(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List every stored MCP server configuration.
 
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying all MCP server rows ordered by name.
@@ -203,7 +202,7 @@ async def list_mcp_servers_page(
     page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
     keyword: str | None = Query(None, max_length=200),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List MCP server configurations with server-side pagination.
 
@@ -213,7 +212,7 @@ async def list_mcp_servers_page(
         page_size: Rows per page (exposed as ``pageSize``).
         keyword: Optional case-insensitive substring matched against name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying a PageResult of MCP server rows ordered by name.
@@ -239,7 +238,7 @@ async def list_mcp_servers_page(
 async def preview_stdio_manifests(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Dry-run the stdio manifest directory sync (no writes, no probes).
 
@@ -249,7 +248,7 @@ async def preview_stdio_manifests(
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the planned create/update/unchanged/skip report.
@@ -266,7 +265,7 @@ async def preview_stdio_manifests(
 async def apply_stdio_sync(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Execute the stdio manifest directory sync (upsert by name).
 
@@ -277,7 +276,7 @@ async def apply_stdio_sync(
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the executed sync report.
@@ -308,7 +307,7 @@ async def create_mcp_server(
     request: Request,
     payload: McpServerCreate,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Register an MCP server with fail-fast tool-name collision validation.
 
@@ -316,7 +315,7 @@ async def create_mcp_server(
         request: The FastAPI request object for rate limiting.
         payload: The MCP server connection definition.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session (audit only).
+        user: Authenticated user used for audit attribution.
 
     Returns:
         Envelope carrying the persisted MCP server row.
@@ -345,7 +344,7 @@ async def create_mcp_server(
             enabled=payload.enabled,
             description=payload.description,
             content_hash="",
-            created_by=_creator(current_session),
+            created_by=user.username or str(user.id),
         )
         server.content_hash = _mcp_content_hash(server)
 
@@ -377,7 +376,7 @@ async def get_mcp_server(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Fetch one MCP server configuration by name.
 
@@ -385,7 +384,7 @@ async def get_mcp_server(
         request: The FastAPI request object for rate limiting.
         name: MCP server primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the matching MCP server row.
@@ -408,7 +407,7 @@ async def update_mcp_server(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Partially update an MCP server (name is immutable).
 
@@ -421,7 +420,7 @@ async def update_mcp_server(
         request: The FastAPI request object for rate limiting.
         name: MCP server primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the updated MCP server row with refreshed hash.
@@ -514,7 +513,7 @@ async def delete_mcp_server(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[None]:
     """Delete an MCP server and invalidate the MCP client cache.
 
@@ -522,7 +521,7 @@ async def delete_mcp_server(
         request: The FastAPI request object for rate limiting.
         name: MCP server primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope with null data on successful deletion.
@@ -555,7 +554,7 @@ async def list_mcp_server_tools(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Live-list the current tools of one MCP server via an ephemeral session.
 
@@ -566,7 +565,7 @@ async def list_mcp_server_tools(
         request: The FastAPI request object for rate limiting.
         name: MCP server primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying raw tool names, descriptions and JSON schemas.
@@ -605,7 +604,7 @@ async def call_mcp_server_tool(
     name: str,
     payload: McpToolCallRequest,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Invoke one tool of an MCP server via an ephemeral session (debug).
 
@@ -614,7 +613,7 @@ async def call_mcp_server_tool(
         name: MCP server primary key.
         payload: Raw tool name and arguments.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the tool output content.
@@ -656,14 +655,14 @@ async def call_mcp_server_tool(
 async def get_tool_catalog(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict[str, Any]]]:
     """Expose the merged tool catalog (builtin + MCP with server attribution).
 
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying catalog entries with source labels for form

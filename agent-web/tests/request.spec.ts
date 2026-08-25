@@ -1,8 +1,17 @@
 /**
- * src/utils/request.ts 统一请求层运行时测试（任务 #16）。
+ * src/utils/request.ts 统一请求层运行时测试（任务 #16 + G1 Auth Phase 1）。
  *
  * 零真实网络：mock axios 实例（以受控 adapter 驱动响应拦截器），
  * mock element-plus 的 ElMessage（不做真实渲染，故无需 DOM 环境）。
+ *
+ * Phase 1 G1 测试范围扩展：
+ *   - 请求拦截器注入 `Authorization: Bearer <userToken>`（替换 sessionToken）；
+ *   - 响应拦截器 401 处理：
+ *     * `/auth/refresh` 端点自身 401 → clearAuth + 跳 login（不递归 refresh）；
+ *     * 其它受保护端点 401 → refreshUserToken 成功 → axios.request 重发；
+ *     * 其它受保护端点 401 → refreshUserToken 失败 → clearAuth + 跳 login；
+ *     * 已 _retried=true 的 401 → 不再 refresh，直接 clearAuth + 跳 login；
+ *     * 登录页 401（密码错误） → 不跳转、不清 token。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -11,10 +20,15 @@ import { getHealth } from '@/api/health'
 import { del, get, post, put } from '@/utils/request'
 
 vi.mock('@/utils/authStorage', () => ({
-  getSessionToken: vi.fn(),
-  setSessionToken: vi.fn(),
-  clearSessionToken: vi.fn(),
+  getUserToken: vi.fn(),
+  setUserToken: vi.fn(),
+  clearUserToken: vi.fn(),
   clearAuth: vi.fn(),
+}))
+
+const refreshUserTokenMock = vi.fn()
+vi.mock('@/composables/useAuth', () => ({
+  refreshUserToken: (...args: unknown[]) => refreshUserTokenMock(...args),
 }))
 
 type ResponseHandler = (response: unknown) => unknown
@@ -30,6 +44,7 @@ interface FakeAxiosInstance {
   post: ReturnType<typeof vi.fn>
   put: ReturnType<typeof vi.fn>
   delete: ReturnType<typeof vi.fn>
+  request: ReturnType<typeof vi.fn>
   adapter: Adapter | undefined
 }
 
@@ -42,6 +57,7 @@ const fakeInstance = vi.hoisted<FakeAxiosInstance>(() => ({
   post: vi.fn(),
   put: vi.fn(),
   delete: vi.fn(),
+  request: vi.fn(),
   adapter: undefined,
 }))
 
@@ -53,6 +69,7 @@ vi.mock('axios', () => ({
       typeof error === 'object' &&
       error !== null &&
       (error as { isAxiosError?: unknown }).isAxiosError === true,
+    request: (...args: unknown[]) => fakeInstance.request(...args),
   },
 }))
 
@@ -61,7 +78,7 @@ vi.mock('element-plus', () => ({
 }))
 
 const authStorage = await import('@/utils/authStorage')
-const getSessionTokenMock = authStorage.getSessionToken as unknown as ReturnType<typeof vi.fn>
+const getUserTokenMock = authStorage.getUserToken as unknown as ReturnType<typeof vi.fn>
 const clearAuthMock = authStorage.clearAuth as unknown as ReturnType<typeof vi.fn>
 
 /** 模拟 vue-router：捕获 replace 调用并暴露当前路由 */
@@ -87,13 +104,16 @@ function axiosResponse(data: unknown, status = 200): Record<string, unknown> {
 function makeAxiosError(
   response: Record<string, unknown> | undefined,
   message = 'Request failed with status code 404',
-): Error {
+  config: Record<string, unknown> = {},
+): Error & { config: Record<string, unknown> } {
   const error = new Error(message) as Error & {
     isAxiosError: boolean
     response?: Record<string, unknown>
+    config: Record<string, unknown>
   }
   error.isAxiosError = true
   error.response = response
+  error.config = config
   return error
 }
 
@@ -133,7 +153,8 @@ function stubAdapterReject(error: unknown): void {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  getSessionTokenMock.mockReturnValue(null)
+  getUserTokenMock.mockReturnValue(null)
+  refreshUserTokenMock.mockReset()
   routerMock.currentRoute.value = { name: 'llm', fullPath: '/llm' }
   routerMock.replace.mockReset()
   fakeInstance.get.mockImplementation((url: string, config?: unknown) =>
@@ -149,6 +170,10 @@ beforeEach(() => {
   )
   fakeInstance.delete.mockImplementation((url: string, config?: unknown) =>
     dispatch({ ...(config as object), method: 'delete', url }),
+  )
+  // 重新挂接 axios.request 默认行为（让 refresh 重发可观测）
+  fakeInstance.request.mockImplementation(
+    (config: Record<string, unknown>) => dispatch(config),
   )
 })
 
@@ -250,9 +275,9 @@ describe('健康检查 API', () => {
   })
 })
 
-describe('认证 token 注入', () => {
-  it('有会话 token 时请求携带 Authorization: Bearer xxx', async () => {
-    getSessionTokenMock.mockReturnValue('session-abc')
+describe('认证 token 注入（Phase 1 G1: access_token = userToken）', () => {
+  it('有用户 token 时请求携带 Authorization: Bearer xxx', async () => {
+    getUserTokenMock.mockReturnValue('user-access-abc')
     const observed: Array<Record<string, unknown>> = []
     fakeInstance.adapter = vi.fn(async (config: Record<string, unknown>) => {
       observed.push(config)
@@ -266,11 +291,11 @@ describe('认证 token 注入', () => {
       (typeof observedHeaders.get === 'function'
         ? (observedHeaders.get as (k: string) => unknown)('Authorization')
         : observedHeaders.Authorization) ?? null
-    expect(headerValue).toBe('Bearer session-abc')
+    expect(headerValue).toBe('Bearer user-access-abc')
   })
 
-  it('无会话 token 时不写入 Authorization 头', async () => {
-    getSessionTokenMock.mockReturnValue(null)
+  it('无用户 token 时不写入 Authorization 头', async () => {
+    getUserTokenMock.mockReturnValue(null)
     const observed: Array<Record<string, unknown>> = []
     fakeInstance.adapter = vi.fn(async (config: Record<string, unknown>) => {
       observed.push(config)
@@ -283,18 +308,66 @@ describe('认证 token 注入', () => {
   })
 })
 
-describe('401 会话过期处理', () => {
-  it('非登录页 401：清除 token 并跳转 /login?reason=expired', async () => {
-    getSessionTokenMock.mockReturnValue('stale-token')
+describe('401 会话过期处理（Phase 1 G1: refresh interceptor）', () => {
+  it('非登录页 401 + refresh 成功：用新 token 重发原请求，不清 token、不跳 login', async () => {
+    getUserTokenMock.mockReturnValue('stale-token')
+    refreshUserTokenMock.mockImplementationOnce(async () => {
+      // 真实 refreshUserToken 成功后调用 setUserToken(new-token)，
+      // 让 getUserToken() 在 retry 时返回新值；这里通过 mockReturnValueOnce
+      // 模拟 setUserToken 的副作用，让重试请求拦截器读到新 token。
+      getUserTokenMock.mockReturnValueOnce('new-token')
+      return 'new-token'
+    })
+    // 第一发原请求 → 401；第二发（refresh 后重试）→ 200
+    const originalConfig: Record<string, unknown> = {
+      method: 'get',
+      url: '/protected',
+      headers: {},
+    }
     const error = makeAxiosError(
       axiosResponse({ code: 401, message: 'expired', data: null }, 401),
       'Request failed with status code 401',
+      originalConfig,
+    )
+    // 第一次 adapter 调用 reject；refresh 成功后 axios.request 重发 → 第二次 adapter 调用 resolve
+    let adapterCalls = 0
+    fakeInstance.adapter = vi.fn(async () => {
+      adapterCalls += 1
+      if (adapterCalls === 1) throw error
+      return axiosResponse({ code: 200, message: 'ok', data: { ok: true } }, 200)
+    })
+
+    const result = await get('/protected')
+
+    expect(result).toEqual({ ok: true })
+    expect(refreshUserTokenMock).toHaveBeenCalledTimes(1)
+    expect(fakeInstance.request).toHaveBeenCalledTimes(1)
+    // 重发时 Authorization 已被替换为新 token（请求拦截器读到 mockReturnValueOnce 的新值）
+    const retriedHeaders = (fakeInstance.request.mock.calls[0]?.[0] as Record<string, unknown>)
+      .headers as Record<string, unknown>
+    const headerValue =
+      (typeof retriedHeaders.get === 'function'
+        ? (retriedHeaders.get as (k: string) => unknown)('Authorization')
+        : retriedHeaders.Authorization) ?? null
+    expect(headerValue).toBe('Bearer new-token')
+    expect(clearAuthMock).not.toHaveBeenCalled()
+    expect(routerMock.replace).not.toHaveBeenCalled()
+  })
+
+  it('非登录页 401 + refresh 失败：清空 token 并跳转 /login?reason=expired', async () => {
+    getUserTokenMock.mockReturnValue('stale-token')
+    refreshUserTokenMock.mockResolvedValueOnce(null)
+    const error = makeAxiosError(
+      axiosResponse({ code: 401, message: 'expired', data: null }, 401),
+      'Request failed with status code 401',
+      { method: 'get', url: '/protected' },
     )
     stubAdapterReject(error)
 
     await expect(get('/protected')).rejects.toBe(error)
     // 让 request.ts 中 401 分支的动态 import + router.replace 异步任务完成
     await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(refreshUserTokenMock).toHaveBeenCalledTimes(1)
     expect(clearAuthMock).toHaveBeenCalledTimes(1)
     expect(routerMock.replace).toHaveBeenCalledWith({
       name: 'login',
@@ -303,16 +376,57 @@ describe('401 会话过期处理', () => {
     expect(ElMessage.error).toHaveBeenCalledWith('会话已失效，请重新登录')
   })
 
-  it('登录页 401（密码错误）：不跳转、不清 token', async () => {
+  it('/auth/refresh 端点自身 401：不递归 refresh、直接 clearAuth + 跳 login', async () => {
+    getUserTokenMock.mockReturnValue('any-token')
+    const error = makeAxiosError(
+      axiosResponse({ code: 401, message: 'INVALID_REFRESH_TOKEN', data: null }, 401),
+      'Request failed with status code 401',
+      { method: 'post', url: '/auth/refresh' },
+    )
+    stubAdapterReject(error)
+
+    await expect(post('/auth/refresh', { refresh_token: 'x' })).rejects.toBe(error)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    // 关键不变量：refresh 端点自身 401 不触发 refreshUserToken（防递归）
+    expect(refreshUserTokenMock).not.toHaveBeenCalled()
+    expect(clearAuthMock).toHaveBeenCalledTimes(1)
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      name: 'login',
+      query: { redirect: '/llm', reason: 'expired' },
+    })
+  })
+
+  it('_retried=true 的 401：不再 refresh，直接 clearAuth + 跳 login', async () => {
+    getUserTokenMock.mockReturnValue('stale-token')
+    const error = makeAxiosError(
+      axiosResponse({ code: 401, message: 'still_expired', data: null }, 401),
+      'Request failed with status code 401',
+      { method: 'get', url: '/protected', _retried: true },
+    )
+    stubAdapterReject(error)
+
+    await expect(get('/protected')).rejects.toBe(error)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(refreshUserTokenMock).not.toHaveBeenCalled()
+    expect(clearAuthMock).toHaveBeenCalledTimes(1)
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      name: 'login',
+      query: { redirect: '/llm', reason: 'expired' },
+    })
+  })
+
+  it('登录页 401（密码错误）：不跳转、不清 token、不 refresh', async () => {
     routerMock.currentRoute.value = { name: 'login', fullPath: '/login' }
     const error = makeAxiosError(
       axiosResponse({ detail: 'Incorrect email or password' }, 401),
       'Request failed with status code 401',
+      { method: 'post', url: '/auth/login' },
     )
     stubAdapterReject(error)
 
-    await expect(get('/auth/login')).rejects.toBe(error)
+    await expect(post('/auth/login', new URLSearchParams())).rejects.toBe(error)
     await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(refreshUserTokenMock).not.toHaveBeenCalled()
     expect(clearAuthMock).not.toHaveBeenCalled()
     expect(routerMock.replace).not.toHaveBeenCalled()
   })

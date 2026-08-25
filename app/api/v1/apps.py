@@ -1,7 +1,7 @@
 """Admin API for agent application assets (CRUD + publish pipeline).
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
-every endpoint only authenticates via ``get_current_session`` and records the
+every endpoint only authenticates via ``get_current_user`` and records the
 creator in the audit-only ``created_by`` field.
 
 Error semantics: missing resources return 404; name collisions, validation
@@ -16,13 +16,12 @@ from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
 from app.api.v1.agent_assets_common import (
-    _creator,
     _read_patch_body,
     _validate_payload,
     get_db_session,
     paginate_by_name,
 )
-from app.api.v1.auth import get_current_session
+from app.api.v1.auth import get_current_user
 from app.api.v1.mcp_servers import _mcp_fingerprint
 from app.api.v1.providers import _model_fingerprint, build_model_catalog
 from app.core.config import settings
@@ -30,7 +29,7 @@ from app.core.limiter import limiter
 from app.core.logging import logger
 from app.models.agent_assets import AgentApp, SkillAsset, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_REF
-from app.models.session import Session as ChatSession
+from app.models.user import User
 from app.schemas.agent_apps import AgentAppCreate, AgentAppRead, AgentAppUpdate
 from app.schemas.base import ApiResponse, PageResult
 from app.services.agents import assembly
@@ -53,14 +52,14 @@ _DEFAULT_AGENT_APP_NAME = "default"
 async def list_agent_apps(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List every stored agent application.
 
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying all agent app rows ordered by id.
@@ -80,7 +79,7 @@ async def list_agent_apps_page(
     page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
     keyword: str | None = Query(None, max_length=200),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List agent applications with server-side pagination.
 
@@ -90,7 +89,7 @@ async def list_agent_apps_page(
         page_size: Rows per page (exposed as ``pageSize``).
         keyword: Optional case-insensitive substring matched against name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying a PageResult of agent app rows ordered by id.
@@ -117,7 +116,7 @@ async def create_agent_app(
     request: Request,
     payload: AgentAppCreate,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Create a draft agent application.
 
@@ -125,7 +124,7 @@ async def create_agent_app(
         request: The FastAPI request object for rate limiting.
         payload: The agent app definition.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session (audit only).
+        user: Authenticated user used for audit attribution.
 
     Returns:
         Envelope carrying the persisted agent app row
@@ -148,7 +147,7 @@ async def create_agent_app(
             skill_names=payload.skill_names,
             subagent_names=payload.subagent_names,
             interrupt_on=payload.interrupt_on,
-            created_by=_creator(current_session),
+            created_by=user.username or str(user.id),
         )
         db.add(app_cfg)
         db.commit()
@@ -167,7 +166,7 @@ async def create_agent_app(
 async def list_published_agent_apps(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """List published agent applications (assistant picker for chat).
 
@@ -176,7 +175,7 @@ async def list_published_agent_apps(
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying all agent app rows with status=published ordered by id.
@@ -195,7 +194,7 @@ async def get_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Fetch one agent application by id.
 
@@ -203,7 +202,7 @@ async def get_agent_app(
         request: The FastAPI request object for rate limiting.
         app_id: Agent app primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the matching agent app row.
@@ -229,7 +228,7 @@ async def update_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Partially update an agent app (name is immutable; lists replace wholesale).
 
@@ -237,7 +236,7 @@ async def update_agent_app(
         request: The FastAPI request object for rate limiting.
         app_id: Agent app primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the updated agent app row with bumped version.
@@ -289,7 +288,7 @@ async def delete_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[None]:
     """Delete an agent application.
 
@@ -297,7 +296,7 @@ async def delete_agent_app(
         request: The FastAPI request object for rate limiting.
         app_id: Agent app primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope with null data on successful deletion.
@@ -332,7 +331,7 @@ async def publish_agent_app(
     request: Request,
     app_id: int,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
     """Publish an agent app after referential + tool-whitelist validation.
 
@@ -345,7 +344,7 @@ async def publish_agent_app(
         request: The FastAPI request object for rate limiting.
         app_id: Agent app primary key.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the published agent app row.

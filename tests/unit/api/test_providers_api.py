@@ -32,7 +32,7 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider, ProviderHealth
-from app.models.session import Session as ChatSession
+from app.models.user import User
 from app.schemas.providers import RemoteModelInfo
 from tests.conftest import unwrap
 
@@ -66,13 +66,13 @@ def db_session() -> Generator[DBSession, None, None]:
 
 
 @pytest.fixture
-def fake_chat_session() -> ChatSession:
-    """A detached chat Session row standing in for get_current_session."""
-    return ChatSession(id="sess-1", user_id=7, name="", username="ann", agent_app_id=None)
+def fake_user() -> User:
+    """A detached User row standing in for get_current_user."""
+    return User(id=7, email="ann@example.com", username="ann", hashed_password="x")  # noqa: S106 — test double, not a real credential
 
 
 @pytest.fixture
-def client(db_session: DBSession, fake_chat_session: ChatSession) -> Generator[TestClient, None, None]:
+def client(db_session: DBSession, fake_user: User) -> Generator[TestClient, None, None]:
     """Minimal app wiring the providers router with limiter + dependency overrides."""
     app = FastAPI()
     app.state.limiter = limiter
@@ -81,7 +81,7 @@ def client(db_session: DBSession, fake_chat_session: ChatSession) -> Generator[T
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # pyright: ignore[reportArgumentType]
     app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
     app.include_router(providers_module.router)
-    app.dependency_overrides[auth_module.get_current_session] = lambda: fake_chat_session
+    app.dependency_overrides[auth_module.get_current_user] = lambda: fake_user
     app.dependency_overrides[common_module.get_db_session] = lambda: db_session
     with TestClient(app) as test_client:
         yield test_client

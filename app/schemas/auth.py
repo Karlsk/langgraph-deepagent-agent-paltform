@@ -29,7 +29,7 @@ class Token(BaseModel):
 
 
 class TokenResponse(BaseResponse):
-    """Response model for login endpoint.
+    """Legacy access-token-only response (kept for backward compatibility).
 
     Attributes:
         access_token: The JWT access token
@@ -40,6 +40,55 @@ class TokenResponse(BaseResponse):
     access_token: str = Field(..., description="The JWT access token")
     token_type: str = Field(default="bearer", description="The type of token")
     expires_at: datetime = Field(..., description="When the token expires")
+
+
+class LoginResponse(BaseResponse):
+    """Response model for /auth/login and /auth/register (Phase 1 G1).
+
+    Replaces the legacy ``TokenResponse`` shape with both an access_token
+    (7-day lifetime) and a refresh_token (30-day lifetime). The refresh
+    token is persisted as a sha256 hash; the raw value is only ever seen by
+    the client.
+
+    Attributes:
+        access_token: Short-lived JWT (7 days by default).
+        refresh_token: Long-lived opaque token (30 days by default);
+            sha256-hashed in the DB.
+        token_type: Always "bearer".
+        expires_at: Expiry timestamp of the access_token.
+    """
+
+    access_token: str = Field(..., description="Short-lived JWT (7 days)")
+    refresh_token: str = Field(
+        ...,
+        min_length=32,
+        max_length=128,
+        description="Long-lived opaque token (30 days); sha256 hashed in DB",
+    )
+    token_type: str = Field(default="bearer")
+    expires_at: datetime = Field(..., description="access_token expiry")
+
+
+class RefreshTokenRequest(BaseModel):
+    """Request body for POST /auth/refresh."""
+
+    refresh_token: str = Field(
+        ...,
+        min_length=32,
+        max_length=128,
+        description="Refresh token previously returned by /auth/login or /auth/register",
+    )
+
+
+class LogoutRequest(BaseModel):
+    """Request body for POST /auth/logout."""
+
+    refresh_token: str = Field(
+        ...,
+        min_length=32,
+        max_length=128,
+        description="Refresh token to revoke (best-effort; idempotent)",
+    )
 
 
 class UserCreate(BaseModel):
@@ -91,19 +140,17 @@ class UserCreate(BaseModel):
 
 
 class UserResponse(BaseResponse):
-    """Response model for user operations.
+    """Response model for user operations (Phase 1 G1: no nested token).
 
     Attributes:
         id: User's ID
         email: User's email address
         username: Optional display name
-        token: Authentication token
     """
 
     id: int = Field(..., description="User's ID")
     email: str = Field(..., description="User's email address")
     username: str | None = Field(default=None, description="Optional display name")
-    token: Token = Field(..., description="Authentication token")
 
 
 class SessionCreate(BaseModel):

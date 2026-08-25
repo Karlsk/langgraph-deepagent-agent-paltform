@@ -164,7 +164,8 @@ class Settings:
         # JWT Configuration
         self.JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
         self.JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-        self.JWT_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_DAYS", "30"))
+        self.JWT_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_DAYS", "7"))
+        self.JWT_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
         # Skills storage root (SKILL.md files for agent skills)
         self.SKILLS_ROOT = os.getenv("SKILLS_ROOT", "./data/skills")
@@ -229,6 +230,8 @@ class Settings:
             "messages": ["50 per minute"],
             "register": ["10 per hour"],
             "login": ["20 per minute"],
+            "auth_refresh": ["10 per minute"],
+            "auth_logout": ["20 per minute"],
             "root": ["10 per minute"],
             "health": ["20 per minute"],
             "workflows_execute": ["20 per minute"],

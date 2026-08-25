@@ -1,8 +1,8 @@
-import axios from 'axios'
-import type { AxiosRequestConfig } from 'axios'
+import axios, { type AxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import type { ApiResponse } from '@/types'
-import { clearAuth, getSessionToken } from '@/utils/authStorage'
+import { clearAuth, getUserToken } from '@/utils/authStorage'
+import { refreshUserToken } from '@/composables/useAuth'
 
 /**
  * 统一 axios 实例：后端 API 前缀为 /api/v1（开发态经 Vite 代理转发，无 rewrite）。
@@ -13,10 +13,10 @@ const request = axios.create({
 })
 
 request.interceptors.request.use((config) => {
-  // 会话 token 注入：受保护资源端点（/providers、/skills 等）均需会话 token，
-  // 由后端 get_current_session 依赖读取；未登录态不写入 Authorization，
+  // 用户 token 注入：受保护资源端点（/providers、/skills 等）均需用户 token，
+  // 由后端 get_current_user 依赖读取；未登录态不写入 Authorization，
   // 让 /auth/login 与 /auth/register 走 OAuth2 form 流程。
-  const token = getSessionToken()
+  const token = getUserToken()
   if (token) {
     // AxiosHeaders 或普通对象都允许；缺失时 fallback 为空对象（兼容测试场景
     // 与真实 axios 自动注入空 headers 两种情形），运行期以 set() 为主，
@@ -73,6 +73,17 @@ function extractErrorMessage(body: unknown, fallback: string): string {
 /** 同名冲突错误文案判定：命中时在 422 主提示后追加回收站清理引导 */
 const DUPLICATE_NAME_HINT_RE = /已存在|already exists|exists|taken|唯一/
 
+/**
+ * Phase 1 G1：判断一个 401 响应是否来自 ``/auth/refresh`` 自身。
+ * refresh 端点自身 401（INVALID_REFRESH_TOKEN / REFRESH_TOKEN_REPLAY）不应
+ * 触发递归 refresh；直接走"清空 + 跳 login"路径。
+ */
+function isRefreshEndpointPath(path: unknown): boolean {
+  if (typeof path !== 'string') return false
+  // 兼容绝对 / 相对路径；``/api/v1`` 前缀由 baseURL 注入，运行时不一定存在。
+  return /(^|\/)auth\/refresh(\?|$)/.test(path)
+}
+
 request.interceptors.response.use(
   (response) => {
     const body: unknown = response.data
@@ -89,19 +100,68 @@ request.interceptors.response.use(
     // 豁免端点（如 /health）仍返回裸响应，原样透传
     return body as unknown as typeof response
   },
-  (error: unknown) => {
+  async (error: unknown) => {
     if (axios.isAxiosError(error)) {
       const status = error.response?.status
+      const originalConfig = error.config as
+        | (AxiosRequestConfig & { _retried?: boolean })
+        | undefined
+
       if (status === 401) {
-        // 会话过期：清空本地 token + 跳转登录页。
-        // 避免 request.ts ↔ router 循环依赖：动态 import 拉取路由模块。
+        // refresh 端点自身 401：直接走清空 + 跳 login，**不**触发递归 refresh。
+        const requestUrl = originalConfig?.url ?? ''
+        if (isRefreshEndpointPath(requestUrl)) {
+          clearAuth()
+          void (async (): Promise<void> => {
+            const { default: router } = await import('@/router')
+            if (router.currentRoute.value.name === 'login') return
+            const redirect = router.currentRoute.value.fullPath
+            await router.replace({ name: 'login', query: { redirect, reason: 'expired' } })
+          })()
+          ElMessage.error('会话已失效，请重新登录')
+          return Promise.reject(error)
+        }
+
+        // 当前已在登录页（如密码错误）：不刷新、不清 token、不跳路由，
+        // 仅 ElMessage 弹错后 reject，把控制权交回调用方。
+        const { default: router } = await import('@/router')
+        if (router.currentRoute.value.name === 'login') {
+          ElMessage.error(
+            (error.response?.data as { message?: string; detail?: string } | undefined)?.message ??
+              (error.response?.data as { detail?: string } | undefined)?.detail ??
+              error.message ??
+              '请求失败',
+          )
+          return Promise.reject(error)
+        }
+
+        // 其它受保护端点 401：尝试 refresh + 重发原请求。
+        if (originalConfig && !originalConfig._retried) {
+          originalConfig._retried = true
+          const newToken = await refreshUserToken()
+          if (newToken) {
+            const headers = (originalConfig.headers ?? {}) as unknown as {
+              set?: (k: string, v: string) => void
+              [k: string]: unknown
+            }
+            if (typeof headers.set === 'function') {
+              headers.set('Authorization', `Bearer ${newToken}`)
+            } else {
+              headers['Authorization'] = `Bearer ${newToken}`
+            }
+            originalConfig.headers = headers as never
+            return axios.request(originalConfig)
+          }
+        }
+
+        // refresh 失败或已是第二次 401：清空 + 跳 login。
+        clearAuth()
         void (async (): Promise<void> => {
           const { default: router } = await import('@/router')
           if (router.currentRoute.value.name === 'login') {
             // 当前已在登录页（如密码错误）：不跳不丢 token，仅弹错。
             return
           }
-          clearAuth()
           const redirect = router.currentRoute.value.fullPath
           await router.replace({
             name: 'login',

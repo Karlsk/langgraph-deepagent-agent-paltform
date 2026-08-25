@@ -1,12 +1,17 @@
 <script setup lang="ts">
 /**
- * 登录页（task-024 两栏式）：
+ * 登录页（Phase 1 G1 单层用户 token）：
  * 左品牌 + 右卡片；含字段图标 + "去注册"入口 + 错误回显。
  *
- * 流程：
- * 1. /auth/login（form 表单） → 用户 token；
- * 2. /auth/session（Bearer 用户 token） → 会话 token；
- * 3. 写入 authStorage 并跳转到 redirect（默认 /llm）。
+ * 流程（Phase 1 G1 单层）：
+ * 1. /auth/login（form 表单） → 同时拿 access_token（7 天）+ refresh_token（30 天）；
+ * 2. access_token 写入 localStorage `auth.userToken`（持久化）；
+ *    refresh_token 仅内存保存（`authStorage.setRefreshToken`）—— 不进
+ *    localStorage，避免 XSS 直接盗用（spec §5.2 + R7）。
+ * 3. request.ts 请求拦截器自动从 `getUserToken()` 读取 access_token
+ *    注入 Authorization 头；401 时由 request.ts refresh 拦截器自动
+ *    调 /auth/refresh 旋转并重发原请求。
+ * 4. 写入 authStorage 并跳转到 redirect（默认 /llm）。
  *
  * 错误处理：401（密码错误）等由统一请求层全局拦截器提示；
  * 401 触发跳转的情况下，request.ts 拦截器会跳过登录页本身（避免反复跳）。
@@ -86,7 +91,7 @@ async function handleSubmit(): Promise<void> {
       <section class="auth-card" aria-labelledby="auth-login-title">
         <header class="auth-card__header">
           <h2 id="auth-login-title" class="auth-card__title">Agent Web 登录</h2>
-          <p class="auth-card__desc">登录后会话 token 注入所有受保护资源请求。</p>
+          <p class="auth-card__desc">登录后用户 access token 注入所有受保护资源请求。</p>
           <p v-if="reasonMessage" class="auth-card__notice">{{ reasonMessage }}</p>
         </header>
 

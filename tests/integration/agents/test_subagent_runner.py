@@ -4,18 +4,22 @@ Full chain under test: admin API creates a subagent (inheritance fields left
 blank) -> ``POST /subagents/{name}/test`` executes one isolated run through
 the real compile/execute path with a scripted model -> the run neither writes
 checkpoints nor pollutes the assembly compile cache. Skill deletion cascades
-to every per-user copy produced by earlier assemblies.
+to every per-user copy produced by earlier assemblies (Phase 1 G1: assembly
+is triggered via ``get_runtime``, the retired chat endpoint's compile seam).
 """
 
+import asyncio
 import os
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
+from sqlmodel import Session as DBSession
 
 from app.core.config import settings
 from app.services.agents import assembly
+from app.services.agents import runtime as runtime_module
 from tests.conftest import unwrap
 
 from .conftest import assert_error_envelope
@@ -25,19 +29,11 @@ pytestmark = pytest.mark.integration
 API = settings.API_V1_STR
 
 
-def _auth(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
-    """Exchange a user token for a chat-session token (management APIs need it)."""
-    response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
-    assert response.status_code == 200, response.text
-    token = unwrap(response)["token"]["access_token"]
-    return {"Authorization": f"Bearer {token}"}
-
-
 def test_subagent_one_shot_test_run_is_isolated(
     client: TestClient, user_headers: dict[str, str], scripted_model: Any
 ) -> None:
     """One-shot test runs return a SubAgentTestResult without cache/checkpoint side effects."""
-    headers = _auth(client, user_headers)
+    headers = user_headers  # Phase 1 G1: user access token authenticates directly
 
     created = client.post(
         f"{API}/subagents",
@@ -73,7 +69,7 @@ def test_subagent_one_shot_test_run_is_isolated(
 
 def test_subagent_test_unknown_name_404(client: TestClient, user_headers: dict[str, str]) -> None:
     """Test-running a missing subagent returns a 404 error envelope."""
-    headers = _auth(client, user_headers)
+    headers = user_headers  # Phase 1 G1: user access token authenticates directly
     response = client.post(f"{API}/subagents/ghost/test", json={"prompt": "hi"}, headers=headers)
     assert_error_envelope(response, code=404, message="subagent 'ghost' not found")
 
@@ -82,7 +78,7 @@ def test_subagent_test_run_persists_queryable_trace(
     client: TestClient, user_headers: dict[str, str], scripted_model: Any
 ) -> None:
     """A one-shot run persists a structured trace retrievable via the trace APIs."""
-    headers = _auth(client, user_headers)
+    headers = user_headers  # Phase 1 G1: user access token authenticates directly
     created = client.post(
         f"{API}/subagents",
         json={
@@ -128,7 +124,11 @@ def test_subagent_test_run_persists_queryable_trace(
 
 
 def test_skill_delete_cascades_user_copies(
-    client: TestClient, user_headers: dict[str, str], scripted_model: Any, memory_checkpointer: Any
+    client: TestClient,
+    user_headers: dict[str, str],
+    scripted_model: Any,
+    memory_checkpointer: Any,
+    db_engine: Any,
 ) -> None:
     """Deleting a global skill removes the per-user copies created by assembly.
 
@@ -136,8 +136,11 @@ def test_skill_delete_cascades_user_copies(
     1. Bound to an AgentApp -> DELETE returns 422 listing the reference;
     2. Unbind via PATCH (workaround path, still supported), DELETE succeeds,
        and per-user copies / global directory are wiped.
+
+    Phase 1 G1: assembly is triggered via ``get_runtime`` (the retired chat
+    endpoint's compile seam) instead of ``POST /chatbot/chat``.
     """
-    headers = _auth(client, user_headers)
+    headers = user_headers  # Phase 1 G1: user access token authenticates directly
     skill = client.post(
         f"{API}/skills",
         json={"name": "doomed-skill", "description": "Temporary", "body": "# doomed-skill\n"},
@@ -145,7 +148,7 @@ def test_skill_delete_cascades_user_copies(
     )
     assert skill.status_code == 201, skill.text
 
-    # Publish an app bound to the skill and chat once so assembly copies it.
+    # Publish an app bound to the skill and compile once so assembly copies it.
     app = client.post(
         f"{API}/apps",
         json={"name": "doomed-app", "system_prompt": "You are doomed.", "skill_names": ["doomed-skill"]},
@@ -155,14 +158,8 @@ def test_skill_delete_cascades_user_copies(
     app_id = unwrap(app, expected_code=201)["id"]
     assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
-    session = client.post(f"{API}/auth/session", json={"agent_app_id": app_id}, headers=user_headers)
-    assert session.status_code == 200, session.text
-    session_token = {"Authorization": f"Bearer {unwrap(session)['token']['access_token']}"}
-    scripted_model.responses = [AIMessage(content="doomed reply")]
-    chat = client.post(
-        f"{API}/chatbot/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=session_token
-    )
-    assert chat.status_code == 200, chat.text
+    with DBSession(db_engine) as db_session:
+        asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
 
     user_copy_dir = os.path.join(settings.SKILLS_ROOT, "users", "system", "doomed-skill")
     assert os.path.isfile(os.path.join(user_copy_dir, "SKILL.md"))
@@ -200,7 +197,7 @@ def test_subagent_one_shot_test_with_skills(
     isolation (no compile-cache pollution, no per-user skill directory
     created under ``settings.SKILLS_ROOT``).
     """
-    headers = _auth(client, user_headers)
+    headers = user_headers  # Phase 1 G1: user access token authenticates directly
 
     # Seed a global skill the subagent will bind to.
     skill = client.post(
@@ -258,7 +255,7 @@ def test_subagent_one_shot_test_with_skill_names_none_inherits_empty(
     The run still completes and reports success without touching the global
     skill tree.
     """
-    headers = _auth(client, user_headers)
+    headers = user_headers  # Phase 1 G1: user access token authenticates directly
     created = client.post(
         f"{API}/subagents",
         json={

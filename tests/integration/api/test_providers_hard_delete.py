@@ -36,10 +36,13 @@ HARD_DELETE_HEADER = {"X-Confirm-Hard-Delete": "true"}
 
 
 def _management_headers(client: TestClient, user_headers: dict[str, str]) -> dict[str, str]:
-    """Exchange a user token for a chat-session token (management APIs need it)."""
-    response = client.post(f"{API}/auth/session", json={}, headers=user_headers)
-    assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {unwrap(response)['token']['access_token']}"}
+    """Management APIs authenticate with the user access token directly.
+
+    Phase 1 G1: the ``POST /auth/session`` exchange is retired; provider
+    endpoints resolve ``get_current_user`` from the same user token.
+    """
+    del client  # kept for signature symmetry with the retired exchange flow
+    return user_headers
 
 
 def _create_provider(

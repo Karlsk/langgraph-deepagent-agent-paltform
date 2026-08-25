@@ -1,7 +1,7 @@
 """Admin API for LLM provider and model config assets (soft-delete CRUD).
 
 Phase-1 scope: all assets are globally shared (no per-user ownership checks);
-every endpoint only authenticates via ``get_current_session`` and records the
+every endpoint only authenticates via ``get_current_user`` and records the
 creator in the audit-only ``created_by`` field.
 
 Error semantics: missing resources return 404; name collisions, validation
@@ -28,13 +28,12 @@ from sqlmodel import Session as DBSession
 from sqlmodel import col, select
 
 from app.api.v1.agent_assets_common import (
-    _creator,
     _read_patch_body,
     _validate_payload,
     get_db_session,
     paginate_by_name,
 )
-from app.api.v1.auth import get_current_session
+from app.api.v1.auth import get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
@@ -47,7 +46,7 @@ from app.models.provider import (
     Provider,
     ProviderHealth,
 )
-from app.models.session import Session as ChatSession
+from app.models.user import User
 from app.schemas.base import ApiResponse, PageResult
 from app.schemas.providers import (
     ConnectionTestResult,
@@ -245,14 +244,14 @@ def _referencing_owners(db: DBSession, ref: str) -> list[str]:
 async def list_providers(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict[str, Any]]]:
     """List every live provider (auth secrets always masked).
 
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying all non-deleted provider rows ordered by name.
@@ -273,7 +272,7 @@ async def list_providers_page(
     page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
     keyword: str | None = Query(None, max_length=200),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[PageResult[dict[str, Any]]]:
     """List providers with server-side pagination, model count and health.
 
@@ -283,7 +282,7 @@ async def list_providers_page(
         page_size: Rows per page (exposed as ``pageSize``).
         keyword: Optional case-insensitive substring matched against name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying a PageResult of provider rows enriched with the
@@ -338,7 +337,7 @@ async def create_provider(
     request: Request,
     payload: ProviderCreate,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Create a model provider referenced by asset ``model`` fields.
 
@@ -346,7 +345,7 @@ async def create_provider(
         request: The FastAPI request object for rate limiting.
         payload: The provider connection definition.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session (audit only).
+        user: Authenticated user used for audit attribution.
 
     Returns:
         Envelope carrying the persisted provider row (masked projection).
@@ -366,7 +365,7 @@ async def create_provider(
             base_url=payload.base_url,
             auth_config=payload.auth_config,
             enabled=payload.enabled,
-            created_by=_creator(current_session),
+            created_by=user.username or str(user.id),
         )
         db.add(provider)
         try:
@@ -403,7 +402,7 @@ async def create_provider(
 async def list_deleted_providers_endpoint(
     request: Request,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict[str, Any]]]:
     """List every soft-deleted provider row ordered by ``updated_at`` desc.
 
@@ -414,7 +413,7 @@ async def list_deleted_providers_endpoint(
     Args:
         request: The FastAPI request object for rate limiting.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the masked trash projection (possibly empty).
@@ -424,7 +423,7 @@ async def list_deleted_providers_endpoint(
         logger.info(
             "provider_trash_listed",
             count=len(rows),
-            actor=_creator(current_session),
+            actor=user.username or str(user.id),
         )
         return ApiResponse.success([_provider_trash_read(row) for row in rows])
     except HTTPException:
@@ -440,7 +439,7 @@ async def get_deleted_provider_endpoint(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Return one soft-deleted provider by name, or 404 when not in the trash.
 
@@ -451,7 +450,7 @@ async def get_deleted_provider_endpoint(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the masked trash projection.
@@ -463,7 +462,7 @@ async def get_deleted_provider_endpoint(
         provider = get_deleted_provider(db, name)
         if provider is None:
             raise HTTPException(status_code=404, detail=f"deleted provider '{name}' not found")
-        logger.info("provider_trash_read", name=name, actor=_creator(current_session))
+        logger.info("provider_trash_read", name=name, actor=user.username or str(user.id))
         return ApiResponse.success(_provider_trash_read(provider))
     except HTTPException:
         raise
@@ -481,7 +480,7 @@ async def list_deleted_provider_models_endpoint(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict[str, Any]]]:
     """List every model config of the soft-deleted provider named ``name``.
 
@@ -493,7 +492,7 @@ async def list_deleted_provider_models_endpoint(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the masked model rows with their ``deleted`` flag.
@@ -509,7 +508,7 @@ async def list_deleted_provider_models_endpoint(
             "model_trash_listed",
             provider_name=name,
             count=len(models),
-            actor=_creator(current_session),
+            actor=user.username or str(user.id),
         )
         rows: list[dict[str, Any]] = []
         for model in models:
@@ -530,7 +529,7 @@ async def get_provider(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Fetch one provider by name (auth secrets always masked).
 
@@ -538,7 +537,7 @@ async def get_provider(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the matching provider row (masked projection).
@@ -564,7 +563,7 @@ async def update_provider(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Partially update a provider (name is immutable).
 
@@ -574,7 +573,7 @@ async def update_provider(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the updated provider row (masked projection).
@@ -637,7 +636,7 @@ async def delete_provider(
         description="Required 'true' when hard=true; prevents accidental irreversible delete",
     ),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[None]:
     """Delete a provider: soft by default, hard when ``?hard=true`` is confirmed.
 
@@ -661,7 +660,7 @@ async def delete_provider(
         hard: If true, physically delete the provider (irreversible).
         x_confirm_hard_delete: Header that must equal ``"true"`` when ``hard=true``.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope with null data on successful deletion.
@@ -717,7 +716,7 @@ async def delete_provider(
                 name=name,
                 model_count=counts["models"],
                 health_cleared=counts["health"],
-                actor=_creator(current_session),
+                actor=user.username or str(user.id),
             )
             return ApiResponse.success(None)
 
@@ -745,7 +744,7 @@ async def test_provider_connection(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Probe a provider on demand and persist the outcome into provider_health.
 
@@ -758,7 +757,7 @@ async def test_provider_connection(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the probe outcome (status, latency_ms, error).
@@ -826,7 +825,7 @@ async def discover_provider_models(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict[str, Any]]]:
     """List the upstream ``/models`` of a stored provider (auth-free projection).
 
@@ -838,7 +837,7 @@ async def discover_provider_models(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the projected ``RemoteModelInfo`` rows from the
@@ -878,7 +877,7 @@ async def list_provider_models(
     request: Request,
     name: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict[str, Any]]]:
     """List every live model config of a provider ordered by name.
 
@@ -886,7 +885,7 @@ async def list_provider_models(
         request: The FastAPI request object for rate limiting.
         name: Provider unique name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the provider's model config rows.
@@ -915,7 +914,7 @@ async def create_provider_model(
     name: str,
     payload: ModelConfigCreate,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Create a model config under a provider.
 
@@ -924,7 +923,7 @@ async def create_provider_model(
         name: Provider unique name.
         payload: The model definition.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session (audit only).
+        user: Authenticated user used for audit attribution.
 
     Returns:
         Envelope carrying the persisted model config row.
@@ -947,7 +946,7 @@ async def create_provider_model(
             context_size=payload.context_size,
             extra_params=payload.extra_params,
             enabled=payload.enabled,
-            created_by=_creator(current_session),
+            created_by=user.username or str(user.id),
         )
         db.add(model)
         try:
@@ -976,7 +975,7 @@ async def update_provider_model(
     name: str,
     model: str,
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[dict[str, Any]]:
     """Partially update a model config (name is immutable).
 
@@ -985,7 +984,7 @@ async def update_provider_model(
         name: Provider unique name.
         model: Model config display name.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope carrying the updated model config row.
@@ -1051,7 +1050,7 @@ async def delete_provider_model(
         description="Required 'true' when hard=true; prevents accidental irreversible delete",
     ),
     db: DBSession = Depends(get_db_session),
-    current_session: ChatSession = Depends(get_current_session),
+    user: User = Depends(get_current_user),
 ) -> ApiResponse[None]:
     """Delete a model config: soft by default, hard when ``?hard=true`` is confirmed.
 
@@ -1070,7 +1069,7 @@ async def delete_provider_model(
         hard: If true, physically delete the model config row.
         x_confirm_hard_delete: Header that must equal ``"true"`` when ``hard=true``.
         db: Request-scoped DB session.
-        current_session: Authenticated chat session.
+        user: Authenticated user resolved from the user access token.
 
     Returns:
         Envelope with null data on successful deletion.
@@ -1141,7 +1140,7 @@ async def delete_provider_model(
             logger.warning(
                 "model_config_hard_deleted",
                 ref=ref,
-                actor=_creator(current_session),
+                actor=user.username or str(user.id),
             )
             return ApiResponse.success(None)
 
