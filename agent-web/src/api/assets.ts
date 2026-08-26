@@ -151,6 +151,45 @@ export function refreshSkill(name: string): Promise<SkillRefreshReport> {
   return post<SkillRefreshReport>(`/skills/${encodeURIComponent(name)}/refresh`)
 }
 
+/** 目录对账结果四态（对应后端 SkillSyncEntry.action） */
+export type SkillSyncAction = 'unchanged' | 'rewritten' | 'imported' | 'invalid'
+
+/** 目录对账结果条目（对应后端 SkillSyncEntry；invalid 条目 name 为 <dir>/SKILL.md 路径） */
+export interface SkillSyncEntry {
+  name: string
+  action: SkillSyncAction
+  reason?: string | null
+}
+
+/** 目录对账报告（对应后端 SkillSyncReport）：per-entry 明细 + 五分支计数 */
+export interface SkillSyncReport {
+  items: SkillSyncEntry[]
+  scanned: number
+  unchanged: number
+  rewritten: number
+  imported: number
+  invalid: number
+}
+
+/**
+ * 目录对账预览（dry-run，零写入）：GET /skills/workspace-sync。
+ * 扫 {DATA_ROOT}/global/skills 下每个 <name>/SKILL.md 与 DB 逐条比对：一致 → unchanged；
+ * 漂移/缺失 → 将以 DB 为准重写（rewritten）；磁盘独有 → 将导入 DB（imported）；
+ * 解析失败/名称冲突/超大文件 → 逐项降级（invalid）。
+ */
+export function planSkillWorkspaceSync(): Promise<SkillSyncReport> {
+  return get<SkillSyncReport>('/skills/workspace-sync')
+}
+
+/**
+ * 执行目录对账：POST /skills/workspace-sync。
+ * DB 为准重写漂移/缺失文件；磁盘独有文件导入为新行（created_by=workspace-sync）
+ * 并规范化落盘；幂等：二次 apply 全部 unchanged。
+ */
+export function applySkillWorkspaceSync(): Promise<SkillSyncReport> {
+  return post<SkillSyncReport>('/skills/workspace-sync')
+}
+
 /**
  * LLM 草稿生成 payload（POST /skills/generate）。
  * 与后端 SkillGenerateRequest 对齐：description 必填，hint 可选。

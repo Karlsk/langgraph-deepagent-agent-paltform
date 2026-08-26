@@ -24,6 +24,7 @@ import type {
   SkillPatchPayload,
   SkillRefreshReport,
   SkillRow,
+  SkillSyncReport,
 } from '@/api/assets'
 import type { PageResult } from '@/types'
 
@@ -107,6 +108,8 @@ const { apiMock } = vi.hoisted(() => {
     generateSkill: vi.fn(),
     refreshAllSkills: vi.fn(),
     refreshSkill: vi.fn(),
+    planSkillWorkspaceSync: vi.fn(),
+    applySkillWorkspaceSync: vi.fn(),
     // 占位：防止测试时触发真实网络或运行期 import 副作用
     listSubAgents: vi.fn(),
     listSubAgentsPage: vi.fn(),
@@ -389,6 +392,22 @@ beforeEach(() => {
         missing: 0,
       }) satisfies SkillRefreshReport,
   )
+  apiMock.planSkillWorkspaceSync.mockResolvedValue({
+    items: [],
+    scanned: 0,
+    unchanged: 0,
+    rewritten: 0,
+    imported: 0,
+    invalid: 0,
+  } satisfies SkillSyncReport)
+  apiMock.applySkillWorkspaceSync.mockResolvedValue({
+    items: [],
+    scanned: 0,
+    unchanged: 0,
+    rewritten: 0,
+    imported: 0,
+    invalid: 0,
+  } satisfies SkillSyncReport)
   apiMock.listSkills.mockResolvedValue([])
   apiMock.getSkill.mockImplementation(async (name: string) => {
     const row = ROWS.find((r) => r.name === name)
@@ -825,5 +844,110 @@ describe('SkillList 技能管理页（task-4e6 CRUD 前端适配）', () => {
       .findAllComponents(ElDialogStub)
       .find((d) => d.attributes('data-title') === '磁盘同步报告')
     expect(reportDialog).toBeUndefined()
+  })
+
+  /** 目录对账预览报告（五分支各一条：unchanged/rewritten/imported/invalid） */
+  const SYNC_PREVIEW_REPORT: SkillSyncReport = {
+    items: [
+      { name: 'pdf-reader', action: 'unchanged' },
+      { name: 'csv-report', action: 'rewritten' },
+      { name: 'manual-import', action: 'imported' },
+      { name: 'broken/SKILL.md', action: 'invalid', reason: 'frontmatter YAML 解析失败' },
+    ],
+    scanned: 4,
+    unchanged: 1,
+    rewritten: 1,
+    imported: 1,
+    invalid: 1,
+  }
+
+  it('工具栏「目录对账」：调 planSkillWorkspaceSync 并在预览弹窗渲染五分支明细', async () => {
+    apiMock.planSkillWorkspaceSync.mockResolvedValue(SYNC_PREVIEW_REPORT)
+    const wrapper = mountPage()
+    await flushPromises()
+    const fetchCount = apiMock.listSkillsPage.mock.calls.length
+
+    await findButton(wrapper, '目录对账').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.planSkillWorkspaceSync).toHaveBeenCalledTimes(1)
+    const syncDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '目录对账预览（未写入）')
+    expect(syncDialog).toBeDefined()
+    const text = syncDialog!.text()
+    // 摘要行 + 明细行（含 invalid 条目的文件路径与 reason）
+    expect(text).toContain('扫描 4 个文件')
+    expect(text).toContain('已导入 1')
+    expect(text).toContain('manual-import')
+    expect(text).toContain('broken/SKILL.md')
+    expect(text).toContain('无效文件')
+    expect(text).toContain('frontmatter YAML 解析失败')
+    // 预览模式：footer 提供「应用同步」，且零副作用（不触发表格刷新与 apply）
+    expect(text).toContain('仅预览')
+    expect(syncDialog!.text()).toContain('应用同步')
+    expect(apiMock.listSkillsPage.mock.calls.length).toBe(fetchCount)
+    expect(apiMock.applySkillWorkspaceSync).not.toHaveBeenCalled()
+  })
+
+  it('对账弹窗「应用同步」：调 applySkillWorkspaceSync，弹窗原位切换结果并刷新列表', async () => {
+    apiMock.planSkillWorkspaceSync.mockResolvedValue(SYNC_PREVIEW_REPORT)
+    const appliedReport: SkillSyncReport = {
+      items: SYNC_PREVIEW_REPORT.items.slice(0, 3),
+      scanned: 3,
+      unchanged: 1,
+      rewritten: 1,
+      imported: 1,
+      invalid: 0,
+    }
+    apiMock.applySkillWorkspaceSync.mockResolvedValue(appliedReport)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findButton(wrapper, '目录对账').trigger('click')
+    await flushPromises()
+    await findButton(wrapper, '应用同步').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.applySkillWorkspaceSync).toHaveBeenCalledTimes(1)
+    // 弹窗保持打开但切换为执行结果视图（footer 不再提供「应用同步」）
+    const resultDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '目录对账结果')
+    expect(resultDialog).toBeDefined()
+    expect(resultDialog!.text()).toContain('无变化 1')
+    // 导入会产生新行：表格被刷新（listSkillsPage 再次被调）
+    expect(apiMock.listSkillsPage.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(elMessageFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'success',
+        message: expect.stringContaining('目录对账完成：重建 1 / 导入 1 / 无效 0'),
+      }),
+    )
+  })
+
+  it('对账 apply 失败：预览报告保留、弹窗不切结果、表格不刷新', async () => {
+    apiMock.planSkillWorkspaceSync.mockResolvedValue(SYNC_PREVIEW_REPORT)
+    apiMock.applySkillWorkspaceSync.mockRejectedValue(new Error('network down'))
+    const wrapper = mountPage()
+    await flushPromises()
+    const fetchCount = apiMock.listSkillsPage.mock.calls.length
+
+    await findButton(wrapper, '目录对账').trigger('click')
+    await flushPromises()
+    await findButton(wrapper, '应用同步').trigger('click')
+    await flushPromises()
+
+    // 预览弹窗保持打开（执行失败不覆盖预览报告，错误提示由拦截器承担）
+    const previewDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '目录对账预览（未写入）')
+    expect(previewDialog).toBeDefined()
+    const resultDialog = wrapper
+      .findAllComponents(ElDialogStub)
+      .find((d) => d.attributes('data-title') === '目录对账结果')
+    expect(resultDialog).toBeUndefined()
+    expect(apiMock.listSkillsPage.mock.calls.length).toBe(fetchCount)
+    expect(elMessageFn).not.toHaveBeenCalled()
   })
 })

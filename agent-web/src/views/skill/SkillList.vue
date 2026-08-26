@@ -22,18 +22,22 @@ import type { TableColumnConfig } from '@/components/WebAgentTable.vue'
 import SkillContentDialog from '@/views/skill/SkillContentDialog.vue'
 import SkillGenerateDialog from '@/views/skill/SkillGenerateDialog.vue'
 import SkillRefreshReportDialog from '@/views/skill/SkillRefreshReportDialog.vue'
+import SkillWorkspaceSyncDialog from '@/views/skill/SkillWorkspaceSyncDialog.vue'
 import {
+  applySkillWorkspaceSync,
   createSkill,
   deleteSkill,
   getSkillContent,
   listSkillsPage,
   patchSkill,
+  planSkillWorkspaceSync,
   refreshAllSkills,
   refreshSkill,
   type SkillCreatePayload,
   type SkillPatchPayload,
   type SkillRefreshReport,
   type SkillRow,
+  type SkillSyncReport,
 } from '@/api/assets'
 import { useConfirm } from '@/composables/useConfirm'
 import { useRequest } from '@/composables/useRequest'
@@ -96,6 +100,17 @@ const refreshReport = ref<SkillRefreshReport | null>(null)
 const { execute: executeRefreshAll, loading: refreshingAll } = useRequest(() => refreshAllSkills())
 const { execute: executeRefreshRow } = useRequest((name: string) => refreshSkill(name))
 
+/** 目录对账弹窗状态：report 先写入再开弹窗（v-if 保证弹窗拿到非空报告） */
+const syncDialogVisible = ref(false)
+const syncReport = ref<SkillSyncReport | null>(null)
+const syncMode = ref<'preview' | 'applied'>('preview')
+
+/** 对账请求托管：syncPlanning 接工具栏按钮 loading；apply 后弹窗原位切换为执行结果 */
+const { execute: executePlanSync, loading: syncPlanning } = useRequest(() =>
+  planSkillWorkspaceSync(),
+)
+const { execute: executeApplySync } = useRequest(() => applySkillWorkspaceSync())
+
 /**
  * 打开报告弹窗（全量 / 单条共用）：先写报告再开弹窗。
  * 关闭时保留 report（v-if 已卸载弹窗，下次打开前必然被新报告覆盖）。
@@ -118,6 +133,29 @@ async function handleRefreshRow(row: SkillRow): Promise<void> {
   const report = await executeRefreshRow(row.name)
   if (report) {
     openRefreshReport(report)
+  }
+}
+
+/** 工具栏「目录对账」：dry-run 预览（零写入）并打开对账弹窗 */
+async function handleWorkspaceSyncPreview(): Promise<void> {
+  const report = await executePlanSync()
+  if (report) {
+    syncReport.value = report
+    syncMode.value = 'preview'
+    syncDialogVisible.value = true
+  }
+}
+
+/** 对账弹窗「应用同步」：执行对账，弹窗原位切换为执行结果并刷新列表（导入会产生新行） */
+async function handleWorkspaceSyncApply(): Promise<void> {
+  const report = await executeApplySync()
+  if (report) {
+    syncReport.value = report
+    syncMode.value = 'applied'
+    tableRef.value?.refresh()
+    notifySuccess(
+      `目录对账完成：重建 ${report.rewritten} / 导入 ${report.imported} / 无效 ${report.invalid}`,
+    )
   }
 }
 
@@ -291,6 +329,13 @@ function truncatedDescription(text: string): string {
         >
           同步磁盘
         </el-button>
+        <el-button
+          class="app-btn app-btn--secondary skill-toolbar__sync"
+          :loading="syncPlanning"
+          @click="handleWorkspaceSyncPreview"
+        >
+          目录对账
+        </el-button>
       </div>
 
       <WebAgentTable
@@ -389,6 +434,14 @@ function truncatedDescription(text: string): string {
       v-model="refreshDialogVisible"
       :report="refreshReport"
     />
+
+    <SkillWorkspaceSyncDialog
+      v-if="syncReport"
+      v-model="syncDialogVisible"
+      :report="syncReport"
+      :mode="syncMode"
+      @apply="handleWorkspaceSyncApply"
+    />
   </div>
 </template>
 
@@ -407,6 +460,9 @@ function truncatedDescription(text: string): string {
   width: 280px;
 }
 .skill-toolbar__refresh {
+  margin-left: 12px;
+}
+.skill-toolbar__sync {
   margin-left: 12px;
 }
 .skill-body-toolbar {
