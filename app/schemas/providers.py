@@ -12,7 +12,7 @@ from pydantic.fields import FieldInfo
 
 from app.schemas.agent_apps import NAME_MAX_LENGTH, _name_field
 
-MODEL_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+MODEL_NAME_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
 
 
 def _model_name_field(description: str) -> FieldInfo:
