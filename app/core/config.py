@@ -5,6 +5,7 @@ for the application. It includes environment detection, .env file loading, and
 configuration value parsing.
 """
 
+import logging
 import os
 from enum import Enum
 from pathlib import Path
@@ -167,8 +168,36 @@ class Settings:
         self.JWT_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_DAYS", "7"))
         self.JWT_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
-        # Skills storage root (SKILL.md files for agent skills)
-        self.SKILLS_ROOT = os.getenv("SKILLS_ROOT", "./data/skills")
+        # Workspace roots (G2 three-layer layout; spec-g2-workspace v3.3 §2.2).
+        # DATA_ROOT is the single parent of global/, agents/<app_id>/ and
+        # users/. The legacy SKILLS_ROOT env is honored one major version for
+        # backward compatibility: when only SKILLS_ROOT is set, DATA_ROOT
+        # falls back to its parent so both roots stay on the same volume.
+        _skills_root_env = os.getenv("SKILLS_ROOT", "")
+        _data_root_env = os.getenv("DATA_ROOT", "")
+        self.SKILLS_ROOT = _skills_root_env or "./data/skills"  # DEPRECATED (G2): use DATA_ROOT
+        if _data_root_env:
+            self.DATA_ROOT = _data_root_env
+        elif _skills_root_env:
+            self.DATA_ROOT = str(Path(_skills_root_env).parent)
+            logging.getLogger(__name__).warning(
+                "SKILLS_ROOT env is deprecated (G2 v3): set DATA_ROOT instead; "
+                "DATA_ROOT fell back to its parent: %s",
+                self.DATA_ROOT,
+            )
+        else:
+            self.DATA_ROOT = "./data"
+        # Legacy on-disk layout detection (spec §10.2): old {SKILLS_ROOT}/global
+        # data that has not been migrated to {DATA_ROOT}/global/skills yet.
+        if (Path(self.SKILLS_ROOT) / "global").is_dir() and not (
+            Path(self.DATA_ROOT) / "global"
+        ).is_dir():
+            logging.getLogger(__name__).warning(
+                "skills_root_legacy_detected: legacy skills at %s/global; run "
+                "scripts/migrate_workspace.py --apply to migrate to %s/global/skills",
+                self.SKILLS_ROOT,
+                self.DATA_ROOT,
+            )
 
         # MCP stdio command allowlist (phase-1 command-surface lockdown;
         # comma-separated executable basenames accepted as stdio commands).

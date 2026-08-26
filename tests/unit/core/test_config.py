@@ -62,3 +62,35 @@ def test_auth_logout_rate_limit_configured() -> None:
 def test_login_rate_limit_still_configured() -> None:
     """The login rate-limit entry still exists."""
     assert global_settings.RATE_LIMIT_ENDPOINTS["login"]
+
+
+# ---------------------------------------------------------------------------
+# G2 workspace roots (DATA_ROOT + legacy SKILLS_ROOT fallback, spec §2.2/§10.2)
+# ---------------------------------------------------------------------------
+
+
+def test_data_root_default_is_data_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DATA_ROOT defaults to ./data with the legacy SKILLS_ROOT alongside."""
+    fresh = _fresh_settings(monkeypatch, "DATA_ROOT", "SKILLS_ROOT")
+    assert fresh.DATA_ROOT == "./data"
+    assert fresh.SKILLS_ROOT == "./data/skills"
+
+
+def test_skills_root_env_falls_back_to_parent_for_data_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy SKILLS_ROOT-only deployment maps DATA_ROOT to its parent."""
+    monkeypatch.delenv("DATA_ROOT", raising=False)
+    monkeypatch.setenv("SKILLS_ROOT", "/srv/custom/skills")
+    fresh = Settings()
+    assert fresh.SKILLS_ROOT == "/srv/custom/skills"
+    assert fresh.DATA_ROOT == "/srv/custom"
+
+
+def test_data_root_env_overrides_skills_root_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit DATA_ROOT env wins over the SKILLS_ROOT parent fallback."""
+    monkeypatch.setenv("SKILLS_ROOT", "/srv/custom/skills")
+    monkeypatch.setenv("DATA_ROOT", "/srv/workspace")
+    fresh = Settings()
+    assert fresh.DATA_ROOT == "/srv/workspace"
+    assert fresh.SKILLS_ROOT == "/srv/custom/skills"

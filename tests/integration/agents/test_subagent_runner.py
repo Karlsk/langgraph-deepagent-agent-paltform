@@ -161,7 +161,7 @@ def test_skill_delete_cascades_user_copies(
     with DBSession(db_engine) as db_session:
         asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
 
-    user_copy_dir = os.path.join(settings.SKILLS_ROOT, "users", "system", "doomed-skill")
+    user_copy_dir = os.path.join(settings.DATA_ROOT, "users", "system", "doomed-skill")
     assert os.path.isfile(os.path.join(user_copy_dir, "SKILL.md"))
 
     # Reference-protection path: skill still bound to the app -> DELETE is rejected (422).
@@ -178,7 +178,7 @@ def test_skill_delete_cascades_user_copies(
     assert deleted.status_code == 200, deleted.text
 
     assert not os.path.exists(user_copy_dir)
-    assert not os.path.isdir(os.path.join(settings.SKILLS_ROOT, "global", "doomed-skill"))
+    assert not os.path.isdir(os.path.join(settings.DATA_ROOT, "global", "skills", "doomed-skill"))
 
 
 # ---------------------------------------------------------------------------
@@ -236,13 +236,13 @@ def test_subagent_one_shot_test_with_skills(
     # Isolation contract still holds.
     assert len(assembly._compile_cache) == 0  # noqa: SLF001
     # No per-user skill copies were created by the standalone runner (it uses
-    # a private tmp dir, never ``settings.SKILLS_ROOT/users/...``).
-    user_skill_root = os.path.join(settings.SKILLS_ROOT, "users")
+    # a private tmp dir, never the per-user workspace under {DATA_ROOT}/users).
+    user_skill_root = os.path.join(settings.DATA_ROOT, "users")
     if os.path.isdir(user_skill_root):
         for entry in os.listdir(user_skill_root):
             assert entry != "system", "standalone runner must not pollute per-user skill dirs"
     # The global skill directory survives intact.
-    assert os.path.isfile(os.path.join(settings.SKILLS_ROOT, "global", "doc-export", "SKILL.md"))
+    assert os.path.isfile(os.path.join(settings.DATA_ROOT, "global", "skills", "doc-export", "SKILL.md"))
 
 
 def test_subagent_one_shot_test_with_skill_names_none_inherits_empty(

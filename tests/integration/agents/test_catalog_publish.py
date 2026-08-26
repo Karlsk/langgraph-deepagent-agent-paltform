@@ -184,8 +184,7 @@ def test_skill_content_refreshed_on_reassembly(
     with DBSession(db_engine) as db_session:
         asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
 
-    skills_root = settings.SKILLS_ROOT
-    user_copy = f"{skills_root}/users/system/style-guide/SKILL.md"
+    user_copy = f"{settings.DATA_ROOT}/users/system/style-guide/SKILL.md"
     with open(user_copy, encoding="utf-8") as handle:
         assert "version-1" in handle.read()
 

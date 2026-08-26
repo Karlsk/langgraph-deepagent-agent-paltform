@@ -475,7 +475,11 @@ async def compile_agent_app(
         for cfg in subagent_cfgs
     ]
 
-    user_skill_root = Path(settings.SKILLS_ROOT) / "users" / str(user_id)
+    # G2 Phase-1 alignment: sync_user_skills now writes the shared user
+    # layer at {DATA_ROOT}/users/<uid> (top-level), so the backend must read
+    # from the same root. Phase 4 (T18, D15) moves both to the nested
+    # {DATA_ROOT}/agents/<app_id>/users/<uid> workspace.
+    user_skill_root = Path(settings.DATA_ROOT) / "users" / str(user_id)
     backend = FilesystemBackend(root_dir=str(user_skill_root))
     interrupt_on = cast(Optional[dict[str, Any]], app_cfg.interrupt_on or None)
 

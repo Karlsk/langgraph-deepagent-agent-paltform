@@ -94,10 +94,11 @@ def clean_compile_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture
-def skills_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect settings.SKILLS_ROOT into an isolated tmp directory."""
-    root = tmp_path / "skills"
-    monkeypatch.setattr(settings, "SKILLS_ROOT", str(root))
+def workspace_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect workspace roots (DATA_ROOT + legacy SKILLS_ROOT) into tmp."""
+    root = tmp_path / "data"
+    monkeypatch.setattr(settings, "DATA_ROOT", str(root))
+    monkeypatch.setattr(settings, "SKILLS_ROOT", str(root / "skills"))
     return root
 
 
@@ -376,7 +377,7 @@ def _task_tool_call(subagent_type: str = "helper") -> AIMessage:
 
 
 def test_max_turns_gate_stops_looping_subagent(
-    skills_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any]
+    workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any]
 ) -> None:
     """A looping subagent model is terminated exactly at the max_turns budget."""
     loop_call = AIMessage(
@@ -540,7 +541,7 @@ def _counter_value(result: str) -> float:
 
 
 def test_get_or_compile_counts_miss_then_hit(
-    skills_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """First lookup misses and compiles; the identical second lookup hits the cache."""
     model = _parent_model()
@@ -561,7 +562,7 @@ def test_get_or_compile_counts_miss_then_hit(
 
 
 def test_get_or_compile_without_checkpointer_never_caches(
-    skills_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """checkpointer=None compiles are returned but never written to the cache."""
     model = _parent_model()
@@ -581,7 +582,7 @@ def test_get_or_compile_without_checkpointer_never_caches(
 
 
 def test_get_or_compile_with_checkpointer_caches(
-    skills_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """checkpointer-bound compiles keep the cache-write path."""
     model = _parent_model()
@@ -601,11 +602,11 @@ def test_get_or_compile_with_checkpointer_caches(
 
 
 def test_compile_agent_app_end_to_end_with_memory_injection(
-    skills_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One-turn ainvoke succeeds, syncs skills and injects the memory section."""
     # Global skill on disk so sync_user_skills can copy it for the user.
-    skill_dir = skills_root / "global" / "greet"
+    skill_dir = workspace_root / "global" / "skills" / "greet"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: greet\ndescription: greeting skill\n---\n\n# Greet\n\nSay hi politely.\n",
@@ -627,7 +628,7 @@ def test_compile_agent_app_end_to_end_with_memory_injection(
     )
 
     # Skills were synced into the per-user directory.
-    assert (skills_root / "users" / "user-42" / "greet" / "SKILL.md").exists()
+    assert (workspace_root / "users" / "user-42" / "greet" / "SKILL.md").exists()
 
     result = asyncio.run(
         graph.ainvoke(
@@ -655,7 +656,7 @@ def test_compile_agent_app_end_to_end_with_memory_injection(
 
 
 def test_compile_agent_app_injects_username_time_and_memory_fallback_per_turn(
-    skills_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dynamic context (username, current time, memory fallback) is injected per turn.
 

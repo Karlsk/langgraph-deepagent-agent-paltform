@@ -403,11 +403,10 @@ def test_run_subagent_once_omits_callback_when_tracing_disabled(
 
 
 def _seed_skill(session: Session, *, name: str, body: str) -> SkillAsset:
-    """Persist a SkillAsset row plus its SKILL.md file under settings.SKILLS_ROOT/global."""
+    """Persist a SkillAsset row plus its SKILL.md file under the Global layer."""
     from app.services.agents import skills_store
 
-    skills_root = Path(settings.SKILLS_ROOT)
-    skill_dir = skills_root / "global" / name
+    skill_dir = Path(settings.DATA_ROOT) / "global" / "skills" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
     asset = SkillAsset(

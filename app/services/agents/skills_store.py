@@ -3,19 +3,27 @@
 Dual-store architecture (DB = source of truth, disk = runtime copy):
 
 - The full SKILL.md body lives in ``SkillAsset.body`` (DB) and in the
-  ``{SKILLS_ROOT}/global/<name>/SKILL.md`` file. Writes go to both; reads
-  are disk-first with a DB self-heal fallback (``read_global``), so a lost
-  disk copy (e.g. container rebuild without a ``./data`` bind mount) is
-  recovered transparently from the DB.
+  ``{DATA_ROOT}/global/skills/<name>/SKILL.md`` file. Writes go to both;
+  reads are disk-first with a DB self-heal fallback (``read_global``), so a
+  lost disk copy (e.g. container rebuild without a ``./data`` bind mount)
+  is recovered transparently from the DB.
 - ``SkillAsset.content_hash`` is the rewrite trigger for
   ``refresh_disk_from_db``: a disk file whose sha256 matches the row hash is
   left untouched, anything else is rewritten from the DB body. Legacy rows
   with ``body IS NULL`` are backfilled from disk (their only copy).
 
-Directory conventions (rooted at ``settings.SKILLS_ROOT``):
+Directory conventions (G2 three-layer workspace, rooted at
+``settings.DATA_ROOT``; spec-g2-workspace v3.3 §2.1):
 
-- Global skills: ``{SKILLS_ROOT}/global/<name>/SKILL.md``
-- Per-user copies: ``{SKILLS_ROOT}/users/<user_id>/<name>/SKILL.md``
+- Global layer (DB truth + disk runtime copy):
+  ``{DATA_ROOT}/global/skills/<name>/SKILL.md``
+- Agent layer (publish-time snapshot):
+  ``{DATA_ROOT}/agents/<app_id>/skills/<name>/SKILL.md``
+- User layer (per-(app, user) combined workspace):
+  ``{DATA_ROOT}/agents/<app_id>/users/<user_id>/skills/<name>/SKILL.md``
+- Top-level shared user copies (legacy two-layer path, kept for the
+  context-free ``materialize_for_user``):
+  ``{DATA_ROOT}/users/<user_id>/<name>/SKILL.md``
 
 All blocking file IO is wrapped in ``asyncio.to_thread`` so callers never
 stall the event loop. Skill names are validated against a strict pattern to
@@ -107,14 +115,19 @@ def _validate_user_id(user_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _data_root() -> Path:
+    """Return the G2 workspace root: ``{DATA_ROOT}``."""
+    return Path(settings.DATA_ROOT)
+
+
 def _skills_root() -> Path:
-    """Return the configured skills storage root."""
-    return Path(settings.SKILLS_ROOT)
+    """Return the Global skills root: ``{DATA_ROOT}/global/skills`` (G2 v3)."""
+    return _data_root() / "global" / "skills"
 
 
 def _global_skill_dir(name: str) -> Path:
-    """Return the global directory of a skill: ``{root}/global/<name>``."""
-    return _skills_root() / "global" / _validate_skill_name(name)
+    """Return the global directory of a skill: ``{root}/global/skills/<name>``."""
+    return _skills_root() / _validate_skill_name(name)
 
 
 def _global_skill_file(name: str) -> Path:
@@ -122,9 +135,44 @@ def _global_skill_file(name: str) -> Path:
     return _global_skill_dir(name) / _SKILL_FILE_NAME
 
 
-def _user_skill_file(user_id: str, name: str) -> Path:
-    """Return the per-user SKILL.md path: ``{root}/users/<user_id>/<name>/SKILL.md``."""
-    return _skills_root() / "users" / _validate_user_id(user_id) / _validate_skill_name(name) / _SKILL_FILE_NAME
+def _shared_user_skill_dir(user_id: str) -> Path:
+    """Return the top-level shared user dir: ``{DATA_ROOT}/users/<user_id>``."""
+    return _data_root() / "users" / _validate_user_id(user_id)
+
+
+def _shared_user_skill_file(user_id: str, name: str) -> Path:
+    """Return the shared-user SKILL.md path: ``{DATA_ROOT}/users/<uid>/<name>/SKILL.md``."""
+    return _shared_user_skill_dir(user_id) / _validate_skill_name(name) / _SKILL_FILE_NAME
+
+
+# ---------------------------------------------------------------------------
+# G2 three-layer path helpers (spec v3.3 §4.3)
+# ---------------------------------------------------------------------------
+
+
+def _agent_dir(app_id: int) -> Path:
+    """Return the AgentApp private workspace root: ``{DATA_ROOT}/agents/<app_id>``."""
+    return _data_root() / "agents" / str(app_id)
+
+
+def _agent_skill_dir(app_id: int) -> Path:
+    """Return the Agent-layer skills dir: ``{DATA_ROOT}/agents/<app_id>/skills``."""
+    return _agent_dir(app_id) / "skills"
+
+
+def _agent_skill_file(app_id: int, name: str) -> Path:
+    """Return the Agent-layer SKILL.md path."""
+    return _agent_skill_dir(app_id) / _validate_skill_name(name) / _SKILL_FILE_NAME
+
+
+def _user_skill_dir(app_id: int, user_id: int) -> Path:
+    """Return the User-layer skills dir: ``{DATA_ROOT}/agents/<app_id>/users/<user_id>/skills``."""
+    return _agent_dir(app_id) / "users" / str(user_id) / "skills"
+
+
+def _user_skill_file(app_id: int, user_id: int, name: str) -> Path:
+    """Return the User-layer SKILL.md path."""
+    return _user_skill_dir(app_id, user_id) / _validate_skill_name(name) / _SKILL_FILE_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +219,7 @@ def _remove_skill_dirs(name: str) -> None:
     if global_dir.is_dir():
         shutil.rmtree(global_dir)
 
-    users_root = _skills_root() / "users"
+    users_root = _data_root() / "users"
     if not users_root.is_dir():
         return
     for user_dir in users_root.iterdir():
@@ -180,17 +228,20 @@ def _remove_skill_dirs(name: str) -> None:
             shutil.rmtree(copy_dir)
 
 
-def _prune_stale_user_skills(user_id: str, keep: set[str]) -> None:
-    """Delete skill directories under a user root that are not in ``keep``.
+def _prune_stale_user_skills(target_dir: Path, keep: set[str]) -> None:
+    """Delete skill directories under ``target_dir`` that are not in ``keep``.
+
+    G2 v3 (D7): the function takes the directory to prune directly (the
+    User-layer combined dir or the top-level shared user dir) instead of
+    deriving it from a user id.
 
     Args:
-        user_id: Validated user identifier.
+        target_dir: Skills directory to prune (e.g. ``_user_skill_dir(app_id, user_id)``).
         keep: Set of skill names that must survive.
     """
-    user_root = _skills_root() / "users" / user_id
-    if not user_root.is_dir():
+    if not target_dir.is_dir():
         return
-    for entry in user_root.iterdir():
+    for entry in target_dir.iterdir():
         if entry.is_dir() and entry.name not in keep:
             shutil.rmtree(entry)
 
@@ -434,7 +485,7 @@ async def materialize_for_user(session: Session, user_id: str, skill_names: Sequ
     names = list(skill_names)
     for name in names:
         body = await read_global(session, name)
-        await asyncio.to_thread(_atomic_write, _user_skill_file(uid, name), body)
+        await asyncio.to_thread(_atomic_write, _shared_user_skill_file(uid, name), body)
     logger.info("skills_materialized_for_user", user_id=uid, skill_count=len(names))
 
 
@@ -491,7 +542,9 @@ async def sync_user_skills(session: Session, user_id: str, associated_names: Seq
     names = list(associated_names)
     try:
         await materialize_for_user(session, uid, names)
-        await asyncio.to_thread(_prune_stale_user_skills, uid, set(names))
+        await asyncio.to_thread(
+            _prune_stale_user_skills, _shared_user_skill_dir(uid), set(names)
+        )
     except (OSError, ValueError):
         skill_sync_total.labels(result="error").inc()
         logger.exception("user_skill_sync_failed", user_id=uid, skill_count=len(names))

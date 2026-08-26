@@ -1,4 +1,4 @@
-# G2 Spec：Workspace 三级文件系统（v3 修订版）
+# G2 Spec：Workspace 三级文件系统（v3.3 修订版）
 
 > **主题**：引入 Agent 层；publish 时 Global→Agent 复制；关联用户时 (Global + Agent) → User 复制；User 层**嵌套**在 AgentApp 下；lazy 校验兜底；User Chat 读 User，Agent/SubAgent 测试读 Global+Agent。
 > **关联文档**：
@@ -9,10 +9,15 @@
 > **目标读者**：后端实施者
 > **风险等级**：中（DB schema + 目录结构 + 发布流程 + Runtime cache）
 > **估算工时**：2.5 周（含 service 层拆分 + 迁移脚本）
-> **修订时间**：2026-08-26（v3.2 上下文歧义修复）
-> **版本**：v3.2 修订版
+> **修订时间**：2026-08-26（v3.3 实现期澄清决策固化）
+> **版本**：v3.3 修订版
 > - v3.1 原则性错误修复：P0-1 user_id 显式传入、P0-3 PATCH 清空关联表、H1-1 缓存大小限制、H1-3 参数语义明确
 > - v3.2 上下文歧义修复：A1-1 DoD 按 Phase 分组、A1-2 G2/G3 接口签名统一、A1-3 MVP 限制表述统一、A1-5 G3 JSON Schema 补充
+> - v3.3 实现期澄清决策固化：Session 类型锁定同步 SQLModel、lazy 校验动态期望指纹算法、
+>   compile_agent_app 移除编译期 User 层填充、移除启动预热、D6/D23 落点修订（详见 §13.4）
+>
+> **全局约定（v3.3）**：本文档所有伪代码基于 **SQLModel 同步 `Session`**（与代码库现状一致）；
+> 函数保持 `async def`（文件 IO 经 `asyncio.to_thread`），`session.get/exec/commit` 为同步调用。
 
 ---
 
@@ -277,7 +282,7 @@ session.commit()
 # app/services/agents/agent_apps_service.py
 
 async def publish_agent_app(
-    session: AsyncSession,
+    session: Session,
     *,
     app_cfg: AgentApp,
     current_user_id: int,
@@ -306,7 +311,7 @@ async def publish_agent_app(
     # 5. 更新关联表的 last_synced_workspace_hash（无效化缓存）
     await _invalidate_user_layer_cache(session, app_cfg)
 
-    await session.commit()
+    session.commit()
     logger.info(
         "agent_app_published",
         app_id=app_cfg.id,
@@ -322,7 +327,7 @@ async def publish_agent_app(
 # app/services/agents/agent_apps_service.py
 
 async def associate_user_with_app(
-    session: AsyncSession,
+    session: Session,
     *,
     user_id: int,
     app_id: int,
@@ -333,12 +338,12 @@ async def associate_user_with_app(
     业务编排（API 层仅做参数校验）。
     """
     # 1. 参数与状态校验
-    app_cfg = await session.get(AgentApp, app_id)
+    app_cfg = session.get(AgentApp, app_id)
     if app_cfg is None:
         raise AgentAppNotFoundError(app_id=app_id)
     if app_cfg.status != "published":
         raise AgentAppNotPublishedError(app_id=app_id)
-    user = await db_service.get_user(session, user_id)
+    user = db_service.get_user(session, user_id)
     if user is None:
         raise UserNotFoundError(user_id=user_id)
 
@@ -360,7 +365,7 @@ async def associate_user_with_app(
 
     # 4. 更新关联表
     assoc.last_synced_workspace_hash = app_cfg.workspace_hash
-    await session.commit()
+    session.commit()
 
     logger.info(
         "user_app_associated",
@@ -405,7 +410,7 @@ def _user_skill_file(app_id: int, user_id: int, name: str) -> Path:
 # ====== 复制函数（v3 全部带 hash 比对） ======
 
 async def materialize_for_agent(
-    session: AsyncSession, *, app_id: int, skill_names: Sequence[str]
+    session: Session, *, app_id: int, skill_names: Sequence[str]
 ) -> None:
     """把 Global skills 复制到 Agent 层；用于 publish 时。
 
@@ -429,7 +434,7 @@ async def materialize_for_agent(
 
 
 async def materialize_to_user_combined(
-    session: AsyncSession, *,
+    session: Session, *,
     app_cfg: AgentApp,
     user_id: int,  # v3 修复：显式传入 user_id（从 API 层 get_current_user 获取）
     subagent_cfgs: Sequence[SubAgentConfig],
@@ -481,7 +486,7 @@ async def materialize_to_user_combined(
 
 
 async def materialize_into_combined_directory(
-    session: AsyncSession,
+    session: Session,
     target_dir: Path,
     *,
     app_id: int,
@@ -556,53 +561,89 @@ def _compute_user_workspace_hash(user_dir: Path) -> str:
     return hashlib.sha256("\n".join(file_hashes).encode("utf-8")).hexdigest()
 
 
-# ====== Lazy 校验（v3 新增） ======
+def _compute_effective_workspace_hash(
+    app_id: int, effective_skill_names: Sequence[str]
+) -> str:
+    """计算期望指纹（v3.3 新增）：按 effective_skill_names 逐名解析期望源文件。
+
+    源解析规则与 materialize_to_user_combined 完全一致（Agent 覆盖 Global）：
+    - Agent 层文件存在 → 以 Agent 层为期望源
+    - 否则 → 以 Global 层为期望源
+    - 两者皆缺失 → 该 name 贡献空串占位（保持位置稳定，指纹可区分缺失）
+
+    背景：User 层文件集 = effective_skill_names（App ∪ SubAgent），可能大于
+    Agent 层快照（SubAgent 可拥有 App 之外的 skill），因此不能直接比对
+    Agent 层 workspace_hash —— 否则永不相等、每次触发同步。
+    """
+    file_hashes: list[str] = []
+    for name in sorted(effective_skill_names):
+        agent_path = _agent_skill_file(app_id, name)
+        source = agent_path if agent_path.exists() else _global_skill_file(name)
+        if source.exists():
+            file_hashes.append(hashlib.sha256(source.read_bytes()).hexdigest())
+        else:
+            file_hashes.append("")
+    return hashlib.sha256("\n".join(file_hashes).encode("utf-8")).hexdigest()
+
+
+# ====== Lazy 校验（v3.3 动态期望指纹算法） ======
 
 async def ensure_user_workspace_up_to_date(
-    session: AsyncSession, *,
+    session: Session, *,
     user_id: int,
     app_id: int,
 ) -> bool:
-    """Lazy 校验：session 启动入口调用。
+    """Lazy 校验：session 启动入口调用（v3.3 动态期望指纹算法）。
 
-    Returns: True 表示执行了重新复制；False 表示 hash 命中跳过。
+    比对算法：动态计算期望指纹（逐名解析 Agent 层优先、缺失回退 Global 层）
+    vs User 层实际指纹。不直接比对 app_cfg.workspace_hash —— 因 SubAgent 可
+    拥有 App 之外的 skill（User 层文件集 = effective_skill_names 并集，可能
+    大于 Agent 层快照），直接比对会导致永不相等、每次触发同步。
+
+    Returns: True 表示执行了重新复制；False 表示 hash 命中跳过 / 静默跳过
+             （app 或 association 不存在时静默 False，不抛异常）。
     """
-    user_dir = _user_skill_dir(app_id, user_id)
-    current_hash = _compute_user_workspace_hash(user_dir)
-
-    app_cfg = await session.get(AgentApp, app_id)
+    app_cfg = session.get(AgentApp, app_id)
     if app_cfg is None:
         logger.warning("lazy_validate_app_not_found", app_id=app_id)
         return False
 
-    expected_hash = app_cfg.workspace_hash or ""
+    assoc = await _get_association(session, user_id=user_id, app_id=app_id)
+    if assoc is None:
+        # 未关联用户：User 层尚不存在，跳过（首次复制由 associate-user 端点负责）
+        logger.debug("lazy_validate_assoc_not_found", user_id=user_id, app_id=app_id)
+        return False
 
-    if current_hash == expected_hash and current_hash != hashlib.sha256(b"").hexdigest():
+    subagent_cfgs = await agents_service.list_subagent_cfgs(
+        session, app_id=app_id, skill_names=app_cfg.skill_names or []
+    )
+    effective_skill_names = sorted(
+        set(app_cfg.skill_names or [])
+        | {n for cfg in subagent_cfgs for n in (cfg.skill_names or [])}
+    )
+
+    expected_hash = _compute_effective_workspace_hash(app_id, effective_skill_names)
+    current_hash = _compute_user_workspace_hash(_user_skill_dir(app_id, user_id))
+
+    if current_hash == expected_hash:
         return False  # 命中，跳过
 
-    # 不一致 → 增量同步
-    assoc = await _get_association(session, user_id=user_id, app_id=app_id)
-    if assoc is not None:
-        subagent_cfgs = await agents_service.list_subagent_cfgs(
-            session, app_id=app_id, skill_names=app_cfg.skill_names or []
-        )
-        await materialize_to_user_combined(
-            session=session,
-            app_cfg=app_cfg,
-            user_id=user_id,  # v3 修复：显式传入 user_id
-            subagent_cfgs=subagent_cfgs,
-        )
-        assoc.last_synced_workspace_hash = app_cfg.workspace_hash
-        await session.commit()
-        logger.info(
-            "user_workspace_lazy_synced",
-            user_id=user_id,
-            app_id=app_id,
-            workspace_hash=app_cfg.workspace_hash,
-        )
-        return True
-
-    return False
+    # 不一致 → 增量同步（幂等：hash 比对仅写差异，prune 过期子目录）
+    await materialize_to_user_combined(
+        session=session,
+        app_cfg=app_cfg,
+        user_id=user_id,
+        subagent_cfgs=subagent_cfgs,
+    )
+    assoc.last_synced_workspace_hash = app_cfg.workspace_hash
+    session.commit()
+    logger.info(
+        "user_workspace_lazy_synced",
+        user_id=user_id,
+        app_id=app_id,
+        workspace_hash=app_cfg.workspace_hash,
+    )
+    return True
 ```
 
 ### 4.4 既有函数复用 / 修改
@@ -610,7 +651,7 @@ async def ensure_user_workspace_up_to_date(
 | 函数 | 现状 | v3 变更 |
 |---|---|---|
 | `materialize_for_user(session, user_id, skill_names)` | 仅 Global → User | **保留**：供独立 skill 复制（无 Agent 上下文） |
-| `sync_user_skills(session, user_id, associated_names)` | 重置 User 目录 | **保留**：与新函数并存；调用方迁移至 `materialize_to_user_combined` |
+| `sync_user_skills(session, user_id, associated_names)` | 重置 User 目录 | **保留（历史兼容）**：G2 起 `compile_agent_app` 不再调用它（v3.3，§6.1.3）；User 层填充统一由 lazy 校验的 `materialize_to_user_combined` 负责 |
 | `refresh_disk_from_db(session, name)` | Global 刷新 | **保留**：作用域限定为 Global |
 | `read_global(session, name)` | Global 读取 | **保留** |
 | `materialize_into_directory(session, target_dir, skill_names)` | 复制到任意目录 | **保留**：供 test_runner 等使用 |
@@ -647,7 +688,8 @@ pending ──ensure_all_agent_workspaces──> active
 - ✅ PATCH 后 `agent_workspace_status = 'pending'`
 - ✅ PATCH 后失效所有关联用户的 `last_synced_workspace_hash`（v3 修复：P0-3）
   - 调用 `_invalidate_user_layer_cache(session, app_cfg)` 清空关联表
-  - 确保下次 lazy 校验时能正确检测 drift
+  - v3.3 说明：drift 检测由动态期望指纹 vs User 层实际指纹承担（§4.3），
+    `last_synced_workspace_hash` 仅作同步状态记录 / 观测用途
 - ✅ 启动期 `ensure_all_agent_workspaces` **同时校验已 active 的 App**（防目录丢失）
 - ✅ draft 状态保持 pending（不自动转 active）
 - ✅ published 状态必要时 rematerialize（Agent 层目录丢失场景）
@@ -681,16 +723,20 @@ _APP_FIELDS = (
     "skill_names", "subagent_names", "interrupt_on", "engine",
 )
 
-def compute_fingerprint(app_cfg: AgentApp, session: AsyncSession) -> str:
+def compute_fingerprint(
+    app_cfg: AgentApp,
+    subagent_cfgs: Sequence[SubAgentConfig],
+    skill_hashes: Mapping[str, str],
+    mcp_fingerprint: str,
+    model_fingerprint: str,
+) -> str:
     """计算 AgentApp fingerprint（用于 cache key 校验）。
 
+    v3.3：伪代码对齐现状实现（5 输入）。
     不纳入 workspace_hash —— 已有 _load_skill_hashes 监控 skill body 变更；
     workspace_hash 变化时 fingerprint 已变化（skill_names 等也会变）。
     """
-    base_str = "|".join(str(getattr(app_cfg, f)) for f in _APP_FIELDS)
-    skill_hashes = _load_skill_hashes(session, app_cfg.skill_names or [])
-    raw = f"{base_str}|{','.join(skill_hashes)}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    ...
 ```
 
 ### 5.4 启动期校验（`bootstrap.py` 重命名）
@@ -698,12 +744,12 @@ def compute_fingerprint(app_cfg: AgentApp, session: AsyncSession) -> str:
 ```python
 # app/services/agents/bootstrap.py
 
-async def ensure_all_agent_workspaces(session: AsyncSession) -> None:
+async def ensure_all_agent_workspaces(session: Session) -> None:
     """启动期补建：遍历所有 AgentApp，确保 Agent 层就位 + workspace_hash 准确。
 
     v3 重命名（原 ensure_default_agent_workspace → ensure_all_agent_workspaces）。
     """
-    apps = (await session.exec(select(AgentApp))).all()
+    apps = session.exec(select(AgentApp)).all()
     active_count = 0
     skipped_count = 0
 
@@ -750,7 +796,7 @@ async def ensure_all_agent_workspaces(session: AsyncSession) -> None:
             )
             continue
 
-    await session.commit()
+    session.commit()
     logger.info(
         "agent_workspace_bootstrap_completed",
         total=len(apps),
@@ -788,7 +834,7 @@ async def ensure_all_agent_workspaces(session: AsyncSession) -> None:
 
 # v3：真实 user_id 透传 + H1-1 缓存优化
 async def get_runtime(
-    session: AsyncSession,
+    session: Session,
     app_id: int,
     *,
     user_id: int,  # v3 必传
@@ -799,9 +845,11 @@ async def get_runtime(
         session, user_id=user_id, app_id=app_id
     )
 
-    # 2. 计算 fingerprint
-    app_cfg = await session.get(AgentApp, app_id)
-    fingerprint = compute_fingerprint(app_cfg, session)
+    # 2. 计算 fingerprint（5 输入，与 assembly.compute_fingerprint 现状签名一致，§5.3）
+    app_cfg = session.get(AgentApp, app_id)
+    fingerprint = compute_fingerprint(
+        app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint
+    )
 
     # 3. 三元组 cache key
     cache_key = (app_id, user_id, fingerprint)
@@ -899,13 +947,14 @@ def evict_runtime_cache(app_id: int, user_id: int) -> None:
 # app/services/agents/assembly.py
 
 async def compile_agent_app(
-    session: AsyncSession,
+    session: Session,
     app_cfg: AgentApp,
     *,
     user_id: int,  # v3 新增必传
 ) -> AgentAppRuntime:
     """编译 AgentApp runtime（v3 nested 路径）。"""
-    # ... 既有逻辑 ...
+    # ... 既有逻辑（v3.3：不再调用 sync_user_skills；
+    #     User 层填充由 get_runtime 前置 lazy 校验负责）...
 
     # v3 关键变更：FilesystemBackend 路径改为 nested user 层
     user_skill_root = (
@@ -921,7 +970,7 @@ async def compile_agent_app(
 # app/services/agents/assembly.py
 
 async def get_or_compile(
-    session: AsyncSession,
+    session: Session,
     app_cfg: AgentApp,
     *,
     user_id: int,  # v3 透传
@@ -931,13 +980,29 @@ async def get_or_compile(
     return await compile_agent_app(session, app_cfg, user_id=user_id)
 ```
 
+#### 6.1.5 启动预热策略（v3.3 决策）
+
+`main.py` `_warm_agent_apps` 原在启动期调用 `get_runtime` 预编译图。v3 起 `get_runtime`
+的 `user_id` 必填且 cache 按 `(app_id, user_id)` 隔离，启动期无真实用户上下文，
+原预热语义不再成立。
+
+**v3.3 决策**：
+- ✅ **移除** `_warm_agent_apps` 中的 `get_runtime` 预热调用（连同该函数一并删除）
+- ✅ lifespan 仅调用 `bootstrap.ensure_all_agent_workspaces`（Agent 层补建 + workspace_hash 校验，§5.4）
+- ✅ 首个用户请求现场编译并缓存（冷启动代价由首个请求承担，通常数秒）
+- ❌ 不引入按关联表遍历 (app, user) 对预热（启动时间随关联数线性增长，否决）
+- ❌ 不允许 `user_id=None` 跳过校验的兼容模式（违背 v3「user_id 必真实」决策，否决）
+
 ### 6.2 Test runner（`app/services/agents/test_runner.py`）
+
+> **v3.3 标注**：下方样例为 G3+ 未来形态；G2 阶段 `run_subagent_once` **不改签名**，
+> 仅 docstring 追加 MVP 限制说明（D24），维持 `materialize_into_directory` Global-only 读取。
 
 ```python
 # app/services/agents/test_runner.py
 
 async def run_subagent_once(
-    session: AsyncSession,
+    session: Session,
     subagent_cfg: SubAgentConfig,
     *,
     user_id: int,
@@ -954,24 +1019,25 @@ async def run_subagent_once(
 
 > **MVP 限制说明**：G2 阶段 test_runner 维持 Global-only；`materialize_into_combined_directory` 函数已实现（§4.3），调用方后续按需启用。
 
-### 6.3 Chatbot 调用方调整（v3 必改）
+### 6.3 Chatbot 调用方调整（v3.3 落点重定向）
+
+> **v3.3 事实修正**：`app/api/v1/chatbot.py` 已于 G1 阶段退役（空 router，无业务端点），
+> 本节原「chat 端点传 user_id」的落点不存在。
+
+**真实调用链（v3.3）**：
+1. 启动期：`main.py` lifespan 仅调用 `ensure_all_agent_workspaces`（Agent 层补建；
+   移除原 `_warm_agent_apps` 预热，§6.1.5）
+2. 请求热路径：G3 session API（`spec-g3-session.md` §12）在 session 创建 / 启动入口
+   调用 `ensure_user_workspace_up_to_date`，随后调用 `get_runtime`
+3. 首个用户请求现场编译并缓存三元组 cache（冷启动代价由首个请求承担）
 
 ```python
-# app/api/v1/chatbot.py
-
-@router.post("/chat")
-async def chat(
-    request: ChatRequest,
-    session: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user),
-) -> ChatResponse:
-    """聊天入口（v3：user_id 透传）。"""
-    runtime = await get_runtime(
-        session,
-        app_id=request.app_id,
-        user_id=current_user.id,  # v3 新增
-    )
-    # ... 既有逻辑 ...
+# G3 session API（未来形态示意；G2 阶段无 API 改动）
+runtime = await get_runtime(
+    session,
+    app_id=app_id,
+    user_id=current_user.id,  # v3 必传真实 user_id
+)
 ```
 
 ### 6.4 影响下游模块清单
@@ -1003,11 +1069,11 @@ async def chat(
 **Phase 1: skills_store 扩展**（依赖 Phase 0，不阻塞 API 层）
 - [ ] **D3**: `skills_store.py` 新增 v3 路径 helpers（`_agent_dir` / `_agent_skill_dir` / `_user_skill_dir`）
 - [ ] **D4**: `skills_store.py` 新增复制函数（`materialize_for_agent` / `materialize_to_user_combined` v3 新签名 / `materialize_into_combined_directory`）
-- [ ] **D5**: `skills_store.py` 新增 hash 工具（`_hash_compare_or_write`）+ workspace_hash 计算（`compute_workspace_hash` / `_compute_user_workspace_hash`）
-- [ ] **D6**: `skills_store.py` 新增 lazy 校验（`ensure_user_workspace_up_to_date`）
+- [ ] **D5**: `skills_store.py` 新增 hash 工具（`_hash_compare_or_write`）+ workspace_hash 计算（`compute_workspace_hash` / `_compute_user_workspace_hash` / `_compute_effective_workspace_hash` v3.3）
 - [ ] **D7**: `skills_store.py` 新增 prune（`_prune_stale_user_skills`）
 
 **Phase 2: service 层重构**（依赖 Phase 1）
+- [ ] **D6**: lazy 校验 `ensure_user_workspace_up_to_date` 实现于 `agent_apps_service.py`（v3.3 归属修订：自 Phase 1 skills_store 移入；算法见 §4.3 动态期望指纹，hash 工具由 skills_store 提供）
 - [ ] **D10**: `agent_apps_service.py` 新建（业务编排：`publish_agent_app` / `associate_user_with_app` / `delete_agent_app` / `patch_agent_app`）
 - [ ] **D11**: `agents_service.py` 新建（`list_subagent_cfgs` / `validate_subagent_skill_visibility`）
 - [ ] **D12**: `db_service.py` 新增 association CRUD（`_get_or_create_association` / `_get_association` / `_invalidate_user_layer_cache`）
@@ -1015,7 +1081,7 @@ async def chat(
 **Phase 3: API 层调整**（依赖 Phase 2）
 - [ ] **D8**: `apps.py` publish 流程新增 Global → Agent 复制步骤；`workspace_hash` 计算
 - [ ] **D9**: `apps.py` 新增 `POST /apps/{id}/associate-user/{uid}` 端点（参数校验）
-- [ ] **D23**: `chatbot.py` 调用 `get_runtime(..., user_id=current_user.id)`
+- [ ] **D23**: 落点重定向（v3.3）：`chatbot.py` 已于 G1 退役（空 router）；user_id 透传由 G3 session API 承接（§6.3）；G2 无代码改动，仅本文档记录
 - [ ] **D24**: `test_runner.py` docstring MVP 限制说明
 
 **Phase 4: runtime 层改造**（依赖 Phase 2）
@@ -1025,7 +1091,7 @@ async def chat(
 - [ ] **D18**: `assembly.py` `compute_fingerprint` 维持原签名（5 输入字段，**不纳入** workspace_hash）
 - [ ] **D19**: `runtime.py` 删除 `_COMPILE_USER_ID = "system"`
 - [ ] **D20**: `runtime.py` `_runtime_cache` 升级为三元组 `(app_id, user_id, fingerprint)` + 大小限制 + TTL
-- [ ] **D21**: `runtime.py` `get_runtime` 接受 `user_id`，调用 `ensure_user_workspace_up_to_date`
+- [ ] **D21**: `runtime.py` `get_runtime` 接受 `user_id`，调用 `ensure_user_workspace_up_to_date`；`main.py` 移除 `_warm_agent_apps` 预热（v3.3，§6.1.5）
 - [ ] **D22**: `runtime.py` cache 淘汰按 `(app_id, user_id)` 维度
 
 **Phase 5: 启动期 + 迁移脚本**（依赖 Phase 1）
@@ -1209,31 +1275,34 @@ app/services/
 # app/services/agents/agent_apps_service.py
 
 async def publish_agent_app(
-    session: AsyncSession, *, app_cfg: AgentApp, current_user_id: int
+    session: Session, *, app_cfg: AgentApp, current_user_id: int
 ) -> AgentApp: ...
 
 async def associate_user_with_app(
-    session: AsyncSession, *, user_id: int, app_id: int, current_user_id: int
+    session: Session, *, user_id: int, app_id: int, current_user_id: int
 ) -> None: ...
 
 async def disassociate_user_from_app(
-    session: AsyncSession, *, user_id: int, app_id: int, current_user_id: int
+    session: Session, *, user_id: int, app_id: int, current_user_id: int
 ) -> None: ...
 
 async def patch_agent_app(
-    session: AsyncSession, *, app_cfg: AgentApp, patch_data: dict, current_user_id: int
+    session: Session, *, app_cfg: AgentApp, patch_data: AgentAppUpdate, current_user_id: int
 ) -> AgentApp:
-    """PATCH 解读 B：published → draft，workspace_hash 清空。"""
+    """PATCH 解读 B：published → draft，workspace_hash 清空。
+
+    v3.3：patch_data 使用现状 Pydantic schema（AgentAppUpdate），非裸 dict。
+    """
     ...
 
 async def delete_agent_app(
-    session: AsyncSession, *, app_id: int, current_user_id: int
+    session: Session, *, app_id: int, current_user_id: int
 ) -> None:
     """删除 AgentApp：清理 Agent 层 + User 层 + 关联表（CASCADE 自动）。"""
     ...
 
 async def ensure_user_workspace_up_to_date(
-    session: AsyncSession, *, user_id: int, app_id: int
+    session: Session, *, user_id: int, app_id: int
 ) -> bool: ...
 ```
 
@@ -1243,11 +1312,11 @@ async def ensure_user_workspace_up_to_date(
 # app/services/agents/agents_service.py
 
 async def list_subagent_cfgs(
-    session: AsyncSession, *, app_id: int, skill_names: Sequence[str]
+    session: Session, *, app_id: int, skill_names: Sequence[str]
 ) -> list[SubAgentConfig]: ...
 
 async def validate_subagent_skill_visibility(
-    session: AsyncSession, *, app_cfg: AgentApp, subagent_cfgs: Sequence[SubAgentConfig]
+    session: Session, *, app_cfg: AgentApp, subagent_cfgs: Sequence[SubAgentConfig]
 ) -> None: ...
 ```
 
@@ -1257,15 +1326,15 @@ async def validate_subagent_skill_visibility(
 # app/services/db_service.py
 
 async def _get_or_create_association(
-    session: AsyncSession, *, user_id: int, app_id: int
+    session: Session, *, user_id: int, app_id: int
 ) -> UserAgentAppAssociation: ...
 
 async def _get_association(
-    session: AsyncSession, *, user_id: int, app_id: int
+    session: Session, *, user_id: int, app_id: int
 ) -> UserAgentAppAssociation | None: ...
 
 async def _invalidate_user_layer_cache(
-    session: AsyncSession, *, app_cfg: AgentApp
+    session: Session, *, app_cfg: AgentApp
 ) -> None:
     """publish / PATCH 后失效关联表的 last_synced_workspace_hash。"""
     ...
@@ -1368,18 +1437,18 @@ def _check_legacy_skills_root() -> None:
 
 ### 12.1 G2 提供的集成接口
 
-**签名一致性说明**：此接口签名与 §4.3（skills_store.py）和 §9.3（agent_apps_service.py）完全一致。G3 调用方无需关心内部实现位置。
+**签名一致性说明**：此接口实现于 `agent_apps_service.py`（v3.3 归属，§9.3）；算法详见 §4.3。G3 调用方无需关心内部实现位置。
 
 ```python
 # app/services/agents/agent_apps_service.py（统一入口）
 
 async def ensure_user_workspace_up_to_date(
-    session: AsyncSession, *, user_id: int, app_id: int
+    session: Session, *, user_id: int, app_id: int
 ) -> bool:
     """G3 在 session 创建 / 启动入口调用。
 
     Args:
-        session: 数据库会话（AsyncSession）
+        session: 数据库会话（SQLModel 同步 Session，v3.3 全局约定）
         user_id: 用户 ID（从 API 层 get_current_user 获取）
         app_id: AgentApp ID
 
@@ -1483,6 +1552,31 @@ async def ensure_user_workspace_up_to_date(
 | D-V3-14 | service 层拆分 | ✅ `agent_apps_service.py` + `agents_service.py` |
 | D-V3-15 | 兼容 `SKILLS_ROOT` | ✅ 保留 1 个大版本 |
 
+### 13.4 v3.3 实现期澄清决策（实现前固化，编码只认本节）
+
+> 产生背景：v3.2 伪代码与代码库现状 / 评审文档存在冲突，实现前经用户逐项澄清确认。
+
+#### A. 用户澄清的 4 项主决策
+
+| # | 议题 | v3.3 决策 | 影响 |
+|---|---|---|---|
+| C-1 | Session 类型 | ✅ SQLModel 同步 `Session`（全文伪代码已同步）；原 `AsyncSession` 为示意笔误 | 不迁移 asyncpg；G2 范围内零引擎变更 |
+| C-2 | 启动预热策略 | ✅ 移除 `main.py` `_warm_agent_apps` 的 get_runtime 预热；lifespan 仅调 `ensure_all_agent_workspaces`（§6.1.5） | 首个请求承担编译冷启动代价 |
+| C-3 | lazy 比对算法 | ✅ 动态期望指纹（`_compute_effective_workspace_hash` 聚合 Agent+Global 期望源 vs User 层实际指纹，§4.3）；bool 返回 + 静默 False 语义保留 | 修复「SubAgent 外部 skill 导致永不相等」缺陷；支持目录丢失自愈 |
+| C-4 | User 层填充时机 | ✅ `compile_agent_app` 删除 `sync_user_skills` 调用（§6.1.3）；填充统一由 get_runtime 前置 lazy 校验负责 | 编译函数纯化；`sync_user_skills` 保留为历史兼容 |
+
+#### B. 次级声明（spec 内部冲突取舍）
+
+| # | 议题 | v3.3 取舍 |
+|---|---|---|
+| S-1 | `ensure_user_workspace_up_to_date` 实现位置 | `agent_apps_service.py`（§9.3 权威；D6 归属同步修订，避免 skills_store ↔ agents_service 循环依赖） |
+| S-2 | `get_runtime` 签名 | `(session, app_id: int, *, user_id: int)`（§6.1）；删除 `_resolve_agent_app` 的 `"system-default"` 占位符解析 |
+| S-3 | `run_subagent_once` | G2 不改签名，仅 docstring 补 MVP 限制（D24；§6.2 样例为 G3+ 未来形态） |
+| S-4 | `patch_agent_app` patch_data 类型 | 现状 Pydantic schema（`AgentAppUpdate`），非裸 dict |
+| S-5 | `db_service.py` 函数命名 | 按 §9.5 下划线名（`_get_or_create_association` 等） |
+| S-6 | `agent_dir` / association 表字段 | `String(255)`；按 §3.4（`associated_at`） |
+| S-7 | `compute_fingerprint` 签名 | 维持现状 5 输入（§5.3 伪代码已修正对齐） |
+
 ---
 
 ## 附录 A：变更影响总览
@@ -1569,7 +1663,7 @@ async def ensure_user_workspace_up_to_date(
 
 ---
 
-**文档版本**：v3 修订版（2026-08-26）
+**文档版本**：v3.3 修订版（2026-08-26）
 **审查方法**：分阶段逐项（6 项）；每项落盘后进入下一项
 **审查记录**：`spec-g2-review.md`（2967 行；62 项关键决策 + 4 项否决）
 **下一步**：按 §7 DoD 顺序实施（Phase 0-7），详见 `spec-g2-review.md` §7.2 交付清单

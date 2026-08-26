@@ -64,6 +64,7 @@ def settings_isolation(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Genera
     """Point mutable settings at test-local values (zero network side effects)."""
     monkeypatch.setattr(settings, "SESSION_NAMING_ENABLED", False)
     monkeypatch.setattr(settings, "LANGFUSE_TRACING_ENABLED", False)
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setattr(settings, "SKILLS_ROOT", str(tmp_path / "skills"))
     yield
 

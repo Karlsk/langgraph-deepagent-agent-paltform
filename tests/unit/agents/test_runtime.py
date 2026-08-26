@@ -89,10 +89,11 @@ def clean_caches() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def skills_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect settings.SKILLS_ROOT into an isolated tmp directory."""
-    root = tmp_path / "skills"
-    monkeypatch.setattr(settings, "SKILLS_ROOT", str(root))
+def workspace_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect workspace roots (DATA_ROOT + legacy SKILLS_ROOT) into tmp."""
+    root = tmp_path / "data"
+    monkeypatch.setattr(settings, "DATA_ROOT", str(root))
+    monkeypatch.setattr(settings, "SKILLS_ROOT", str(root / "skills"))
     return root
 
 
