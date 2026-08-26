@@ -165,9 +165,14 @@ def _agent_skill_file(app_id: int, name: str) -> Path:
     return _agent_skill_dir(app_id) / _validate_skill_name(name) / _SKILL_FILE_NAME
 
 
+def _user_dir(app_id: int, user_id: int) -> Path:
+    """Return the per-(app, user) workspace root: ``{DATA_ROOT}/agents/<app_id>/users/<user_id>``."""
+    return _agent_dir(app_id) / "users" / str(user_id)
+
+
 def _user_skill_dir(app_id: int, user_id: int) -> Path:
-    """Return the User-layer skills dir: ``{DATA_ROOT}/agents/<app_id>/users/<user_id>/skills``."""
-    return _agent_dir(app_id) / "users" / str(user_id) / "skills"
+    """Return the User-layer skills dir: ``{_user_dir(app_id, user_id)}/skills``."""
+    return _user_dir(app_id, user_id) / "skills"
 
 
 def _user_skill_file(app_id: int, user_id: int, name: str) -> Path:

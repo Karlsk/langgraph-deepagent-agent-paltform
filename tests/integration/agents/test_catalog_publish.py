@@ -12,6 +12,7 @@ endpoint.
 """
 
 import asyncio
+import os
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session as DBSession
 
 from app.core.config import settings
+from app.models.user import User
 from app.services.agents import assembly
 from app.services.agents import runtime as runtime_module
 from tests.conftest import unwrap
@@ -153,15 +155,18 @@ def test_agent_app_publish_chain_with_skill_subagent_and_mcp_tool(
 
 def test_skill_content_refreshed_on_reassembly(
     client: TestClient,
+    user: User,
     user_headers: dict[str, str],
     scripted_model: Any,
     memory_checkpointer: Any,
     db_engine: Any,
 ) -> None:
-    """Updating a global skill changes the user copy after the next assembly.
+    """Republishing a skill edit refreshes the user copy on the next runtime call.
 
-    Phase 1 G1: assembly is triggered via ``get_runtime`` (the same compile
-    seam the retired chat endpoint used), not via ``POST /chatbot/chat``.
+    G2 v3.3 chain: publish snapshots the skill into the Agent layer; the
+    associate endpoint builds the combined User layer; a later skill edit +
+    republish changes the Agent layer, and the next ``get_runtime`` lazy
+    validation resyncs the User layer to the new content.
     """
     headers = user_headers
     skill = client.post(
@@ -179,24 +184,25 @@ def test_skill_content_refreshed_on_reassembly(
     assert app.status_code == 201, app.text
     app_id = unwrap(app, expected_code=201)["id"]
     assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
+    assert client.post(f"{API}/apps/{app_id}/associate-user/{user.id}", headers=headers).status_code == 200
 
-    # First compile materialises the user copy carrying version-1.
-    with DBSession(db_engine) as db_session:
-        asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
-
-    user_copy = f"{settings.DATA_ROOT}/users/system/style-guide/SKILL.md"
+    user_copy = os.path.join(
+        settings.DATA_ROOT, "agents", str(app_id), "users", str(user.id), "skills", "style-guide", "SKILL.md"
+    )
     with open(user_copy, encoding="utf-8") as handle:
         assert "version-1" in handle.read()
 
-    # Update the global skill; the next compile re-materializes the copy.
+    # Edit the skill, then republish so the Agent layer snapshot is refreshed.
     updated = client.patch(f"{API}/skills/style-guide", json={"body": "# style-guide\n\nversion-2\n"}, headers=headers)
     assert updated.status_code == 200, updated.text
+    assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
 
-    # Clear caches to model a restart, then compile again (reassembly path).
+    # Clear caches to model a restart; the next get_runtime lazily resyncs the
+    # user layer because the expected fingerprint no longer matches.
     assembly.clear_compile_cache()
     runtime_module.clear_runtime_cache()
 
     with DBSession(db_engine) as db_session:
-        asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
+        asyncio.run(runtime_module.get_runtime(db_session, app_id, user_id=user.id))
     with open(user_copy, encoding="utf-8") as handle:
         assert "version-2" in handle.read()

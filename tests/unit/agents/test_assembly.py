@@ -27,7 +27,7 @@ from app.core.config import settings
 from app.core.metrics import agent_graph_cache_hits_total
 from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
-from app.services.agents import assembly
+from app.services.agents import assembly, skills_store
 
 pytestmark = pytest.mark.unit
 
@@ -313,9 +313,9 @@ def test_build_subagent_spec_skill_names_none_inherits_parent_skills() -> None:
         parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
-        parent_skills=["/pdf-export", "/csv-clean"],
+        parent_skills=["/skills/pdf-export", "/skills/csv-clean"],
     )
-    assert spec.get("skills") == ["/pdf-export", "/csv-clean"]
+    assert spec.get("skills") == ["/skills/pdf-export", "/skills/csv-clean"]
 
 
 def test_build_subagent_spec_skill_names_empty_overrides_to_no_skills() -> None:
@@ -325,21 +325,21 @@ def test_build_subagent_spec_skill_names_empty_overrides_to_no_skills() -> None:
         parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
-        parent_skills=["/pdf-export", "/csv-clean"],
+        parent_skills=["/skills/pdf-export", "/skills/csv-clean"],
     )
     assert "skills" not in spec
 
 
 def test_build_subagent_spec_skill_names_explicit_whitelist_prefixes_slash() -> None:
-    """Explicit ``skill_names=[..]`` is materialised as ``["/<name>", ...]``."""
+    """Explicit ``skill_names=[..]`` is materialised as ``["/skills/<name>", ...]``."""
     spec = assembly.build_subagent_spec(
         _make_subagent(skill_names=["pdf-export"]),
         parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
-        parent_skills=["/csv-clean"],
+        parent_skills=["/skills/csv-clean"],
     )
-    assert spec.get("skills") == ["/pdf-export"]
+    assert spec.get("skills") == ["/skills/pdf-export"]
 
 
 def test_build_subagent_spec_default_parent_skills_empty_when_omitted() -> None:
@@ -396,10 +396,10 @@ def test_max_turns_gate_stops_looping_subagent(
 
         graph = asyncio.run(
             assembly.compile_agent_app(
+                object(),
                 app_cfg,
                 subagent_cfgs=[sub_cfg],
-                user_id="user-1",
-                session=object(),
+                user_id=1,
                 checkpointer=MemorySaver(),
             )
         )
@@ -604,8 +604,9 @@ def test_get_or_compile_with_checkpointer_caches(
 def test_compile_agent_app_end_to_end_with_memory_injection(
     workspace_root: Path, mock_catalog: list[dict[str, Any]], mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One-turn ainvoke succeeds, syncs skills and injects the memory section."""
-    # Global skill on disk so sync_user_skills can copy it for the user.
+    """One-turn ainvoke succeeds and injects the memory section."""
+    # Global skill on disk (G2 v3.3: compile no longer copies it anywhere —
+    # the User layer is filled by the lazy validation before get_runtime).
     skill_dir = workspace_root / "global" / "skills" / "greet"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
@@ -619,16 +620,17 @@ def test_compile_agent_app_end_to_end_with_memory_injection(
     app_cfg = _make_app(skill_names=["greet"])
     graph = asyncio.run(
         assembly.compile_agent_app(
+            object(),
             app_cfg,
             subagent_cfgs=[],
-            user_id="user-42",
-            session=object(),
+            user_id=42,
             checkpointer=MemorySaver(),
         )
     )
 
-    # Skills were synced into the per-user directory.
-    assert (workspace_root / "users" / "user-42" / "greet" / "SKILL.md").exists()
+    # G2 v3.3 (澄清 4): compile no longer materialises the User layer — the
+    # lazy validation in front of runtime.get_runtime owns the refill.
+    assert not list(workspace_root.rglob("users/*/greet/SKILL.md"))
 
     result = asyncio.run(
         graph.ainvoke(
@@ -672,10 +674,10 @@ def test_compile_agent_app_injects_username_time_and_memory_fallback_per_turn(
     app_cfg = _make_app()
     graph = asyncio.run(
         assembly.compile_agent_app(
+            object(),
             app_cfg,
             subagent_cfgs=[],
-            user_id="user-77",
-            session=object(),
+            user_id=77,
             checkpointer=MemorySaver(),
         )
     )
@@ -702,3 +704,108 @@ def test_compile_agent_app_injects_username_time_and_memory_fallback_per_turn(
     # Current date and time reflect the request moment (not DB bootstrap time).
     assert "# Current date and time" in system_text
     assert str(datetime.now().year) in system_text
+
+
+# ---------------------------------------------------------------------------
+# G2 workspace compilation (spec-g2-workspace v3.3 §8.1.3, D15/D16/D18)
+# ---------------------------------------------------------------------------
+
+
+def _compile_with_recording_backend(
+    monkeypatch: pytest.MonkeyPatch, app_cfg: AgentApp, user_id: int
+) -> str:
+    """Compile an app while capturing the FilesystemBackend root_dir (D15)."""
+    captured: dict[str, str] = {}
+    real_backend = assembly.FilesystemBackend
+
+    class RecordingBackend(real_backend):  # type: ignore[misc,valid-type]
+        def __init__(self, root_dir: str) -> None:
+            captured["root_dir"] = root_dir
+            super().__init__(root_dir=root_dir)
+
+    monkeypatch.setattr(assembly, "FilesystemBackend", RecordingBackend)
+    _patch_llm_seams(monkeypatch, {"default": ScriptedChatModel(responses=[AIMessage(content="ok")])})
+    asyncio.run(
+        assembly.compile_agent_app(
+            object(),
+            app_cfg,
+            subagent_cfgs=[],
+            user_id=user_id,
+            checkpointer=MemorySaver(),
+        )
+    )
+    return captured["root_dir"]
+
+
+def test_compile_agent_app_user_skill_root_nested(
+    workspace_root: Path, mock_catalog: Any, mock_memory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D15: the backend roots at the per-(app, user) workspace root."""
+    app_cfg = _make_app()
+    app_cfg.id = 3
+    root = _compile_with_recording_backend(monkeypatch, app_cfg, user_id=9)
+    assert root == str(workspace_root / "agents" / "3" / "users" / "9")
+
+
+def test_compile_agent_app_passes_user_id_to_backend(
+    workspace_root: Path, mock_catalog: Any, mock_memory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D16: the int user_id threads through into per-user backend roots."""
+    app_cfg = _make_app()
+    app_cfg.id = 11
+    root_a = _compile_with_recording_backend(monkeypatch, app_cfg, user_id=42)
+    root_b = _compile_with_recording_backend(monkeypatch, app_cfg, user_id=43)
+    assert root_a != root_b
+    assert root_a.endswith("/agents/11/users/42")
+    assert root_b.endswith("/agents/11/users/43")
+
+
+def test_compile_agent_app_skills_mount_matches_physical_user_layer(
+    workspace_root: Path, mock_catalog: Any, mock_memory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D15: the virtual "/skills/<name>" mount resolves to the §2.1 physical files.
+
+    backend.root_dir is the per-(app, user) workspace root and skills mount
+    at "/skills/<name>", so the resolved path must equal
+    ``skills_store._user_skill_file(...)`` — the exact file the associate
+    endpoint and the lazy validation materialise.
+    """
+    app_cfg = _make_app(skill_names=["greet"])
+    app_cfg.id = 6
+    captured: dict[str, Any] = {}
+
+    real_backend = assembly.FilesystemBackend
+
+    class RecordingBackend(real_backend):  # type: ignore[misc,valid-type]
+        def __init__(self, root_dir: str) -> None:
+            captured["root_dir"] = root_dir
+            super().__init__(root_dir=root_dir)
+
+    real_create = assembly.create_deep_agent
+
+    def recording_create(**kwargs: Any) -> Any:
+        captured["skills"] = kwargs.get("skills")
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(assembly, "FilesystemBackend", RecordingBackend)
+    monkeypatch.setattr(assembly, "create_deep_agent", recording_create)
+    _patch_llm_seams(monkeypatch, {"default": ScriptedChatModel(responses=[AIMessage(content="ok")])})
+
+    asyncio.run(
+        assembly.compile_agent_app(object(), app_cfg, subagent_cfgs=[], user_id=9, checkpointer=MemorySaver())
+    )
+
+    assert captured["skills"] == ["/skills/greet"]
+    root = Path(captured["root_dir"])
+    assert root == workspace_root / "agents" / "6" / "users" / "9"
+    assert root / "skills" / "greet" / "SKILL.md" == skills_store._user_skill_file(6, 9, "greet")  # noqa: SLF001
+
+
+def test_compute_fingerprint_no_workspace_hash() -> None:
+    """D18: workspace_hash / agent_dir do not participate in compute_fingerprint."""
+    base = _make_app()
+    with_hash_a = base.model_copy(update={"workspace_hash": "hash-aaa"})
+    with_hash_b = base.model_copy(update={"workspace_hash": "hash-bbb", "agent_dir": "/srv/other"})
+    fingerprint_a = assembly.compute_fingerprint(with_hash_a, [], {}, "", "")
+    fingerprint_b = assembly.compute_fingerprint(with_hash_b, [], {}, "", "")
+    assert fingerprint_a == fingerprint_b

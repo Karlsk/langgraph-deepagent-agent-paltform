@@ -6,7 +6,6 @@ of blocking), and the compile of every published app. All external services
 (cache, long-term memory, checkpointer, LLM, MCP) are faked or neutralized.
 """
 
-import asyncio
 import importlib
 import sys
 from typing import Any
@@ -103,7 +102,7 @@ def test_lifespan_shutdown_closes_shared_checkpoint_pool(monkeypatch: pytest.Mon
     monkeypatch.setattr(memory_service, "initialize", AsyncMock(return_value=None))
 
     main_module = importlib.import_module("app.main")
-    monkeypatch.setattr(main_module, "_warm_agent_apps", AsyncMock(return_value=None))
+    monkeypatch.setattr(main_module, "ensure_all_agent_workspaces", AsyncMock(return_value=None))
     monkeypatch.setattr(main_module, "shutdown_mcp_clients", AsyncMock(return_value=None))
 
     pool_mock = AsyncMock()
@@ -122,7 +121,7 @@ def test_lifespan_shutdown_survives_missing_pool(db_engine: Any, monkeypatch: py
     monkeypatch.setattr(memory_service, "initialize", AsyncMock(return_value=None))
 
     main_module = importlib.import_module("app.main")
-    monkeypatch.setattr(main_module, "_warm_agent_apps", AsyncMock(return_value=None))
+    monkeypatch.setattr(main_module, "ensure_all_agent_workspaces", AsyncMock(return_value=None))
     monkeypatch.setattr(main_module, "shutdown_mcp_clients", AsyncMock(return_value=None))
     monkeypatch.setattr(main_module, "get_shared_connection_pool", AsyncMock(return_value=None))
 
@@ -130,28 +129,22 @@ def test_lifespan_shutdown_survives_missing_pool(db_engine: Any, monkeypatch: py
         assert test_client.get("/health").status_code == 200
 
 
-def test_warm_agent_apps_uses_independent_sessions(db_engine: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each concurrent warm task owns its own DBSession (no shared session across awaits)."""
-    rows = [
-        AgentApp(name=f"warm-{i}", system_prompt="prompt", engine="deepagents", status="published") for i in range(2)
-    ]
-    with DBSession(db_engine) as db_session:
-        for row in rows:
-            db_session.add(row)
-        db_session.commit()
-
+def test_warm_agent_apps_removed_and_workspaces_bootstrapped(
+    db_engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§6.1.5: ``_warm_agent_apps`` is gone; lifespan bootstraps workspaces instead."""
     main_module = importlib.import_module("app.main")
-    monkeypatch.setattr(main_module, "ensure_default_agent_app", AsyncMock(return_value=None))
-    monkeypatch.setattr(main_module, "get_mcp_tools", AsyncMock(return_value=[]))
+    assert not hasattr(main_module, "_warm_agent_apps")
 
-    captured: list[Any] = []
+    monkeypatch.setattr(cache_service, "initialize", AsyncMock(return_value=None))
+    monkeypatch.setattr(cache_service, "close", AsyncMock(return_value=None))
+    monkeypatch.setattr(memory_service, "initialize", AsyncMock(return_value=None))
 
-    async def fake_get_runtime(session: Any, app_id: str) -> None:
-        captured.append(session)
+    bootstrap_spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(main_module, "ensure_all_agent_workspaces", bootstrap_spy)
+    monkeypatch.setattr(main_module, "shutdown_mcp_clients", AsyncMock(return_value=None))
 
-    monkeypatch.setattr(main_module, "get_runtime", fake_get_runtime)
+    with TestClient(main_module.app):
+        pass  # startup + shutdown run the real lifespan
 
-    asyncio.run(main_module._warm_agent_apps())  # noqa: SLF001 — unit under test
-
-    assert len(captured) == 2
-    assert captured[0] is not captured[1]  # no shared Session across tasks
+    bootstrap_spy.assert_awaited_once()

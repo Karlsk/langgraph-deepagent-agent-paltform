@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage
 from sqlmodel import Session as DBSession
 
 from app.core.config import settings
+from app.models.user import User
 from app.services.agents import assembly
 from app.services.agents import runtime as runtime_module
 from tests.conftest import unwrap
@@ -125,20 +126,22 @@ def test_subagent_test_run_persists_queryable_trace(
 
 def test_skill_delete_cascades_user_copies(
     client: TestClient,
+    user: User,
     user_headers: dict[str, str],
     scripted_model: Any,
     memory_checkpointer: Any,
     db_engine: Any,
 ) -> None:
-    """Deleting a global skill removes the per-user copies created by assembly.
+    """Deleting a global skill is reference-protected and cleans the global tree.
 
-    Exercises both halves of the new reference-protection contract:
+    G2 v3.3: the per-user copy lives in the nested User layer
+    ``{DATA_ROOT}/agents/<app_id>/users/<uid>/skills/<name>`` and is created
+    by the associate endpoint (publish materializes the Agent layer only).
+
+    Exercises the reference-protection contract:
     1. Bound to an AgentApp -> DELETE returns 422 listing the reference;
     2. Unbind via PATCH (workaround path, still supported), DELETE succeeds,
-       and per-user copies / global directory are wiped.
-
-    Phase 1 G1: assembly is triggered via ``get_runtime`` (the retired chat
-    endpoint's compile seam) instead of ``POST /chatbot/chat``.
+       and the global directory is wiped.
     """
     headers = user_headers  # Phase 1 G1: user access token authenticates directly
     skill = client.post(
@@ -148,7 +151,8 @@ def test_skill_delete_cascades_user_copies(
     )
     assert skill.status_code == 201, skill.text
 
-    # Publish an app bound to the skill and compile once so assembly copies it.
+    # Publish an app bound to the skill (Agent layer) and associate the user
+    # (combined User layer) so the nested per-user copy exists.
     app = client.post(
         f"{API}/apps",
         json={"name": "doomed-app", "system_prompt": "You are doomed.", "skill_names": ["doomed-skill"]},
@@ -157,12 +161,17 @@ def test_skill_delete_cascades_user_copies(
     assert app.status_code == 201, app.text
     app_id = unwrap(app, expected_code=201)["id"]
     assert client.post(f"{API}/apps/{app_id}/publish", headers=headers).status_code == 200
+    assert (
+        client.post(f"{API}/apps/{app_id}/associate-user/{user.id}", headers=headers).status_code == 200
+    )
 
     with DBSession(db_engine) as db_session:
-        asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
+        asyncio.run(runtime_module.get_runtime(db_session, app_id, user_id=user.id))
 
-    user_copy_dir = os.path.join(settings.DATA_ROOT, "users", "system", "doomed-skill")
-    assert os.path.isfile(os.path.join(user_copy_dir, "SKILL.md"))
+    user_copy = os.path.join(
+        settings.DATA_ROOT, "agents", str(app_id), "users", str(user.id), "skills", "doomed-skill", "SKILL.md"
+    )
+    assert os.path.isfile(user_copy)
 
     # Reference-protection path: skill still bound to the app -> DELETE is rejected (422).
     blocked = client.delete(f"{API}/skills/doomed-skill", headers=headers)
@@ -172,13 +181,14 @@ def test_skill_delete_cascades_user_copies(
     assert "doomed-skill" in blocked_body["message"]
     assert "doomed-app" in blocked_body["message"]
 
-    # Unbind the skill from the app, then DELETE succeeds and cascade cleans both copies.
+    # Unbind the skill from the app, then DELETE succeeds and cleans the global tree.
     assert client.patch(f"{API}/apps/{app_id}", json={"skill_names": []}, headers=headers).status_code == 200
     deleted = client.delete(f"{API}/skills/doomed-skill", headers=headers)
     assert deleted.status_code == 200, deleted.text
 
-    assert not os.path.exists(user_copy_dir)
     assert not os.path.isdir(os.path.join(settings.DATA_ROOT, "global", "skills", "doomed-skill"))
+    # The retired sync_user_skills path (top-level {DATA_ROOT}/users) stays untouched.
+    assert not os.path.isdir(os.path.join(settings.DATA_ROOT, "users", "system"))
 
 
 # ---------------------------------------------------------------------------

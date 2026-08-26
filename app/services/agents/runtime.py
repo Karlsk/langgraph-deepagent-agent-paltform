@@ -58,7 +58,6 @@ from app.core.logging import logger
 from app.core.metrics import llm_inference_duration_seconds, subagent_task_duration_seconds
 from app.core.observability import langfuse_callback_handler
 from app.models.agent_assets import (
-    DEFAULT_AGENT_APP_ID,
     AgentApp,
     SkillAsset,
     SubAgentConfig,
@@ -66,24 +65,11 @@ from app.models.agent_assets import (
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.schemas import Message
 from app.services.agents import assembly
-from app.services.agents.bootstrap import ensure_default_agent_app
 from app.services.agents.mcp_manager import load_mcp_servers
 from app.services.llm.llm_store import compute_model_config_hash, parse_model_ref
 from app.services.memory import memory_service
 from app.utils import dump_messages, extract_text_content
 
-_DEFAULT_APP_NAME = "default"
-# Runtimes are shared across requests, so compilation uses a fixed pseudo-user
-# for the per-user skills directory (skill materialization is per-app here).
-#
-# Phase-1 deviation (documented, intentional): all assets are globally shared
-# and there is no per-user permission isolation yet, so skill materialization
-# uniformly lands under ``{SKILLS_ROOT}/users/system/`` for every request.
-# Phase-2 upgrade path: once per-user asset ownership exists, thread the real
-# requesting user id through ``get_runtime`` -> ``get_or_compile`` so each
-# user's skills materialize under ``users/<user_id>/`` and the compile cache
-# key gains a user dimension.
-_COMPILE_USER_ID = "system"
 _INTERRUPT_FALLBACK_TEXT = "Waiting for input."
 
 # Strong references to fire-and-forget memory write-back tasks (prevents GC
@@ -558,8 +544,24 @@ class WorkflowAppRuntime(AgentAppRuntime):
 # Runtime resolution, fingerprint cache and HIL degradation
 # ---------------------------------------------------------------------------
 
-# Process-level runtime cache keyed by (AgentApp.id, config fingerprint).
-_runtime_cache: dict[tuple[int, str], AgentAppRuntime] = {}
+# Process-level runtime cache bounds (spec-g2-workspace v3.3 §6.1.2).
+_RUNTIME_CACHE_MAX_SIZE = 1000  # entries; the least recently used one is evicted
+_RUNTIME_CACHE_TTL = 3600  # seconds; older entries are evicted as stale
+
+
+@dataclass
+class _CacheEntry:
+    """One cached runtime with its TTL/LRU timestamps (spec §6.1.2)."""
+
+    runtime: AgentAppRuntime
+    created_at: float  # time.time()
+    last_accessed: float  # time.time() — LRU basis
+
+
+# G2 v3 (spec §6.1.2): keyed by the (app_id, user_id, fingerprint) triple.
+# The compiled graph embeds a per-user FilesystemBackend, so entries of
+# different users must never alias.
+_runtime_cache: dict[tuple[int, int, str], _CacheEntry] = {}
 
 
 def clear_runtime_cache() -> None:
@@ -567,39 +569,47 @@ def clear_runtime_cache() -> None:
     _runtime_cache.clear()
 
 
-async def _resolve_agent_app(session: Session, agent_app_id: Optional[str]) -> AgentApp:
-    """Resolve a session-stored agent_app_id to the AgentApp row.
+def _evict_stale_entries() -> None:
+    """Evict entries older than the TTL (spec §6.1.2, H1-1)."""
+    now = time.time()
+    stale_keys = [key for key, entry in _runtime_cache.items() if now - entry.created_at > _RUNTIME_CACHE_TTL]
+    for key in stale_keys:
+        del _runtime_cache[key]
 
-    ``None`` or the ``"system-default"`` placeholder both load the system
-    default app (``name="default"``); any other value is parsed as the int
-    AgentApp primary key. When the default row is missing it is lazily
-    (re)created via ``ensure_default_agent_app`` so a failed startup
-    bootstrap cannot permanently break chat until restart.
+
+def _evict_oldest_if_full() -> None:
+    """Evict the least recently accessed entry once the cache is at capacity."""
+    if len(_runtime_cache) >= _RUNTIME_CACHE_MAX_SIZE:
+        oldest_key = min(_runtime_cache, key=lambda k: _runtime_cache[k].last_accessed)
+        del _runtime_cache[oldest_key]
+
+
+def evict_runtime_cache(app_id: int, user_id: int) -> None:
+    """Evict every cached runtime of one (app_id, user_id) pair (spec §6.1.2)."""
+    for stale_key in [key for key in _runtime_cache if key[0] == app_id and key[1] == user_id]:
+        del _runtime_cache[stale_key]
+
+
+async def _load_agent_app(session: Session, app_id: int) -> AgentApp:
+    """Load the AgentApp row by its integer primary key (G2 v3.3 §6.1.1).
+
+    The ``"system-default"`` placeholder / NULL resolution is gone: callers
+    pass the real ``AgentApp.id`` int (legacy session rows were already
+    backfilled to the concrete id).
 
     Args:
         session: SQLModel database session.
-        agent_app_id: Raw session value (str of AgentApp.id, placeholder, None).
+        app_id: AgentApp integer primary key.
 
     Returns:
         The AgentApp row (status NOT checked here).
 
     Raises:
-        ValueError: When the id is unparseable or the row does not exist.
+        ValueError: When the row does not exist.
     """
-    if agent_app_id is None or agent_app_id == DEFAULT_AGENT_APP_ID:
-        app_cfg = session.exec(select(AgentApp).where(col(AgentApp.name) == _DEFAULT_APP_NAME)).first()
-        if app_cfg is None:
-            logger.warning("default_agent_app_missing_lazy_bootstrap")
-            app_cfg = await ensure_default_agent_app(session)
-        return app_cfg
-
-    try:
-        app_pk = int(agent_app_id)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid agent_app_id: {agent_app_id!r}")
-    app_cfg = session.get(AgentApp, app_pk)
+    app_cfg = session.get(AgentApp, app_id)
     if app_cfg is None:
-        raise ValueError(f"agent app {app_pk} not found")
+        raise ValueError(f"agent app {app_id} not found")
     return app_cfg
 
 
@@ -735,16 +745,20 @@ async def _build_checkpointer() -> BaseCheckpointSaver | None:
     return checkpointer
 
 
-async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentAppRuntime:
-    """Load, compile (cached) and return the runtime for an AgentApp.
+async def get_runtime(session: Session, app_id: int, *, user_id: int) -> AgentAppRuntime:
+    """Load, validate and return the AgentApp runtime for one user.
 
-    Data-consistency contract: ``session.agent_app_id`` stores ``str(AgentApp.id)``;
-    legacy rows carry the ``"system-default"`` placeholder (or NULL) which both
-    resolve to the ``name="default"`` system app created by ``bootstrap``.
+    G2 v3.3 (spec-g2-workspace §6.1.1): the runtime is isolated per
+    ``(app_id, user_id)``. Every call first runs the lazy user-layer
+    validation (``agent_apps_service.ensure_user_workspace_up_to_date``,
+    refilling the nested User workspace), then resolves the 5-input config
+    fingerprint and serves the ``(app_id, user_id, fingerprint)`` triple from
+    the TTL+LRU bounded cache (§6.1.2).
 
     Args:
         session: SQLModel database session.
-        agent_app_id: Raw session value (see ``_resolve_agent_app``).
+        app_id: AgentApp integer primary key (no placeholder resolution).
+        user_id: User whose nested workspace backs the skills backend.
 
     Returns:
         The cached or freshly built AgentAppRuntime.
@@ -754,9 +768,16 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
             unknown (anything other than ``deepagents``/``workflow``), or a
             referenced model config is missing/disabled.
     """
-    app_cfg = await _resolve_agent_app(session, agent_app_id)
+    # Local import: agent_apps_service imports this module at top level.
+    from app.services.agents import agent_apps_service
+
+    app_cfg = await _load_agent_app(session, app_id)
     if app_cfg.status != "published":
         raise ValueError(f"agent app {app_cfg.name!r} is not published (status={app_cfg.status})")
+
+    # Lazy user-layer validation (D21): refill the nested User workspace
+    # before any compile reads it; silently no-ops for unassociated users.
+    await agent_apps_service.ensure_user_workspace_up_to_date(session, user_id=user_id, app_id=app_id)
 
     subagent_cfgs = _load_subagents(session, app_cfg.subagent_names)
     skill_hashes = await _load_skill_hashes(session, app_cfg.skill_names, subagent_cfgs)
@@ -766,10 +787,13 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
         app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint
     )
 
-    cached = _runtime_cache.get((app_cfg.id, fingerprint))
+    cache_key = (app_id, user_id, fingerprint)
+    cached = _runtime_cache.get(cache_key)
     if cached is not None:
-        logger.debug("agent_app_runtime_cache_hit", app_name=app_cfg.name, app_id=app_cfg.id)
-        return cached
+        # Refresh the LRU timestamp on every hit (spec §6.1.2).
+        cached.last_accessed = time.time()
+        logger.debug("agent_app_runtime_cache_hit", app_name=app_cfg.name, app_id=app_id, user_id=user_id)
+        return cached.runtime
 
     checkpointer = await _build_checkpointer()
 
@@ -783,13 +807,13 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
             compile_cfg = app_cfg.model_copy(update={"interrupt_on": {}})
             degraded = True
         graph = await assembly.get_or_compile(
+            session,
             compile_cfg,
             subagent_cfgs=subagent_cfgs,
             skill_hashes=skill_hashes,
             mcp_fingerprint=mcp_fingerprint,
             model_fingerprint=model_fingerprint,
-            user_id=_COMPILE_USER_ID,
-            session=session,
+            user_id=user_id,
             checkpointer=checkpointer,
         )
         runtime_obj: AgentAppRuntime = DeepAgentsAppRuntime(
@@ -809,10 +833,14 @@ async def get_runtime(session: Session, agent_app_id: Optional[str]) -> AgentApp
         logger.debug("agent_app_runtime_not_cached_degraded", app_name=app_cfg.name, app_id=app_cfg.id)
         return runtime_obj
 
-    # Evict stale fingerprints of this app before caching the fresh runtime
-    # (keeps the cache bounded without an LRU dependency).
-    for stale_key in [key for key in _runtime_cache if key[0] == app_cfg.id]:
+    _evict_stale_entries()
+    _evict_oldest_if_full()
+    now = time.time()
+    _runtime_cache[cache_key] = _CacheEntry(runtime=runtime_obj, created_at=now, last_accessed=now)
+
+    # Evict stale fingerprints of the same (app_id, user_id) pair (D22):
+    # the cache keeps one runtime per user per app.
+    for stale_key in [key for key in _runtime_cache if key[0] == app_id and key[1] == user_id and key != cache_key]:
         del _runtime_cache[stale_key]
-    _runtime_cache[(app_cfg.id, fingerprint)] = runtime_obj
-    logger.info("agent_app_runtime_ready", app_name=app_cfg.name, app_id=app_cfg.id, engine=app_cfg.engine)
+    logger.info("agent_app_runtime_ready", app_name=app_cfg.name, app_id=app_cfg.id, user_id=user_id, engine=app_cfg.engine)
     return runtime_obj

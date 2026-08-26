@@ -502,6 +502,7 @@ def test_three_layer_path_helpers(data_root: Path) -> None:
     assert skills_store._agent_skill_file(7, "greet") == (
         data_root / "agents" / "7" / "skills" / "greet" / "SKILL.md"
     )
+    assert skills_store._user_dir(7, 42) == data_root / "agents" / "7" / "users" / "42"
     assert skills_store._user_skill_dir(7, 42) == (
         data_root / "agents" / "7" / "users" / "42" / "skills"
     )

@@ -1,6 +1,5 @@
 """This file contains the main application entry point."""
 
-import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -15,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from asgi_correlation_id import CorrelationIdMiddleware
@@ -39,10 +38,8 @@ from app.core.middleware import (
     ProfilingMiddleware,
 )
 from app.core.observability import langfuse_init
-from app.models.agent_assets import AgentApp
-from app.services.agents.bootstrap import ensure_default_agent_app
+from app.services.agents.bootstrap import ensure_all_agent_workspaces, ensure_default_agent_app
 from app.services.agents.mcp_manager import get_mcp_tools, shutdown_mcp_clients
-from app.services.agents.runtime import get_runtime
 from app.services.database import database_service
 from app.services.memory import memory_service
 from app.workflow.cli import DEFAULT_CONFIG_DIR, build_registry
@@ -50,38 +47,6 @@ from app.workflow.cli import DEFAULT_CONFIG_DIR, build_registry
 # Load environment variables
 load_dotenv()
 langfuse_init()
-
-
-async def _warm_agent_apps() -> None:
-    """Provision the default AgentApp, pre-warm MCP tools, compile published apps.
-
-    Startup order: ensure_default_agent_app -> MCP tool pre-warm (degrades
-    without blocking on failure) -> concurrent compile of every published
-    AgentApp via get_runtime (checkpointer comes from the shared pool inside
-    get_runtime; when unavailable it degrades to None + HIL disabled).
-    """
-    with Session(database_service.engine) as db_session:
-        await ensure_default_agent_app(db_session)
-
-        try:
-            await get_mcp_tools(db_session)
-            logger.info("mcp_tools_pre_warmed")
-        except Exception as e:
-            logger.exception("mcp_tools_pre_warm_failed_degraded", error=str(e))
-
-        published = list(db_session.exec(select(AgentApp).where(col(AgentApp.status) == "published")).all())
-
-    async def warm_one(app_cfg: AgentApp) -> None:
-        # Each concurrent warm task owns its own DBSession: a SQLModel Session
-        # must never be shared across awaits / concurrent tasks.
-        try:
-            with Session(database_service.engine) as warm_session:
-                await get_runtime(warm_session, str(app_cfg.id))
-        except Exception as e:
-            logger.exception("agent_app_warm_failed", app_name=app_cfg.name, error=str(e))
-
-    await asyncio.gather(*(warm_one(app_cfg) for app_cfg in published))
-    logger.info("agent_apps_warmed", count=len(published))
 
 
 @asynccontextmanager
@@ -107,12 +72,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.exception("memory_service_pre_warm_failed", error=str(e))
 
-    # AgentApp runtime warm-up: default app bootstrap + MCP tools + compile of
-    # every published AgentApp (each step degrades instead of blocking startup)
+    # AgentApp bootstrap (G2 v3.3 §6.1.5): default-app provisioning and the
+    # MCP tool pre-warm stay (G1 contract, degrading on failure), but the
+    # runtime compile pre-warm is gone — ensure_all_agent_workspaces repairs
+    # the Agent layers (§5.4) and the first user request compiles per
+    # (app_id, user_id).
     try:
-        await _warm_agent_apps()
+        with Session(database_service.engine) as db_session:
+            await ensure_default_agent_app(db_session)
+            try:
+                await get_mcp_tools(db_session)
+                logger.info("mcp_tools_pre_warmed")
+            except Exception as e:
+                logger.exception("mcp_tools_pre_warm_failed_degraded", error=str(e))
+            await ensure_all_agent_workspaces(db_session)
     except Exception as e:
-        logger.exception("agent_apps_warm_up_failed", error=str(e))
+        logger.exception("agent_workspace_bootstrap_failed", error=str(e))
 
     yield
 

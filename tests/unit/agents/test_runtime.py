@@ -22,6 +22,7 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import MemorySaver
 from prometheus_client import REGISTRY
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.config import settings
@@ -29,7 +30,7 @@ from app.core.prompts import load_static_system_prompt
 from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.schemas import Message
-from app.services.agents import assembly, bootstrap, runtime
+from app.services.agents import agent_apps_service, assembly, bootstrap, runtime, skills_store
 from app.services.llm.llm_store import compute_model_config_hash
 
 pytestmark = pytest.mark.unit
@@ -177,10 +178,10 @@ def _compile_runtime(model: ScriptedChatModel, app_cfg: AgentApp, monkeypatch: p
     saver = MemorySaver()
     graph = asyncio.run(
         assembly.compile_agent_app(
+            object(),
             app_cfg,
             subagent_cfgs=[],
-            user_id="user-1",
-            session=object(),
+            user_id=1,
             checkpointer=saver,
         )
     )
@@ -470,10 +471,14 @@ def test_memory_writeback_failure_is_contained_and_tasks_tracked(
 def _patch_get_runtime_seams(monkeypatch: pytest.MonkeyPatch, model: ScriptedChatModel, app_cfg: AgentApp) -> None:
     """Patch every DB/pool seam of get_runtime plus the assembly compile path."""
 
-    async def fake_resolve(session: Any, agent_app_id: Any) -> AgentApp:
+    async def fake_load_app(session: Any, app_id: int) -> AgentApp:
         return app_cfg
 
-    monkeypatch.setattr(runtime, "_resolve_agent_app", fake_resolve)
+    async def fake_lazy(session: Any, *, user_id: int, app_id: int) -> bool:
+        return False
+
+    monkeypatch.setattr(runtime, "_load_agent_app", fake_load_app)
+    monkeypatch.setattr(agent_apps_service, "ensure_user_workspace_up_to_date", fake_lazy)
     monkeypatch.setattr(runtime, "_load_subagents", lambda session, names: [])
 
     async def fake_skill_hashes(session: Any, app_names: Any, subagent_cfgs: Any = None) -> dict[str, str]:
@@ -500,21 +505,21 @@ def test_get_runtime_draft_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """Draft apps are rejected with ValueError."""
     _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[]), _make_app(status="draft"))
     with pytest.raises(ValueError, match="not published"):
-        asyncio.run(runtime.get_runtime(object(), "1"))
+        asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
 
 
 def test_get_runtime_unknown_engine_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unknown engine backends are rejected with ValueError."""
     _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[]), _make_app(engine="quantum"))
     with pytest.raises(ValueError, match="unknown engine"):
-        asyncio.run(runtime.get_runtime(object(), "1"))
+        asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
 
 
 def test_get_runtime_cache_returns_same_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     """Identical (app_id, fingerprint) lookups return the cached runtime."""
     _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="x")]), _make_app())
-    first = asyncio.run(runtime.get_runtime(object(), "1"))
-    second = asyncio.run(runtime.get_runtime(object(), "1"))
+    first = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
+    second = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert first is second
     assert isinstance(first, runtime.DeepAgentsAppRuntime)
 
@@ -523,22 +528,22 @@ def test_get_runtime_fingerprint_change_builds_new_instance(monkeypatch: pytest.
     """A fingerprint change (prompt edit) yields a fresh runtime instance."""
     model = ScriptedChatModel(responses=[AIMessage(content="x")])
     _patch_get_runtime_seams(monkeypatch, model, _make_app())
-    first = asyncio.run(runtime.get_runtime(object(), "1"))
+    first = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
 
     v2 = _make_app(system_prompt="v2")
 
-    async def resolve_v2(session: Any, agent_app_id: Any) -> AgentApp:
+    async def load_v2(session: Any, app_id: int) -> AgentApp:
         return v2
 
-    monkeypatch.setattr(runtime, "_resolve_agent_app", resolve_v2)
-    second = asyncio.run(runtime.get_runtime(object(), "1"))
+    monkeypatch.setattr(runtime, "_load_agent_app", load_v2)
+    second = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert first is not second
 
 
 def test_get_runtime_workflow_engine_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
     """Workflow apps resolve to the placeholder runtime that always raises."""
     _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[]), _make_app(engine="workflow"))
-    rt = asyncio.run(runtime.get_runtime(object(), "1"))
+    rt = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert isinstance(rt, runtime.WorkflowAppRuntime)
     with pytest.raises(NotImplementedError, match="workflow engine runtime reserved"):
         asyncio.run(rt.get_chat_history("s"))
@@ -554,7 +559,7 @@ def test_hil_disabled_without_checkpointer_copies_config(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(runtime, "_build_checkpointer", no_checkpointer)
 
-    rt = asyncio.run(runtime.get_runtime(object(), "1"))
+    rt = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert isinstance(rt, runtime.DeepAgentsAppRuntime)
     assert rt.app_cfg.interrupt_on == {}  # degraded copy
     assert app_cfg.interrupt_on == {"echo": True}  # original untouched
@@ -570,8 +575,8 @@ def test_hil_degraded_runtime_not_cached(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(runtime, "_build_checkpointer", no_checkpointer)
 
-    first = asyncio.run(runtime.get_runtime(object(), "1"))
-    second = asyncio.run(runtime.get_runtime(object(), "1"))
+    first = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
+    second = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert first is not second  # rebuilt every time once the pool recovers
     assert runtime._runtime_cache == {}  # noqa: SLF001 — cache stayed clean
 
@@ -581,16 +586,16 @@ def test_runtime_cache_evicts_stale_fingerprints_of_same_app(monkeypatch: pytest
     app_cfg = _make_app()
     app_cfg.id = 5
     _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="x")]), app_cfg)
-    asyncio.run(runtime.get_runtime(object(), "5"))
+    asyncio.run(runtime.get_runtime(object(), 5, user_id=7))
 
     v2 = _make_app(system_prompt="v2")
     v2.id = 5
 
-    async def resolve_v2(session: Any, agent_app_id: Any) -> AgentApp:
+    async def load_v2(session: Any, app_id: int) -> AgentApp:
         return v2
 
-    monkeypatch.setattr(runtime, "_resolve_agent_app", resolve_v2)
-    asyncio.run(runtime.get_runtime(object(), "5"))
+    monkeypatch.setattr(runtime, "_load_agent_app", load_v2)
+    asyncio.run(runtime.get_runtime(object(), 5, user_id=7))
 
     keys = list(runtime._runtime_cache)  # noqa: SLF001 — cache introspection
     assert len(keys) == 1 and keys[0][0] == 5
@@ -599,7 +604,7 @@ def test_runtime_cache_evicts_stale_fingerprints_of_same_app(monkeypatch: pytest
 def test_get_runtime_exposes_resolved_model_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """The runtime caches the resolved model_name and metrics label uses it."""
     _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="x")]), _make_app())
-    rt = asyncio.run(runtime.get_runtime(object(), "1"))
+    rt = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert rt.resolved_model_name == "real-model-x"  # real model name, not a reference
     assert rt._model_label() == "real-model-x"  # noqa: SLF001 — unit under test
 
@@ -625,35 +630,6 @@ def test_load_subagents_orders_by_name() -> None:
     session = RecordingSession()
     assert runtime._load_subagents(session, ["b", "a"]) == []  # noqa: SLF001 — unit under test
     assert "ORDER BY" in str(session.statements[0]).upper()
-
-
-def test_resolve_agent_app_lazy_bootstraps_missing_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A missing default app triggers one lazy ensure_default_agent_app call."""
-    created = _make_app(name="default")
-
-    async def fake_ensure(session: Any) -> AgentApp:
-        return created
-
-    monkeypatch.setattr(runtime, "ensure_default_agent_app", fake_ensure)
-    session = FakeDBSession(default_app=None)
-    resolved = asyncio.run(runtime._resolve_agent_app(session, None))  # noqa: SLF001 — unit under test
-    assert resolved is created
-
-
-def test_resolve_agent_app_reuses_existing_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An existing default app short-circuits the lazy bootstrap."""
-    existing = _make_app(name="default")
-    calls: list[int] = []
-
-    async def fake_ensure(session: Any) -> AgentApp:
-        calls.append(1)
-        return existing
-
-    monkeypatch.setattr(runtime, "ensure_default_agent_app", fake_ensure)
-    session = FakeDBSession(default_app=existing)
-    resolved = asyncio.run(runtime._resolve_agent_app(session, None))  # noqa: SLF001 — unit under test
-    assert resolved is existing
-    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1138,3 +1114,182 @@ def test_build_checkpointer_setup_runs_once_per_process(monkeypatch: pytest.Monk
     asyncio.run(scenario())
 
     assert len(setup_calls) == 1  # DDL never races across concurrent compiles
+
+
+# ---------------------------------------------------------------------------
+# G2 runtime cache + lazy validation (spec-g2-workspace v3.3 §8.1.2)
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_cache_three_tuple_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D20: the runtime cache key is the (app_id, user_id, fingerprint) triple."""
+    app_cfg = _make_app()
+    app_cfg.id = 2
+    _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="x")]), app_cfg)
+    asyncio.run(runtime.get_runtime(object(), 2, user_id=7))
+
+    keys = list(runtime._runtime_cache)  # noqa: SLF001 — cache introspection
+    assert len(keys) == 1
+    key = keys[0]
+    assert len(key) == 3
+    assert key[0] == 2  # app_id
+    assert key[1] == 7  # user_id
+    assert isinstance(key[2], str) and key[2]  # fingerprint
+
+
+def test_runtime_cache_eviction_per_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D22: a fresh fingerprint evicts only the same (app, user)'s stale entries."""
+    app_cfg = _make_app()
+    app_cfg.id = 5
+    _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="x")]), app_cfg)
+    asyncio.run(runtime.get_runtime(object(), 5, user_id=1))
+    asyncio.run(runtime.get_runtime(object(), 5, user_id=2))
+    assert len(runtime._runtime_cache) == 2  # noqa: SLF001 — both users coexist
+
+    v2 = _make_app(system_prompt="v2")
+    v2.id = 5
+
+    async def load_v2(session: Any, app_id: int) -> AgentApp:
+        return v2
+
+    monkeypatch.setattr(runtime, "_load_agent_app", load_v2)
+    asyncio.run(runtime.get_runtime(object(), 5, user_id=1))
+
+    keys = list(runtime._runtime_cache)  # noqa: SLF001 — cache introspection
+    assert {key[1] for key in keys} == {1, 2}  # user 2's entry survives
+    assert len([key for key in keys if key[1] == 1]) == 1  # user 1 keeps only the fresh fingerprint
+
+
+def test_get_runtime_invokes_lazy_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D21: get_runtime runs the lazy user-layer validation before compiling."""
+    app_cfg = _make_app()
+    app_cfg.id = 4
+    _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[AIMessage(content="x")]), app_cfg)
+    calls: list[dict[str, int]] = []
+
+    async def spy_lazy(session: Any, *, user_id: int, app_id: int) -> bool:
+        calls.append({"user_id": user_id, "app_id": app_id})
+        return False
+
+    monkeypatch.setattr(agent_apps_service, "ensure_user_workspace_up_to_date", spy_lazy)
+    asyncio.run(runtime.get_runtime(object(), 4, user_id=8))
+    assert calls == [{"user_id": 8, "app_id": 4}]
+
+
+def test_remove_compile_user_id_constant() -> None:
+    """D19: the ``_COMPILE_USER_ID = "system"`` shortcut no longer exists."""
+    assert not hasattr(runtime, "_COMPILE_USER_ID")
+
+
+# ---------------------------------------------------------------------------
+# G2 startup workspace bootstrap (spec-g2-workspace v3.3 §5.4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def workspace_db() -> Generator[Session, None, None]:
+    """In-memory SQLite for ensure_all_agent_workspaces (real rows + real files)."""
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    yield session
+    session.close()
+
+
+def test_ensure_all_draft_app_creates_skeleton_only(workspace_db: Session) -> None:
+    """§5.4: a draft app gets the empty skeleton dir and stays pending."""
+    draft = AgentApp(name="draft-app", system_prompt="p", engine="deepagents", status="draft")
+    workspace_db.add(draft)
+    workspace_db.commit()
+    workspace_db.refresh(draft)
+
+    asyncio.run(bootstrap.ensure_all_agent_workspaces(workspace_db))
+
+    assert skills_store._agent_skill_dir(draft.id).exists()
+    workspace_db.refresh(draft)
+    assert draft.agent_workspace_status == "pending"
+
+
+def test_ensure_all_published_app_rematerializes(workspace_db: Session) -> None:
+    """§5.4: a published app with a missing Agent layer is rebuilt and marked active."""
+    asyncio.run(
+        skills_store.create_global(
+            workspace_db, name="guide", description="Guide", body="# guide\n\nbootstrap\n"
+        )
+    )
+    app = AgentApp(
+        name="pub-app",
+        system_prompt="p",
+        engine="deepagents",
+        status="published",
+        skill_names=["guide"],
+    )
+    workspace_db.add(app)
+    workspace_db.commit()
+    workspace_db.refresh(app)
+    assert not skills_store._agent_skill_dir(app.id).exists()
+
+    asyncio.run(bootstrap.ensure_all_agent_workspaces(workspace_db))
+
+    assert skills_store._agent_skill_file(app.id, "guide").exists()
+    workspace_db.refresh(app)
+    assert app.agent_workspace_status == "active"
+
+
+def test_ensure_all_active_app_hash_drift_repaired(workspace_db: Session) -> None:
+    """§5.4: an active app with a stale stored hash is repaired to the expected value."""
+    app = AgentApp(
+        name="drift-app",
+        system_prompt="p",
+        engine="deepagents",
+        status="published",
+        skill_names=[],
+        agent_workspace_status="active",
+        workspace_hash="stale-hash",
+    )
+    workspace_db.add(app)
+    workspace_db.commit()
+    workspace_db.refresh(app)
+
+    asyncio.run(bootstrap.ensure_all_agent_workspaces(workspace_db))
+
+    workspace_db.refresh(app)
+    expected = skills_store.compute_workspace_hash(skills_store._agent_skill_dir(app.id))
+    assert app.workspace_hash == expected
+    assert app.workspace_hash != "stale-hash"
+
+
+def test_ensure_all_single_app_failure_isolated(
+    workspace_db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5.4: one app's bootstrap failure never blocks the remaining apps."""
+    good = AgentApp(name="good-app", system_prompt="p", engine="deepagents", status="published")
+    workspace_db.add(good)
+    workspace_db.commit()
+    workspace_db.refresh(good)
+    bad = AgentApp(
+        name="bad-app",
+        system_prompt="p",
+        engine="deepagents",
+        status="published",
+        skill_names=["guide"],
+    )
+    workspace_db.add(bad)
+    workspace_db.commit()
+    workspace_db.refresh(bad)
+
+    async def failing_materialize(session: Any, *, app_id: int, skill_names: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(skills_store, "materialize_for_agent", failing_materialize)
+
+    asyncio.run(bootstrap.ensure_all_agent_workspaces(workspace_db))  # must not raise
+
+    workspace_db.refresh(good)
+    workspace_db.refresh(bad)
+    assert good.agent_workspace_status == "active"
+    assert bad.agent_workspace_status == "pending"

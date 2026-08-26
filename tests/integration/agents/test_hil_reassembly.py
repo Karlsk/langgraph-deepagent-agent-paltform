@@ -22,6 +22,7 @@ from langchain_core.messages import AIMessage
 from sqlmodel import Session as DBSession
 
 from app.core.config import settings
+from app.models.user import User
 from app.schemas.chat import Message
 from app.services.agents import runtime as runtime_module
 from tests.conftest import unwrap
@@ -46,6 +47,7 @@ def _setup_mcp_server(client: TestClient, headers: dict[str, str], fake_tools: d
 
 def test_hil_interrupt_then_resume_round_trip(
     client: TestClient,
+    user: User,
     user_headers: dict[str, str],
     fake_mcp: dict[str, list[Any]],
     scripted_model: Any,
@@ -70,7 +72,7 @@ def test_hil_interrupt_then_resume_round_trip(
     assert client.post(f"{API}/apps/{app_id}/publish", headers=user_headers).status_code == 200
 
     with DBSession(db_engine) as db_session:
-        runtime = asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
+        runtime = asyncio.run(runtime_module.get_runtime(db_session, app_id, user_id=user.id))
 
     # Turn 1: the scripted model calls it_search; the HIL gate interrupts.
     scripted_model.responses = [
@@ -105,6 +107,7 @@ def test_hil_interrupt_then_resume_round_trip(
 
 def test_runtime_cache_hit_and_fingerprint_reassembly(
     client: TestClient,
+    user: User,
     user_headers: dict[str, str],
     fake_mcp: dict[str, list[Any]],
     scripted_model: Any,
@@ -124,8 +127,8 @@ def test_runtime_cache_hit_and_fingerprint_reassembly(
     assert client.post(f"{API}/apps/{app_id}/publish", headers=user_headers).status_code == 200
 
     with DBSession(db_engine) as db_session:
-        runtime_1 = asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
-        runtime_2 = asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
+        runtime_1 = asyncio.run(runtime_module.get_runtime(db_session, app_id, user_id=user.id))
+        runtime_2 = asyncio.run(runtime_module.get_runtime(db_session, app_id, user_id=user.id))
     assert runtime_1 is runtime_2  # identical fingerprint -> cache hit
 
     # Changing the MCP server configuration changes the fingerprint.
@@ -135,5 +138,5 @@ def test_runtime_cache_hit_and_fingerprint_reassembly(
     assert patched.status_code == 200, patched.text
 
     with DBSession(db_engine) as db_session:
-        runtime_3 = asyncio.run(runtime_module.get_runtime(db_session, str(app_id)))
+        runtime_3 = asyncio.run(runtime_module.get_runtime(db_session, app_id, user_id=user.id))
     assert runtime_3 is not runtime_1  # fingerprint changed -> fresh runtime

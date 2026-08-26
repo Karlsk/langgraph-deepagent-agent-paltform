@@ -9,8 +9,9 @@ Assembly pipeline (``compile_agent_app``):
 1. The effective skill set is the union of ``app_cfg.skill_names`` and every
    bound subagent's effective ``skill_names`` (``None`` contributes nothing
    because the sub-agent will inherit the parent's skill set; explicit empty
-   lists and explicit whitelists both contribute their names). The union is
-   materialised by ``sync_user_skills`` into the per-user skill directory.
+   lists and explicit whitelists both contribute their names). G2 v3.3: the
+   union is no longer materialised here — the User layer is filled by the
+   lazy validation in front of ``runtime.get_runtime`` instead.
 2. ``build_tool_catalog`` merges builtin + MCP tools (fail-fast whitelist
    validation happens against this catalog in ``validate_publish``).
 3. ``resolve_tools`` applies the app-level tool whitelist (None = all).
@@ -63,22 +64,23 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Checkpointer
 from sqlmodel import Session
 
-from app.core.config import settings
 from app.core.langgraph.tools import tools as builtin_tools
 from app.core.logging import logger
 from app.core.metrics import agent_graph_cache_hits_total, agent_graph_compile_duration_seconds
 from app.models.agent_assets import AgentApp, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
+from app.services.agents import skills_store
 from app.services.agents.mcp_manager import build_tool_catalog, get_mcp_tools
-from app.services.agents.skills_store import sync_user_skills
 from app.services.llm.llm_store import build_chat_model, load_model_config
 from app.services.memory import memory_service
 
 _COMPILE_CACHE_CAPACITY = 64
 
-# Process-level LRU of successfully compiled graphs keyed by config fingerprint.
+# Process-level LRU of successfully compiled graphs keyed by
+# (config fingerprint, user_id): the graph embeds a per-user
+# FilesystemBackend, so two users must never share a compiled entry.
 # Only successful compiles are cached; failures always recompile.
-_compile_cache: "OrderedDict[str, CompiledStateGraph]" = OrderedDict()
+_compile_cache: "OrderedDict[tuple[str, int], CompiledStateGraph]" = OrderedDict()
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +244,12 @@ def build_subagent_spec(
     - ``allowed_tools=None`` inherits the parent's resolved tools.
     - ``model=None`` inherits the parent's model instance (the same object).
     - ``skill_names=None`` inherits the parent's published skill set
-      (``parent_skills``, the parent's effective ``["/<name>", ...]`` list).
+      (``parent_skills``, the parent's effective ``["/skills/<name>", ...]``
+      list).
     - ``skill_names=[]`` explicitly binds no skills (overrides inheritance).
-    - ``skill_names=[<name>, ...]`` becomes ``["/<name>", ...]`` after the
-      bind-time whitelist resolution.
+    - ``skill_names=[<name>, ...]`` becomes ``["/skills/<name>", ...]`` after
+      the bind-time whitelist resolution (skills mount at ``/skills/``
+      relative to the shared per-(app, user) backend root).
 
     A non-NULL ``model`` is a ``"provider/model"`` reference resolved through
     ``resolve_model``. ``when_to_use`` maps to ``SubAgent["description"]``
@@ -301,7 +305,7 @@ def build_subagent_spec(
         skills = []
         skill_source = "none"
     else:
-        skills = [f"/{name}" for name in cfg.skill_names]
+        skills = [f"/skills/{name}" for name in cfg.skill_names]
         skill_source = "whitelist"
     if skills:
         spec["skills"] = skills  # type: ignore[typeddict-item]
@@ -416,20 +420,25 @@ def compile_standalone_subagent(
 
 
 async def compile_agent_app(
+    session: Session,
     app_cfg: AgentApp,
     *,
     subagent_cfgs: Sequence[SubAgentConfig],
-    user_id: str,
-    session: Session,
+    user_id: int,
     checkpointer: Checkpointer | None = None,
 ) -> CompiledStateGraph:
     """Assemble and compile an AgentApp into an executable deepagents graph.
 
+    G2 v3.3 (spec-g2-workspace §6.1.3): ``user_id`` is a required int and the
+    skills backend reads the nested per-(app, user) User layer. The compile
+    path no longer materialises anything — the User layer is filled by the
+    lazy validation in front of ``runtime.get_runtime`` (spec §6.1.1).
+
     Args:
+        session: SQLModel database session (for the MCP tool catalog).
         app_cfg: The AgentApp configuration row to compile.
         subagent_cfgs: SubAgentConfig rows referenced by ``app_cfg.subagent_names``.
-        user_id: User whose per-user skill directory backs the skills backend.
-        session: SQLModel database session (for the MCP tool catalog).
+        user_id: User whose nested workspace backs the skills backend.
         checkpointer: Checkpointer to attach (production: AsyncPostgresSaver
             over the shared connection pool; tests: MemorySaver).
 
@@ -443,7 +452,6 @@ async def compile_agent_app(
     effective_skill_names = sorted(
         set(app_cfg.skill_names) | {n for cfg in subagent_cfgs for n in (cfg.skill_names or [])}
     )
-    await sync_user_skills(session, user_id, effective_skill_names)
 
     catalog = await build_tool_catalog(session)
     mcp_tools = await get_mcp_tools(session)
@@ -462,7 +470,7 @@ async def compile_agent_app(
         """Resolve a subagent model reference against the live DB."""
         return build_chat_model(*load_model_config(session, reference))
 
-    parent_skills: list[str] = [f"/{name}" for name in effective_skill_names]
+    parent_skills: list[str] = [f"/skills/{name}" for name in effective_skill_names]
     subagents = [
         build_subagent_spec(
             cfg,
@@ -475,12 +483,15 @@ async def compile_agent_app(
         for cfg in subagent_cfgs
     ]
 
-    # G2 Phase-1 alignment: sync_user_skills now writes the shared user
-    # layer at {DATA_ROOT}/users/<uid> (top-level), so the backend must read
-    # from the same root. Phase 4 (T18, D15) moves both to the nested
-    # {DATA_ROOT}/agents/<app_id>/users/<uid> workspace.
-    user_skill_root = Path(settings.DATA_ROOT) / "users" / str(user_id)
-    backend = FilesystemBackend(root_dir=str(user_skill_root))
+    # G2 v3 (D15, spec §2.1/§6.1.3): the backend roots at the per-(app, user)
+    # workspace — the agent's sandboxed filesystem. Skills are referenced as
+    # virtual "/skills/<name>" paths relative to root_dir (deepagents mount
+    # convention), so the physical files resolve to
+    # {user_root}/skills/<name>/SKILL.md — exactly the §2.1 User-layer
+    # template that materialize_to_user_combined and the lazy validation
+    # write. Sourced from the Phase-1 path helper (single source of truth).
+    user_root = skills_store._user_dir(app_cfg.id, user_id)  # noqa: SLF001 — same-package path helper
+    backend = FilesystemBackend(root_dir=str(user_root))
     interrupt_on = cast(Optional[dict[str, Any]], app_cfg.interrupt_on or None)
 
     graph = create_deep_agent(
@@ -644,44 +655,48 @@ def clear_compile_cache() -> None:
 
 
 async def get_or_compile(
+    session: Session,
     app_cfg: AgentApp,
     *,
     subagent_cfgs: Sequence[SubAgentConfig],
     skill_hashes: Mapping[str, str],
     mcp_fingerprint: str,
     model_fingerprint: str,
-    user_id: str,
-    session: Session,
+    user_id: int,
     checkpointer: Checkpointer | None = None,
 ) -> CompiledStateGraph:
-    """Return a cached compiled graph for the fingerprint, or compile and cache it.
+    """Return a cached compiled graph for the (fingerprint, user), or compile.
 
-    The cache is a process-level OrderedDict LRU (capacity 64). Hits count
-    ``agent_graph_cache_hits_total{result="hit"}``, misses compile under
-    ``agent_graph_compile_duration_seconds`` and count ``result="miss"``.
-    Only successful compiles are cached. Checkpointer-less compiles are
-    returned but never written to the cache: a graph compiled without a
-    checkpointer must not be served again once the shared pool recovers
-    (same hygiene as the degraded-runtime guard in ``runtime.get_runtime``).
+    The cache is a process-level OrderedDict LRU (capacity 64) keyed by
+    ``(fingerprint, user_id)``: the compiled graph embeds a per-user
+    FilesystemBackend, so identical fingerprints of different users must
+    never share an entry. Hits count ``agent_graph_cache_hits_total{result="hit"}``,
+    misses compile under ``agent_graph_compile_duration_seconds`` and count
+    ``result="miss"``. Only successful compiles are cached. Checkpointer-less
+    compiles are returned but never written to the cache: a graph compiled
+    without a checkpointer must not be served again once the shared pool
+    recovers (same hygiene as the degraded-runtime guard in
+    ``runtime.get_runtime``).
 
     Args:
+        session: SQLModel database session (for the MCP tool catalog).
         app_cfg: The AgentApp configuration row to compile.
         subagent_cfgs: Bound SubAgentConfig rows.
         skill_hashes: Mapping of skill name -> content hash (fingerprint input).
         mcp_fingerprint: MCP configuration fingerprint (fingerprint input).
         model_fingerprint: Model config content fingerprint (fingerprint input).
-        user_id: User whose skill directory backs the skills backend.
-        session: SQLModel database session (for the MCP tool catalog).
+        user_id: User whose nested workspace backs the skills backend.
         checkpointer: Checkpointer to attach to freshly compiled graphs.
 
     Returns:
         The compiled deep agent graph (cached or newly compiled).
     """
     fingerprint = compute_fingerprint(app_cfg, subagent_cfgs, skill_hashes, mcp_fingerprint, model_fingerprint)
+    cache_key = (fingerprint, user_id)
 
-    cached = _compile_cache.get(fingerprint)
+    cached = _compile_cache.get(cache_key)
     if cached is not None:
-        _compile_cache.move_to_end(fingerprint)
+        _compile_cache.move_to_end(cache_key)
         agent_graph_cache_hits_total.labels(result="hit").inc()
         logger.debug("agent_graph_compile_cache_hit", fingerprint=fingerprint, app_name=app_cfg.name)
         return cached
@@ -689,10 +704,10 @@ async def get_or_compile(
     agent_graph_cache_hits_total.labels(result="miss").inc()
     started = time.perf_counter()
     graph = await compile_agent_app(
+        session,
         app_cfg,
         subagent_cfgs=subagent_cfgs,
         user_id=user_id,
-        session=session,
         checkpointer=checkpointer,
     )
     agent_graph_compile_duration_seconds.observe(time.perf_counter() - started)
@@ -703,8 +718,8 @@ async def get_or_compile(
         logger.info("agent_graph_compiled_not_cached_no_checkpointer", fingerprint=fingerprint, app_name=app_cfg.name)
         return graph
 
-    _compile_cache[fingerprint] = graph
-    _compile_cache.move_to_end(fingerprint)
+    _compile_cache[cache_key] = graph
+    _compile_cache.move_to_end(cache_key)
     while len(_compile_cache) > _COMPILE_CACHE_CAPACITY:
         evicted, _ = _compile_cache.popitem(last=False)
         logger.debug("agent_graph_compile_cache_evicted", fingerprint=evicted)

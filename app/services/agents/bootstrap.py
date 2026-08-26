@@ -45,7 +45,7 @@ from app.core.prompts import load_static_system_prompt
 from app.models.agent_assets import DEFAULT_AGENT_APP_ID, AgentApp
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.models.session import Session as ChatSession
-from app.services.agents import assembly
+from app.services.agents import assembly, skills_store
 from app.services.llm.llm_store import compute_model_config_hash
 
 _DEFAULT_APP_NAME = "default"
@@ -235,3 +235,78 @@ async def ensure_default_agent_app(session: Session) -> AgentApp:
 
     _backfill_legacy_sessions(session, default_app)
     return default_app
+
+
+async def ensure_all_agent_workspaces(session: Session) -> None:
+    """Startup repair: every AgentApp's Agent layer + workspace hash are sound.
+
+    G2 v3.3 (spec-g2-workspace §5.4), run once in the FastAPI lifespan:
+
+    - draft apps keep their pending status and only get the empty skeleton
+      directory (skipped count);
+    - published apps with a missing/empty Agent layer are re-materialized
+      from the Global layer (only when ``skill_names`` is non-empty);
+    - active apps re-verify ``workspace_hash`` against the directory content
+      and repair drift (warning ``agent_workspace_hash_drift``);
+    - non-draft apps are then promoted to ``active``.
+
+    A single app's failure is isolated (logged as
+    ``agent_workspace_bootstrap_failed``) so the remaining apps still
+    bootstrap. The whole pass commits once at the end.
+
+    Args:
+        session: SQLModel database session.
+    """
+    apps = list(session.exec(select(AgentApp)).all())
+    active_count = 0
+    skipped_count = 0
+
+    for app in apps:
+        try:
+            agent_dir = skills_store._agent_skill_dir(app.id)  # noqa: SLF001 — same-package path helper
+
+            if app.status == "draft":
+                # Draft stays pending: only the empty skeleton directory exists.
+                agent_dir.mkdir(parents=True, exist_ok=True)
+                skipped_count += 1
+                continue
+
+            # Published/active: rebuild the Agent layer when it went missing.
+            if not agent_dir.exists() or not any(agent_dir.iterdir()):
+                if app.skill_names:
+                    await skills_store.materialize_for_agent(
+                        session,
+                        app_id=app.id,
+                        skill_names=list(app.skill_names),
+                    )
+
+            # Active apps re-verify the stored hash (directory-loss guard).
+            if app.agent_workspace_status == "active":
+                expected_hash = skills_store.compute_workspace_hash(agent_dir)
+                if app.workspace_hash != expected_hash:
+                    logger.warning(
+                        "agent_workspace_hash_drift",
+                        app_id=app.id,
+                        stored=app.workspace_hash,
+                        expected=expected_hash,
+                    )
+                    app.workspace_hash = expected_hash
+
+            app.agent_workspace_status = "active"
+            active_count += 1
+        except Exception as exc:  # noqa: BLE001 — spec §5.4 single-app isolation
+            # Single-app isolation: one failure never blocks the rest.
+            logger.exception(
+                "agent_workspace_bootstrap_failed",
+                app_id=app.id,
+                error=str(exc),
+            )
+            continue
+
+    session.commit()
+    logger.info(
+        "agent_workspace_bootstrap_completed",
+        total=len(apps),
+        active=active_count,
+        skipped=skipped_count,
+    )
