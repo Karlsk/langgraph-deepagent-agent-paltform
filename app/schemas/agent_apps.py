@@ -406,6 +406,9 @@ class AgentAppRead(BaseModel):
         engine: Execution engine backend
         status: Lifecycle status (draft|published)
         published_hash: Hash snapshot of the last published revision
+        agent_dir: Agent workspace directory stamped at publish time
+        workspace_hash: Content hash over the agent workspace skill files
+        agent_workspace_status: Agent workspace materialization status
         version: Monotonic configuration version counter
         created_by: Audit-only creator identifier
     """
@@ -421,6 +424,9 @@ class AgentAppRead(BaseModel):
     engine: str = Field(..., description="Execution engine backend")
     status: str = Field(..., description="Lifecycle status (draft|published)")
     published_hash: Optional[str] = Field(default=None, description="Hash snapshot of the last published revision")
+    agent_dir: Optional[str] = Field(default=None, description="Agent workspace directory stamped at publish time")
+    workspace_hash: Optional[str] = Field(default=None, description="Content hash over the agent workspace skill files")
+    agent_workspace_status: str = Field(default="pending", description="Agent workspace materialization status (pending|ready|stale)")
     version: int = Field(..., description="Monotonic configuration version counter")
     created_by: Optional[str] = Field(default=None, description="Audit-only creator identifier")
 

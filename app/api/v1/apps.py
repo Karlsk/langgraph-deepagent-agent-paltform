@@ -22,24 +22,30 @@ from app.api.v1.agent_assets_common import (
     paginate_by_name,
 )
 from app.api.v1.auth import get_current_user
-from app.api.v1.mcp_servers import _mcp_fingerprint
-from app.api.v1.providers import _model_fingerprint, build_model_catalog
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
-from app.models.agent_assets import AgentApp, SkillAsset, SubAgentConfig
-from app.models.provider import DEFAULT_MODEL_REF
+from app.models.agent_assets import AgentApp
 from app.models.user import User
 from app.schemas.agent_apps import AgentAppCreate, AgentAppRead, AgentAppUpdate
 from app.schemas.base import ApiResponse, PageResult
-from app.services.agents import assembly
-from app.services.agents.mcp_manager import build_tool_catalog
+from app.services.agents import agent_apps_service
 
 router = APIRouter()
 
-# System default AgentApp name (bootstrap-seeded; delete-protected like the
-# default provider/model pair).
-_DEFAULT_AGENT_APP_NAME = "default"
+# Service-layer not-found errors map to 404; the remaining AgentAppServiceError
+# subclasses (not-published, ...) map to 422 like the ValueError validations.
+_NOT_FOUND_ERRORS = (
+    agent_apps_service.AgentAppNotFoundError,
+    agent_apps_service.UserNotFoundError,
+    agent_apps_service.AssociationNotFoundError,
+)
+
+
+def _service_error_to_http(exc: agent_apps_service.AgentAppServiceError) -> HTTPException:
+    """Translate a service-layer business error into its HTTP counterpart."""
+    status = 404 if isinstance(exc, _NOT_FOUND_ERRORS) else 422
+    return HTTPException(status_code=status, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +238,10 @@ async def update_agent_app(
 ) -> ApiResponse[Any]:
     """Partially update an agent app (name is immutable; lists replace wholesale).
 
+    API layer: body parsing + schema validation only; the interpretation-B
+    state machine (published -> draft, workspace hash invalidation) lives in
+    ``agent_apps_service.patch_agent_app``.
+
     Args:
         request: The FastAPI request object for rate limiting.
         app_id: Agent app primary key.
@@ -251,32 +261,16 @@ async def update_agent_app(
         if app_cfg is None:
             raise HTTPException(status_code=404, detail=f"agent app '{app_id}' not found")
 
-        updates = payload.model_dump(exclude_unset=True)
-        if not updates:
-            raise HTTPException(status_code=422, detail="nothing to update")
-
-        for field in ("skill_names", "subagent_names", "interrupt_on"):
-            if field in updates and updates[field] is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{field} must not be null; pass an empty {'list' if field != 'interrupt_on' else 'dict'} to clear it",
-                )
-
-        for field, value in updates.items():
-            setattr(app_cfg, field, value)
-        if app_cfg.status == "published":
-            # Content edits invalidate the published fingerprint: demote back
-            # to draft so a broken config cannot keep serving live sessions.
-            app_cfg.status = "draft"
-            logger.info("agent_app_unpublished_on_edit", app_id=app_id)
-        app_cfg.version += 1
-        db.add(app_cfg)
-        db.commit()
-        db.refresh(app_cfg)
-        logger.info("agent_app_updated", app_id=app_id, version=app_cfg.version)
-        return ApiResponse.success(app_cfg)
+        updated = await agent_apps_service.patch_agent_app(
+            db, app_cfg=app_cfg, patch_data=payload, current_user_id=user.id
+        )
+        return ApiResponse.success(updated)
     except HTTPException:
         raise
+    except agent_apps_service.AgentAppServiceError as exc:
+        raise _service_error_to_http(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("agent_app_update_failed", app_id=app_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -290,7 +284,11 @@ async def delete_agent_app(
     db: DBSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ) -> ApiResponse[None]:
-    """Delete an agent application.
+    """Delete an agent application (DB row + workspace cascade).
+
+    API layer: parameter validation only; the default-app protection and
+    the agent-workspace directory cascade live in
+    ``agent_apps_service.delete_agent_app``.
 
     Args:
         request: The FastAPI request object for rate limiting.
@@ -302,24 +300,18 @@ async def delete_agent_app(
         Envelope with null data on successful deletion.
 
     Raises:
-        HTTPException: 404 when the agent app does not exist.
+        HTTPException: 404 when the agent app does not exist, 422 when it is
+            the delete-protected system default app.
     """
     try:
-        app_cfg = db.get(AgentApp, app_id)
-        if app_cfg is None:
-            raise HTTPException(status_code=404, detail=f"agent app '{app_id}' not found")
-        if app_cfg.name == _DEFAULT_AGENT_APP_NAME:
-            logger.warning("agent_app_delete_rejected", app_id=app_id, reason="default_protected")
-            raise HTTPException(
-                status_code=422,
-                detail="the system default agent app is protected and cannot be deleted",
-            )
-        db.delete(app_cfg)
-        db.commit()
-        logger.info("agent_app_deleted", app_id=app_id)
+        await agent_apps_service.delete_agent_app(
+            db, app_id=app_id, current_user_id=user.id
+        )
         return ApiResponse.success(None)
-    except HTTPException:
-        raise
+    except agent_apps_service.AgentAppServiceError as exc:
+        raise _service_error_to_http(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("agent_app_delete_failed", app_id=app_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -335,10 +327,10 @@ async def publish_agent_app(
 ) -> ApiResponse[Any]:
     """Publish an agent app after referential + tool-whitelist validation.
 
-    Validation order: skill/subagent reference existence (422) ->
-    ``assembly.validate_publish`` against the live tool catalog (422) ->
-    stamp status=published, published_hash (config fingerprint) and bump
-    the version.
+    API layer: parameter validation only; the two-stage referential
+    validation, Global -> Agent materialization, workspace_hash stamping and
+    user-layer cache invalidation live in
+    ``agent_apps_service.publish_agent_app``.
 
     Args:
         request: The FastAPI request object for rate limiting.
@@ -358,65 +350,102 @@ async def publish_agent_app(
         if app_cfg is None:
             raise HTTPException(status_code=404, detail=f"agent app '{app_id}' not found")
 
-        subagent_cfgs: list[SubAgentConfig] = []
-        for subagent_name in app_cfg.subagent_names:
-            cfg = db.get(SubAgentConfig, subagent_name)
-            if cfg is None:
-                raise HTTPException(status_code=422, detail=f"referenced subagent '{subagent_name}' does not exist")
-            subagent_cfgs.append(cfg)
-
-        skill_hashes: dict[str, str] = {}
-        for skill_name in app_cfg.skill_names:
-            asset = db.get(SkillAsset, skill_name)
-            if asset is None:
-                raise HTTPException(status_code=422, detail=f"referenced skill '{skill_name}' does not exist")
-            skill_hashes[skill_name] = asset.content_hash
-        # Sub-agent explicit whitelists (the inherit ``None`` case contributes
-        # nothing because the sub-agent resolves to the app's set, already
-        # covered above) also have to resolve to a real SkillAsset; otherwise
-        # a dangling subagent-only skill would silently skip recompilation.
-        for cfg in subagent_cfgs:
-            for skill_name in cfg.skill_names or []:
-                if skill_name in skill_hashes:
-                    continue
-                asset = db.get(SkillAsset, skill_name)
-                if asset is None:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"referenced skill '{skill_name}' (subagent '{cfg.name}') does not exist",
-                    )
-                skill_hashes[skill_name] = asset.content_hash
-
-        catalog = await build_tool_catalog(db)
-        model_catalog = build_model_catalog(db)
-        try:
-            assembly.validate_publish(app_cfg, subagent_cfgs, catalog, model_catalog)
-        except ValueError as exc:
-            logger.warning("agent_app_publish_validation_failed", app_id=app_id, error=str(exc))
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        reference_names = {app_cfg.model or DEFAULT_MODEL_REF}
-        reference_names.update(cfg.model or DEFAULT_MODEL_REF for cfg in subagent_cfgs)
-        referenced = {name: model_catalog[name] for name in reference_names}
-
-        app_cfg.status = "published"
-        app_cfg.published_hash = assembly.compute_fingerprint(
-            app_cfg, subagent_cfgs, skill_hashes, _mcp_fingerprint(db), _model_fingerprint(referenced)
+        published = await agent_apps_service.publish_agent_app(
+            db, app_cfg=app_cfg, current_user_id=user.id
         )
-        app_cfg.version += 1
-        db.add(app_cfg)
-        db.commit()
-        db.refresh(app_cfg)
-        logger.info(
-            "agent_app_published",
-            app_id=app_id,
-            version=app_cfg.version,
-            skill_count=len(skill_hashes),
-            subagent_count=len(subagent_cfgs),
-        )
-        return ApiResponse.success(app_cfg)
+        return ApiResponse.success(published)
     except HTTPException:
         raise
+    except agent_apps_service.AgentAppServiceError as exc:
+        raise _service_error_to_http(exc) from exc
+    except ValueError as exc:
+        logger.warning("agent_app_publish_validation_failed", app_id=app_id, error=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("agent_app_publish_failed", app_id=app_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/apps/{app_id}/associate-user/{user_id}", response_model=ApiResponse[None])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
+async def associate_user_with_app(
+    request: Request,
+    app_id: int,
+    user_id: int,
+    db: DBSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ApiResponse[None]:
+    """Associate a user with a published app (materialize the User layer).
+
+    API layer: parameter validation only; the published-status check, user
+    lookup, association upsert and the combined (Global + Agent) -> User
+    materialization live in ``agent_apps_service.associate_user_with_app``.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        app_id: Agent app primary key.
+        user_id: Target user primary key.
+        db: Request-scoped DB session.
+        user: Authenticated user resolved from the user access token.
+
+    Returns:
+        Envelope with null data once the user layer is materialized.
+
+    Raises:
+        HTTPException: 404 when the app or user does not exist, 422 when
+            the app is not published.
+    """
+    try:
+        await agent_apps_service.associate_user_with_app(
+            db, user_id=user_id, app_id=app_id, current_user_id=user.id
+        )
+        return ApiResponse.success(None)
+    except agent_apps_service.AgentAppServiceError as exc:
+        raise _service_error_to_http(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("user_app_associate_failed", app_id=app_id, user_id=user_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/apps/{app_id}/associate-user/{user_id}", response_model=ApiResponse[None])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["agent_app"][0])
+async def disassociate_user_from_app(
+    request: Request,
+    app_id: int,
+    user_id: int,
+    db: DBSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ApiResponse[None]:
+    """Remove a user association and clean the User workspace directory.
+
+    API layer: parameter validation only; the association lookup and the
+    user-layer directory cleanup live in
+    ``agent_apps_service.disassociate_user_from_app``.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        app_id: Agent app primary key.
+        user_id: Target user primary key.
+        db: Request-scoped DB session.
+        user: Authenticated user resolved from the user access token.
+
+    Returns:
+        Envelope with null data once the association is removed.
+
+    Raises:
+        HTTPException: 404 when the association does not exist.
+    """
+    try:
+        await agent_apps_service.disassociate_user_from_app(
+            db, user_id=user_id, app_id=app_id, current_user_id=user.id
+        )
+        return ApiResponse.success(None)
+    except agent_apps_service.AgentAppServiceError as exc:
+        raise _service_error_to_http(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("user_app_disassociate_failed", app_id=app_id, user_id=user_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

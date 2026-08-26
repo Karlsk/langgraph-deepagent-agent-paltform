@@ -38,11 +38,12 @@ from app.core import mcp_client
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.mcp_client import MCPUpstreamError, ToolSummary
+from app.models.agent_assets import AgentApp
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.models.subagent_trace import SubAgentTestTrace
 from app.models.user import User
 from app.schemas.agent_apps import SubAgentTestResult
-from app.services.agents import skills_store
+from app.services.agents import agent_apps_service, skills_store
 from pydantic import ValidationError
 from tests.conftest import unwrap
 
@@ -97,13 +98,13 @@ def fake_user() -> User:
 
 @pytest.fixture(autouse=True)
 def catalog(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Stub build_tool_catalog on the API modules with a mutable builtin list."""
+    """Stub build_tool_catalog on the service/API modules with a mutable builtin list."""
     entries: list[dict[str, Any]] = [dict(entry) for entry in BUILTIN_CATALOG]
 
     async def fake_build_tool_catalog(session: Any) -> list[dict[str, Any]]:
         return entries
 
-    monkeypatch.setattr(apps_module, "build_tool_catalog", fake_build_tool_catalog)
+    monkeypatch.setattr(agent_apps_service, "build_tool_catalog", fake_build_tool_catalog)
     monkeypatch.setattr(mcp_servers_module, "build_tool_catalog", fake_build_tool_catalog)
     return entries
 
@@ -1519,3 +1520,111 @@ def test_list_mcp_servers_page_returns_page_result(client: TestClient) -> None:
 
     assert [row["name"] for row in payload["items"]] == ["fs-server"]
     assert payload["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# G2 service-layer boundary (spec-g2-workspace v3.3 §8.1.5)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_endpoint_calls_service(
+    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The publish endpoint only validates the route and forwards to the service."""
+    _seed_default_pair(db_session)
+    app_id = unwrap(client.post("/apps", json=_app_body()), expected_code=201)["id"]
+    app_row = db_session.get(AgentApp, app_id)
+    assert app_row is not None
+
+    spy = AsyncMock(return_value=app_row)
+    monkeypatch.setattr(agent_apps_service, "publish_agent_app", spy)
+
+    response = client.post(f"/apps/{app_id}/publish")
+
+    assert response.status_code == 200
+    spy.assert_awaited_once()
+    _, kwargs = spy.await_args
+    assert kwargs["app_cfg"] is app_row
+    assert kwargs["current_user_id"] == 7  # fake_user id from the auth override
+    assert unwrap(response)["id"] == app_id
+
+
+def test_associate_user_endpoint_validates_params(
+    client: TestClient, db_session: DBSession
+) -> None:
+    """Association rejects unknown apps (404), draft apps (422) and unknown users (404)."""
+    # Unknown app -> 404.
+    assert client.post("/apps/9999/associate-user/5").status_code == 404
+
+    # Draft app -> 422 (not published).
+    app_id = unwrap(client.post("/apps", json=_app_body()), expected_code=201)["id"]
+    response = client.post(f"/apps/{app_id}/associate-user/5")
+    assert response.status_code == 422
+    assert response.json()["code"] == 422
+
+    # Published app but unknown user -> 404.
+    app_row = db_session.get(AgentApp, app_id)
+    assert app_row is not None
+    app_row.status = "published"
+    db_session.add(app_row)
+    db_session.commit()
+    assert client.post(f"/apps/{app_id}/associate-user/424242").status_code == 404
+
+
+def test_associate_user_endpoint_calls_service(
+    client: TestClient, db_session: DBSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The associate endpoint forwards (user_id, app_id, current_user_id) to the service."""
+    member = User(email="member@example.com", username="member", hashed_password="x")  # noqa: S106 — test double, not a real credential
+    db_session.add(member)
+    db_session.commit()
+    db_session.refresh(member)
+    app_id = unwrap(client.post("/apps", json=_app_body()), expected_code=201)["id"]
+    app_row = db_session.get(AgentApp, app_id)
+    assert app_row is not None
+    app_row.status = "published"
+    db_session.add(app_row)
+    db_session.commit()
+
+    spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(agent_apps_service, "associate_user_with_app", spy)
+
+    response = client.post(f"/apps/{app_id}/associate-user/{member.id}")
+
+    assert response.status_code == 200
+    spy.assert_awaited_once()
+    _, kwargs = spy.await_args
+    assert kwargs == {"user_id": member.id, "app_id": app_id, "current_user_id": 7}
+
+
+def test_patch_endpoint_handles_status_transition(
+    client: TestClient, db_session: DBSession
+) -> None:
+    """PATCH on a published app applies the interpretation-B machine end to end."""
+    app_id = _seed_publishable_app(client, db_session)
+    assert unwrap(client.post(f"/apps/{app_id}/publish"))["status"] == "published"
+
+    response = client.patch(f"/apps/{app_id}", json={"system_prompt": "v2"})
+
+    assert response.status_code == 200
+    payload = unwrap(response)
+    assert payload["status"] == "draft"
+    assert payload["workspace_hash"] is None
+    assert payload["agent_workspace_status"] == "pending"
+    assert payload["version"] == 3
+
+
+def test_delete_endpoint_cascades_workspace(
+    client: TestClient, db_session: DBSession
+) -> None:
+    """DELETE removes the DB row and the whole agent workspace directory."""
+    app_id = _seed_publishable_app(client, db_session)
+    unwrap(client.post(f"/apps/{app_id}/publish"))
+    agent_skill_file = skills_store._agent_skill_file(app_id, "pdf-export")
+    assert agent_skill_file.exists()  # publish materialized Global -> Agent
+
+    response = client.delete(f"/apps/{app_id}")
+
+    assert response.status_code == 200
+    assert client.get(f"/apps/{app_id}").status_code == 404
+    assert not skills_store._agent_dir(app_id).exists()

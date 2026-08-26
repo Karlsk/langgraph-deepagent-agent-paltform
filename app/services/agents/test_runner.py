@@ -128,6 +128,13 @@ async def run_subagent_once(
         model id of the resolved model config and the ``trace_id`` of the
         persisted execution trace (None only if trace persistence failed).
 
+    G2 MVP limitation (spec-g2-workspace v3.3 §6.2): this standalone runner
+    reads skills from the Global layer only (via ``materialize_into_directory``);
+    it does not consult the per-(app, user) combined layer. The combined
+    reader ``skills_store.materialize_into_combined_directory`` exists, but
+    wiring it into this runner is deferred to G3+ — the signature stays
+    unchanged in G2.
+
     Raises:
         ValueError: When no SubAgentConfig exists under ``name``, its model
             reference cannot be resolved, or a bound skill is missing.

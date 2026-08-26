@@ -635,3 +635,23 @@ def test_run_subagent_once_persists_error_trace_and_reraises(
     assert trace.events[0]["status"] == "error"
     assert "model exploded" in str(trace.events[0]["error"])
     assert trace.events[-1]["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# G2 MVP limitation notes (spec-g2-workspace v3.3 §6.2 / §8.1.4)
+# ---------------------------------------------------------------------------
+
+
+def test_run_subagent_once_docstring_mvp_note() -> None:
+    """The docstring documents the G2 MVP Global-only limitation (spec §6.2)."""
+    doc = test_runner.run_subagent_once.__doc__ or ""
+    assert "Global" in doc
+    assert "combined" in doc
+    assert "G3" in doc
+
+
+def test_materialize_into_combined_directory_function_exists() -> None:
+    """skills_store exposes the combined-directory materializer for G3+ callers."""
+    from app.services.agents import skills_store
+
+    assert callable(skills_store.materialize_into_combined_directory)
