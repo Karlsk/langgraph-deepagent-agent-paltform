@@ -317,6 +317,48 @@ class SkillRefreshReport(BaseModel):
     missing: int = Field(..., description="Skills lost from both stores")
 
 
+class SkillSyncEntry(BaseModel):
+    """One outcome entry of a workspace-sync (directory reconciliation).
+
+    Attributes:
+        name: Skill name; invalid entries carry the relative file path
+            (``<dir>/SKILL.md``) instead.
+        action: What the sync did / would do:
+            ``unchanged`` — DB row and disk file match;
+            ``rewritten`` — disk file drifted or was missing and is
+            rewritten from the DB row (DB is the source of truth);
+            ``imported`` — disk-only file imported as a new DB row;
+            ``invalid`` — file rejected per-file (see ``reason``).
+        reason: Rejection detail for ``invalid`` entries (else None).
+    """
+
+    name: str = Field(..., description="Skill name (invalid entries carry the file path)")
+    action: Literal["unchanged", "rewritten", "imported", "invalid"] = Field(
+        ..., description="Sync outcome for this entry"
+    )
+    reason: Optional[str] = Field(default=None, description="Rejection reason (invalid only)")
+
+
+class SkillSyncReport(BaseModel):
+    """Aggregated report of a workspace-sync (dry-run or applied).
+
+    Attributes:
+        items: Per-skill / per-file outcome entries.
+        scanned: Number of SKILL.md files found in the directory.
+        unchanged: DB rows whose rendered file matches disk.
+        rewritten: Files (re)written from the DB row.
+        imported: Disk-only files imported as new DB rows.
+        invalid: Files degraded per-file with a reason.
+    """
+
+    items: list[SkillSyncEntry] = Field(default_factory=list, description="Per-entry outcomes")
+    scanned: int = Field(..., description="SKILL.md files found in the directory")
+    unchanged: int = Field(..., description="Rows matching their disk file")
+    rewritten: int = Field(..., description="Files rewritten from the DB row")
+    imported: int = Field(..., description="Disk-only files imported into the DB")
+    invalid: int = Field(..., description="Files degraded per-file")
+
+
 class SkillGenerateRequest(BaseModel):
     """Request model for LLM-assisted skill draft generation.
 

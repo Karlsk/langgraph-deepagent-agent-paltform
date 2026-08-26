@@ -33,6 +33,8 @@ from app.schemas.agent_apps import (
     SkillRead,
     SkillRefreshEntry,
     SkillRefreshReport,
+    SkillSyncEntry,
+    SkillSyncReport,
     SkillUpdate,
 )
 from app.schemas.base import ApiResponse, PageResult
@@ -249,6 +251,90 @@ def _build_refresh_report(entries: list[dict[str, str]]) -> SkillRefreshReport:
         unchanged=sum(1 for item in items if item.action == "unchanged"),
         backfilled=sum(1 for item in items if item.action == "backfilled"),
         missing=sum(1 for item in items if item.action == "missing"),
+    )
+
+
+# Registered BEFORE the ``/skills/{name}`` routes: FastAPI matches in
+# registration order, so ``workspace-sync`` would otherwise be captured by
+# the ``{name}`` path parameter.
+
+
+@router.get("/skills/workspace-sync", response_model=ApiResponse[SkillSyncReport])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
+async def plan_skill_workspace_sync(
+    request: Request,
+    db: DBSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ApiResponse[SkillSyncReport]:
+    """Dry-run the workspace sync (zero writes).
+
+    Reconciles DB rows against ``{DATA_ROOT}/global/skills/*/SKILL.md``:
+    matching files stay ``unchanged``; drifted/missing files would be
+    ``rewritten`` from the DB (DB is truth); disk-only files would be
+    ``imported``; broken files degrade per-file to ``invalid``.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        db: Request-scoped DB session.
+        user: Authenticated user resolved from the user access token.
+
+    Returns:
+        Envelope carrying the planned sync report.
+    """
+    try:
+        report = await skills_store.plan_workspace_sync(db)
+        return ApiResponse.success(_build_sync_report(report))
+    except Exception as exc:
+        logger.exception("skill_workspace_sync_preview_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/skills/workspace-sync", response_model=ApiResponse[SkillSyncReport])
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["skill"][0])
+async def apply_skill_workspace_sync(
+    request: Request,
+    db: DBSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ApiResponse[SkillSyncReport]:
+    """Execute the workspace sync (directory reconciliation).
+
+    Drifted/missing files are rewritten from the DB row; disk-only files are
+    imported as new rows (``created_by="workspace-sync"``) and normalized;
+    invalid files degrade per-file without blocking the rest. Idempotent:
+    an immediate second call reports everything ``unchanged``.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        db: Request-scoped DB session.
+        user: Authenticated user resolved from the user access token.
+
+    Returns:
+        Envelope carrying the executed sync report.
+    """
+    try:
+        report = await skills_store.apply_workspace_sync(db)
+        return ApiResponse.success(_build_sync_report(report))
+    except Exception as exc:
+        logger.exception("skill_workspace_sync_failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _build_sync_report(report: dict[str, Any]) -> SkillSyncReport:
+    """Aggregate the service-layer sync dict into the API report model."""
+    items = [SkillSyncEntry(name=name, action="unchanged") for name in report["unchanged"]]
+    items += [SkillSyncEntry(name=name, action="rewritten") for name in report["rewritten"]]
+    items += [SkillSyncEntry(name=name, action="imported") for name in report["imported"]]
+    items += [
+        SkillSyncEntry(name=entry["file"], action="invalid", reason=entry["reason"])
+        for entry in report["invalid"]
+    ]
+    return SkillSyncReport(
+        items=items,
+        scanned=report["scanned"],
+        unchanged=len(report["unchanged"]),
+        rewritten=len(report["rewritten"]),
+        imported=len(report["imported"]),
+        invalid=len(report["invalid"]),
     )
 
 

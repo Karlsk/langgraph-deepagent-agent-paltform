@@ -587,9 +587,13 @@ def test_refresh_all_skills_rewrites_lost_and_drifted_files(client: TestClient, 
     by_name = {entry["name"]: entry["action"] for entry in report["items"]}
     assert by_name == {"pdf-export": "rewritten", "csv-clean": "rewritten"}
     assert report["rewritten"] == 2
-    body = _skill_body()["body"]
-    assert (Path(isolated_skills_root) / "global" / "skills" / "pdf-export" / "SKILL.md").read_text(encoding="utf-8") == body
-    assert (Path(isolated_skills_root) / "global" / "skills" / "csv-clean" / "SKILL.md").read_text(encoding="utf-8") == body
+    # Refreshed files carry the rendered frontmatter + DB body.
+    pdf = _skill_body()
+    csv = _skill_body(name="csv-clean", description="Clean CSV")
+    expected_pdf = skills_store.render_skill_md(pdf["name"], pdf["description"], pdf["body"])
+    expected_csv = skills_store.render_skill_md(csv["name"], csv["description"], csv["body"])
+    assert (Path(isolated_skills_root) / "global" / "skills" / "pdf-export" / "SKILL.md").read_text(encoding="utf-8") == expected_pdf
+    assert (Path(isolated_skills_root) / "global" / "skills" / "csv-clean" / "SKILL.md").read_text(encoding="utf-8") == expected_csv
 
 
 def test_refresh_all_reports_unchanged_for_healthy_files(client: TestClient) -> None:
@@ -615,7 +619,10 @@ def test_refresh_single_skill_rewrites_lost_file(client: TestClient, isolated_sk
     assert response.status_code == 200
     report = unwrap(response)
     assert report["items"] == [{"name": "pdf-export", "action": "rewritten"}]
-    assert skill_file.read_text(encoding="utf-8") == _skill_body()["body"]
+    pdf = _skill_body()
+    assert skill_file.read_text(encoding="utf-8") == skills_store.render_skill_md(
+        pdf["name"], pdf["description"], pdf["body"]
+    )
 
 
 def test_refresh_single_unknown_skill_404(client: TestClient) -> None:
@@ -623,6 +630,56 @@ def test_refresh_single_unknown_skill_404(client: TestClient) -> None:
     response = client.post("/skills/ghost/refresh")
 
     assert response.status_code == 404
+
+
+def test_workspace_sync_get_dry_run_has_no_side_effects(
+    client: TestClient, isolated_skills_root: str
+) -> None:
+    """GET /skills/workspace-sync previews the reconciliation without writes."""
+    client.post("/skills", json=_skill_body())
+    skill_file = Path(isolated_skills_root) / "global" / "skills" / "pdf-export" / "SKILL.md"
+    skill_file.write_text("drifted", encoding="utf-8")
+    stray = Path(isolated_skills_root) / "global" / "skills" / "stray" / "SKILL.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("# stray\n\nstray prose\n", encoding="utf-8")
+
+    response = client.get("/skills/workspace-sync")
+
+    assert response.status_code == 200
+    report = unwrap(response)
+    actions = {entry["name"]: entry["action"] for entry in report["items"]}
+    assert actions == {"pdf-export": "rewritten", "stray": "imported"}
+    assert report["scanned"] == 2
+    assert report["rewritten"] == 1
+    assert report["imported"] == 1
+    # Dry-run leaves disk and DB untouched.
+    assert skill_file.read_text(encoding="utf-8") == "drifted"
+    assert client.get("/skills/stray").status_code == 404
+
+
+def test_workspace_sync_post_imports_disk_only_skill(
+    client: TestClient, isolated_skills_root: str
+) -> None:
+    """POST /skills/workspace-sync imports disk-only files (DB row + rewrite)."""
+    client.post("/skills", json=_skill_body())
+    stray = Path(isolated_skills_root) / "global" / "skills" / "stray" / "SKILL.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("# stray\n\nstray prose\n", encoding="utf-8")
+
+    response = client.post("/skills/workspace-sync")
+
+    assert response.status_code == 200
+    report = unwrap(response)
+    actions = {entry["name"]: entry["action"] for entry in report["items"]}
+    assert actions == {"pdf-export": "unchanged", "stray": "imported"}
+    row = unwrap(client.get("/skills/stray"))
+    assert row["created_by"] == "workspace-sync"
+    # Imported file is rewritten with frontmatter; a second pass is a no-op.
+    assert stray.read_text(encoding="utf-8").startswith("---\n")
+    second = unwrap(client.post("/skills/workspace-sync"))
+    assert second["unchanged"] == 2
+    assert second["rewritten"] == 0
+    assert second["imported"] == 0
 
 
 def test_delete_skill_removes_row(client: TestClient) -> None:

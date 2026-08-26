@@ -111,6 +111,11 @@ def _user_skill_file(root: Path, user_id: str, name: str) -> Path:
     return root / "users" / user_id / name / "SKILL.md"
 
 
+def _rendered(name: str, description: str, body: str) -> str:
+    """Expected on-disk SKILL.md content (frontmatter + body)."""
+    return skills_store.render_skill_md(name, description, body)
+
+
 # ---------------------------------------------------------------------------
 # create_global
 # ---------------------------------------------------------------------------
@@ -124,9 +129,9 @@ def test_create_global_writes_file_and_db_row(data_root: Path, db: FakeDBSession
     )
 
     file_path = _global_skill_file(data_root, "greet")
-    assert file_path.read_text(encoding="utf-8") == body
+    assert file_path.read_text(encoding="utf-8") == _rendered("greet", "greets", body)
     assert asset.name == "greet"
-    assert asset.content_hash == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert asset.content_hash == hashlib.sha256(_rendered("greet", "greets", body).encode("utf-8")).hexdigest()
     assert asset.version == 1
     assert asset.created_by == "alice"
     assert db.rows["greet"] is asset
@@ -141,7 +146,9 @@ def test_create_global_duplicate_raises(data_root: Path, db: FakeDBSession) -> N
         asyncio.run(skills_store.create_global(db, name="greet", description="again", body="v2"))
 
     # original content untouched
-    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == "v1"
+    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "v1"
+    )
 
 
 def test_create_global_db_conflict_writes_no_file(data_root: Path, db: FakeDBSession) -> None:
@@ -192,10 +199,14 @@ def test_update_global_rewrites_file_and_bumps_version(data_root: Path, db: Fake
 
     asset = asyncio.run(skills_store.update_global(db, name="greet", description="greets v2", body="v2"))
 
-    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == "v2"
+    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets v2", "v2"
+    )
     assert asset.version == 2
     assert asset.description == "greets v2"
-    assert asset.content_hash == hashlib.sha256(b"v2").hexdigest()
+    assert asset.content_hash == hashlib.sha256(
+        _rendered("greet", "greets v2", "v2").encode("utf-8")
+    ).hexdigest()
 
 
 def test_update_global_missing_skill_raises(data_root: Path, db: FakeDBSession) -> None:
@@ -220,7 +231,9 @@ def test_update_global_file_write_failure_reverts_row(
         asyncio.run(skills_store.update_global(db, name="greet", description="greets v2", body="v2"))
 
     # Disk still holds v1 and the DB row matches it (no hash drift).
-    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == "v1"
+    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "v1"
+    )
     reverted = db.rows["greet"]
     assert reverted.content_hash == original_hash
     assert reverted.version == 1
@@ -271,7 +284,9 @@ def test_list_global_returns_metadata(data_root: Path, db: FakeDBSession) -> Non
     assert alpha["description"] == "d1"
     assert alpha["created_by"] == "bob"
     assert alpha["version"] == 1
-    assert alpha["content_hash"] == hashlib.sha256(b"a").hexdigest()
+    assert alpha["content_hash"] == hashlib.sha256(
+        _rendered("alpha", "d1", "a").encode("utf-8")
+    ).hexdigest()
 
 
 def test_list_global_page_paginates_and_filters(data_root: Path, db: FakeDBSession) -> None:
@@ -324,7 +339,9 @@ def test_materialize_overwrites_stale_user_copy(data_root: Path, db: FakeDBSessi
     asyncio.run(skills_store.update_global(db, name="greet", body="v2"))
     asyncio.run(skills_store.materialize_for_user(db, "user-1", ["greet"]))
 
-    assert _user_skill_file(data_root, "user-1", "greet").read_text(encoding="utf-8") == "v2"
+    assert _user_skill_file(data_root, "user-1", "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "v2"
+    )
 
 
 def test_materialize_missing_global_skill_raises(data_root: Path, db: FakeDBSession) -> None:
@@ -346,8 +363,12 @@ def test_sync_user_skills_refreshes_and_prunes_stale(data_root: Path, db: FakeDB
 
     asyncio.run(skills_store.sync_user_skills(db, "user-1", ["keep", "fresh"]))
 
-    assert _user_skill_file(data_root, "user-1", "fresh").read_text(encoding="utf-8") == "fresh-v3"
-    assert _user_skill_file(data_root, "user-1", "keep").read_text(encoding="utf-8") == "keep-body"
+    assert _user_skill_file(data_root, "user-1", "fresh").read_text(encoding="utf-8") == _rendered(
+        "fresh", "f", "fresh-v3"
+    )
+    assert _user_skill_file(data_root, "user-1", "keep").read_text(encoding="utf-8") == _rendered(
+        "keep", "k", "keep-body"
+    )
     assert not leftover_dir.exists()
 
 
@@ -392,7 +413,9 @@ def test_read_global_selfheals_disk_from_db(data_root: Path, db: FakeDBSession) 
     _global_skill_file(data_root, "greet").unlink()
 
     assert asyncio.run(skills_store.read_global(db, "greet")) == "heal me"
-    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == "heal me"
+    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "heal me"
+    )
 
 
 def test_read_global_legacy_row_without_body_and_disk_raises(
@@ -415,7 +438,9 @@ def test_materialize_into_directory_selfheals_from_db(data_root: Path, db: FakeD
     target = tmp_path / "standalone-skills"
     asyncio.run(skills_store.materialize_into_directory(db, target, ["greet"]))
 
-    assert (target / "greet" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+    assert (target / "greet" / "SKILL.md").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "v1"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +456,9 @@ def test_refresh_rewrites_stale_disk_file(data_root: Path, db: FakeDBSession) ->
     report = asyncio.run(skills_store.refresh_disk_from_db(db))
 
     assert report == [{"name": "greet", "action": "rewritten"}]
-    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == "db body"
+    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "db body"
+    )
 
 
 def test_refresh_rewrites_missing_disk_file(data_root: Path, db: FakeDBSession) -> None:
@@ -442,7 +469,9 @@ def test_refresh_rewrites_missing_disk_file(data_root: Path, db: FakeDBSession) 
     report = asyncio.run(skills_store.refresh_disk_from_db(db, name="greet"))
 
     assert report == [{"name": "greet", "action": "rewritten"}]
-    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == "db body"
+    assert _global_skill_file(data_root, "greet").read_text(encoding="utf-8") == _rendered(
+        "greet", "greets", "db body"
+    )
 
 
 def test_refresh_skips_unchanged_file(data_root: Path, db: FakeDBSession) -> None:
@@ -469,7 +498,10 @@ def test_refresh_backfills_legacy_row_from_disk(data_root: Path, db: FakeDBSessi
 
     assert report == [{"name": "legacy", "action": "backfilled"}]
     assert db.rows["legacy"].body == "# legacy\n\non disk only"
-    assert db.rows["legacy"].content_hash == hashlib.sha256("# legacy\n\non disk only".encode()).hexdigest()
+    # The file is upgraded to the rendered format and the hash tracks it.
+    upgraded = _rendered("legacy", "d", "# legacy\n\non disk only")
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == upgraded
+    assert db.rows["legacy"].content_hash == hashlib.sha256(upgraded.encode()).hexdigest()
     assert db.rows["legacy"].version == 3
 
 
@@ -527,7 +559,7 @@ def test_shared_user_copies_move_to_top_level_users(data_root: Path, db: FakeDBS
 
     assert (data_root / "users" / "user-1" / "greet" / "SKILL.md").read_text(
         encoding="utf-8"
-    ) == "v1"
+    ) == _rendered("greet", "d", "v1")
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +688,7 @@ def test_materialize_for_agent_creates_files(data_root: Path, db: FakeDBSession)
     asyncio.run(skills_store.materialize_for_agent(db, app_id=3, skill_names=["greet"]))
 
     agent_file = data_root / "agents" / "3" / "skills" / "greet" / "SKILL.md"
-    assert agent_file.read_text(encoding="utf-8") == "hello"
+    assert agent_file.read_text(encoding="utf-8") == _rendered("greet", "d", "hello")
 
 
 def test_materialize_for_agent_hash_skip(data_root: Path, db: FakeDBSession) -> None:
@@ -709,8 +741,12 @@ def test_materialize_to_user_combined_aggregates_global_and_agent(
     )
 
     user_dir = data_root / "agents" / "1" / "users" / "7" / "skills"
-    assert (user_dir / "shared" / "SKILL.md").read_text(encoding="utf-8") == "shared-body"
-    assert (user_dir / "sub-only" / "SKILL.md").read_text(encoding="utf-8") == "sub-body"
+    assert (user_dir / "shared" / "SKILL.md").read_text(encoding="utf-8") == _rendered(
+        "shared", "d", "shared-body"
+    )
+    assert (user_dir / "sub-only" / "SKILL.md").read_text(encoding="utf-8") == _rendered(
+        "sub-only", "d", "sub-body"
+    )
 
 
 def test_agent_skill_overrides_global_in_combined(data_root: Path, db: FakeDBSession) -> None:
@@ -777,7 +813,9 @@ def test_materialize_into_combined_directory_resolves_layers(
     )
 
     assert (target / "greet" / "SKILL.md").read_text(encoding="utf-8") == "agent-body"
-    assert (target / "solo" / "SKILL.md").read_text(encoding="utf-8") == "solo-body"
+    assert (target / "solo" / "SKILL.md").read_text(encoding="utf-8") == _rendered(
+        "solo", "d", "solo-body"
+    )
 
 
 # ---------------------------------------------------------------------------

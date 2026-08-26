@@ -398,6 +398,19 @@ export TOKEN=$USER_TOKEN
 所有端点位于 `$BASE/skills*`，需要用户 token（G1 单层认证，直接用 2.2 节登录 token）。
 `name` 规则：`^[a-z0-9][a-z0-9_-]*$`，最长 64 字符，创建后不可改名。
 
+**frontmatter 自动渲染（落盘格式）**：DB 只存纯正文（`body`），所有磁盘写入点
+（创建 / PATCH / 自愈 / refresh / workspace-sync）都会自动渲染 YAML frontmatter
+（`---\nname: ...\ndescription: ...\n---` + 正文）——这是 deepagents `SkillsMiddleware`
+的运行时硬要求（无 frontmatter 的 SKILL.md 会被整个跳过）。`content_hash` 是**渲染后完整文件**
+的 sha256；content 端点（3.3）仍只返回纯正文。验证落盘格式：
+
+```bash
+curl -s -X POST "$BASE/skills/refresh" -H "Authorization: Bearer $TOKEN"   # 全量刷新（存量旧文件也会补齐 frontmatter）
+cat "$DATA_ROOT/global/skills/csv-report/SKILL.md"                          # 头部应见 ---/name:/description:/---
+```
+
+Agent 层 / User 层副本（§6.6）为字节级复制，同样自带 frontmatter。
+
 ### 3.1 创建全局 Skill（直接输入）
 
 ```bash
@@ -480,6 +493,51 @@ curl -s -X POST "$BASE/skills/generate" \
 
 `DELETE $BASE/skills/csv-report` 会级联清理该 skill 的用户副本。由于第 6 节创建的
 AgentApp 会引用该 skill，**先删 skill 会导致发布校验报 422**，所以请保留到收尾阶段再验证。
+
+### 3.7 workspace-sync 目录对账（dry-run → apply → 幂等 → 导入）
+
+对账语义：扫 `{DATA_ROOT}/global/skills/*/SKILL.md` 与 DB 逐条比对。DB 有 + 文件一致 →
+`unchanged`；DB 有 + 文件漂移/缺失 → 以 DB 为准重写（`rewritten`）；DB 缺失 + 文件有 →
+导入为新行（`imported`，`created_by="workspace-sync"`）；解析失败 / frontmatter name 与目录名冲突 /
+超过 1 MiB 的文件 → 逐项降级记 `invalid`，不阻断其余。无删除对齐：目录多余文件不会被删行。
+
+**第一步：dry-run（零副作用）**
+
+```bash
+curl -s "$BASE/skills/workspace-sync" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：200 信封，`data` 为 `{items, scanned, unchanged, rewritten, imported, invalid}`；
+`items` 每项 `{name, action, reason?}`（invalid 项 `name` 是 `<目录>/SKILL.md` 相对路径）。
+调用前后文件与 DB 均无变化。
+
+**第二步：放一个无 DB 行的手工文件，验证导入**
+
+```bash
+mkdir -p "$DATA_ROOT/global/skills/manual-import"
+cat > "$DATA_ROOT/global/skills/manual-import/SKILL.md" <<'EOF'
+# manual-import
+
+手工放置的验证文件，无 frontmatter 也能导入。
+EOF
+curl -s -X POST "$BASE/skills/workspace-sync" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：200 信封，`manual-import` 出现在 `imported`；`GET $BASE/skills/manual-import` 可查到新行，
+`data.created_by == "workspace-sync"`、`data.description` 取正文首行非标题文本（「手工放置的验证文件，…」）；
+磁盘文件被重写为规范化格式（头部见 frontmatter，`name: manual-import`）。
+带 frontmatter 的文件同样支持导入（frontmatter 的 `name` 必须与目录名一致，否则记 `invalid`）。
+
+**第三步：幂等验证（二次 apply 全 unchanged）**
+
+```bash
+curl -s -X POST "$BASE/skills/workspace-sync" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：`data.imported == 0`、`data.rewritten == 0`，所有条目（含 `manual-import`）均为 `unchanged`。
+
+**失败排查**：`invalid` 条目附 `reason`（如 frontmatter 与目录名冲突、文件超大小、YAML 解析失败），
+按 `name` 指向的文件单独修复即可，不影响其余条目。
 
 ---
 

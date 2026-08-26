@@ -2,15 +2,19 @@
 
 Dual-store architecture (DB = source of truth, disk = runtime copy):
 
-- The full SKILL.md body lives in ``SkillAsset.body`` (DB) and in the
-  ``{DATA_ROOT}/global/skills/<name>/SKILL.md`` file. Writes go to both;
-  reads are disk-first with a DB self-heal fallback (``read_global``), so a
-  lost disk copy (e.g. container rebuild without a ``./data`` bind mount)
-  is recovered transparently from the DB.
-- ``SkillAsset.content_hash`` is the rewrite trigger for
-  ``refresh_disk_from_db``: a disk file whose sha256 matches the row hash is
-  left untouched, anything else is rewritten from the DB body. Legacy rows
-  with ``body IS NULL`` are backfilled from disk (their only copy).
+- The SKILL.md body lives in ``SkillAsset.body`` (DB, plain markdown without
+  frontmatter) and in the ``{DATA_ROOT}/global/skills/<name>/SKILL.md`` file.
+  Every disk write renders a YAML frontmatter (``name`` + ``description``,
+  required by the deepagents ``SkillsMiddleware`` parser — files without it
+  are skipped at runtime) from the row fields; reads expose the plain body
+  again (frontmatter is a disk-only concern).
+- ``SkillAsset.content_hash`` is the sha256 of the *rendered* file content
+  (frontmatter + body) and the rewrite trigger for ``refresh_disk_from_db``:
+  a disk file whose sha256 matches the row hash is left untouched, anything
+  else is rewritten from the DB row. Legacy rows with ``body IS NULL`` are
+  backfilled from disk (their only copy); legacy body-only files (created
+  before the frontmatter upgrade) mismatch by construction and are rewritten
+  with frontmatter on the next refresh pass.
 
 Directory conventions (G2 three-layer workspace, rooted at
 ``settings.DATA_ROOT``; spec-g2-workspace v3.3 §2.1):
@@ -39,8 +43,9 @@ import shutil
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
+import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -68,6 +73,52 @@ Required structure:
 
 Keep it concise, concrete and directly executable by an agent.
 """
+
+
+# ---------------------------------------------------------------------------
+# SKILL.md frontmatter rendering (deepagents SkillsMiddleware requires it)
+# ---------------------------------------------------------------------------
+
+# Same shape the deepagents parser uses (``_parse_skill_metadata``), kept in
+# sync so anything we render is guaranteed to parse at runtime.
+_FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def render_skill_md(name: str, description: str, body: str) -> str:
+    """Render the full on-disk SKILL.md: YAML frontmatter + plain body.
+
+    The frontmatter carries exactly the two DB-owned fields (``name`` /
+    ``description``); ``yaml.safe_dump`` handles quoting/escaping of special
+    characters. The DB keeps storing the plain body — frontmatter is a
+    disk-only concern regenerated from the row on every write.
+
+    Args:
+        name: Skill name (must equal the skill directory name).
+        description: Human-readable description from the DB row.
+        body: Plain markdown body from the DB row.
+
+    Returns:
+        The complete SKILL.md file content.
+    """
+    frontmatter = yaml.safe_dump(
+        {"name": name, "description": description}, allow_unicode=True, sort_keys=False
+    )
+    return f"---\n{frontmatter}---\n{body}"
+
+
+def strip_frontmatter(text: str) -> str:
+    """Strip a leading YAML frontmatter block, returning the plain body.
+
+    Text without a frontmatter block (legacy body-only files) passes through
+    unchanged.
+
+    Args:
+        text: Raw SKILL.md file content.
+
+    Returns:
+        The markdown body without frontmatter.
+    """
+    return _FRONTMATTER_PATTERN.sub("", text, count=1)
 
 
 # ---------------------------------------------------------------------------
@@ -280,14 +331,15 @@ async def create_global(
 
     # DB-first ordering: the metadata row is committed before any disk write,
     # so a uniqueness conflict (concurrent create of the same name) can never
-    # leave an orphaned SKILL.md behind a lost insert race. The full body is
+    # leave an orphaned SKILL.md behind a lost insert race. The plain body is
     # stored in the row (dual-store source of truth); the disk file is the
-    # runtime copy consumed by FilesystemBackend.
+    # rendered runtime copy (frontmatter + body) consumed by FilesystemBackend.
+    rendered = render_skill_md(name, description, body)
     asset = SkillAsset(
         name=name,
         description=description,
         body=body,
-        content_hash=_sha256(body),
+        content_hash=_sha256(rendered),
         created_by=created_by,
     )
     session.add(asset)
@@ -298,7 +350,7 @@ async def create_global(
         raise ValueError(f"skill {name!r} already exists") from None
 
     try:
-        await asyncio.to_thread(_atomic_write, _global_skill_file(name), body)
+        await asyncio.to_thread(_atomic_write, _global_skill_file(name), rendered)
     except OSError:
         # Compensate the orphaned row so DB and disk stay consistent.
         session.delete(asset)
@@ -340,17 +392,24 @@ async def update_global(
     previous_description = asset.description
     previous_body = asset.body
     if body is not None:
-        asset.content_hash = _sha256(body)
         asset.body = body
     if description is not None:
         asset.description = description
     asset.version += 1
+    # The frontmatter embeds both fields, so ANY provided change (body and/or
+    # description) re-renders the file and refreshes the rendered-content
+    # hash. Legacy rows with ``body IS NULL`` keep their disk file untouched
+    # (it is their only copy until a refresh backfill recovers the body).
+    rendered: str | None = None
+    if asset.body is not None:
+        rendered = render_skill_md(name, asset.description, asset.body)
+        asset.content_hash = _sha256(rendered)
     session.add(asset)
     session.commit()
 
-    if body is not None:
+    if rendered is not None:
         try:
-            await asyncio.to_thread(_atomic_write, _global_skill_file(name), body)
+            await asyncio.to_thread(_atomic_write, _global_skill_file(name), rendered)
         except OSError:
             asset.content_hash = previous_hash
             asset.version = previous_version
@@ -441,21 +500,20 @@ async def list_global_page(
     )
 
 
-async def read_global(session: Session, name: str) -> str:
-    """Read the raw SKILL.md body of a global skill (disk-first, DB self-heal).
+async def _read_global_file_content(session: Session, name: str) -> str:
+    """Read the rendered SKILL.md file content (disk-first, DB self-heal).
 
-    Dual-store read path: the disk file is the fast path; when it is missing
-    (e.g. lost on a container rebuild) the body is recovered from the DB row
-    and the disk file is rewritten so subsequent reads hit the fast path
-    again. Only when both copies are gone (or the row predates dual-store
-    with ``body IS NULL``) is the skill genuinely not found.
+    Internal materialization primitive: returns the FULL on-disk content
+    (frontmatter + body) so copies at every layer keep the frontmatter the
+    runtime parser requires. The self-heal path re-renders the file from the
+    DB row when the disk copy is gone.
 
     Args:
         session: SQLModel DB session (self-heal fallback source).
         name: Skill name.
 
     Returns:
-        The markdown body.
+        The rendered SKILL.md file content.
 
     Raises:
         ValueError: If the name is invalid or the skill exists neither on
@@ -467,10 +525,35 @@ async def read_global(session: Session, name: str) -> str:
 
     asset = session.get(SkillAsset, name)
     if asset is not None and asset.body is not None:
-        await asyncio.to_thread(_atomic_write, path, asset.body)
+        rendered = render_skill_md(asset.name, asset.description, asset.body)
+        await asyncio.to_thread(_atomic_write, path, rendered)
         logger.warning("skill_disk_selfhealed_from_db", name=name)
-        return asset.body
+        return rendered
     raise ValueError(f"skill {name!r} not found")
+
+
+async def read_global(session: Session, name: str) -> str:
+    """Read the raw SKILL.md body of a global skill (disk-first, DB self-heal).
+
+    Dual-store read path: the disk file is the fast path (its frontmatter is
+    stripped before returning); when it is missing (e.g. lost on a container
+    rebuild) the body is recovered from the DB row and the disk file is
+    rewritten so subsequent reads hit the fast path again. Only when both
+    copies are gone (or the row predates dual-store with ``body IS NULL``)
+    is the skill genuinely not found.
+
+    Args:
+        session: SQLModel DB session (self-heal fallback source).
+        name: Skill name.
+
+    Returns:
+        The markdown body (frontmatter stripped).
+
+    Raises:
+        ValueError: If the name is invalid or the skill exists neither on
+            disk nor as a DB row with a body.
+    """
+    return strip_frontmatter(await _read_global_file_content(session, name))
 
 
 async def materialize_for_user(session: Session, user_id: str, skill_names: Sequence[str]) -> None:
@@ -489,8 +572,8 @@ async def materialize_for_user(session: Session, user_id: str, skill_names: Sequ
     uid = _validate_user_id(user_id)
     names = list(skill_names)
     for name in names:
-        body = await read_global(session, name)
-        await asyncio.to_thread(_atomic_write, _shared_user_skill_file(uid, name), body)
+        content = await _read_global_file_content(session, name)
+        await asyncio.to_thread(_atomic_write, _shared_user_skill_file(uid, name), content)
     logger.info("skills_materialized_for_user", user_id=uid, skill_count=len(names))
 
 
@@ -518,8 +601,8 @@ async def materialize_into_directory(
     """
     for name in skill_names:
         _validate_skill_name(name)
-        body = await read_global(session, name)
-        await asyncio.to_thread(_atomic_write, target_dir / name / _SKILL_FILE_NAME, body)
+        content = await _read_global_file_content(session, name)
+        await asyncio.to_thread(_atomic_write, target_dir / name / _SKILL_FILE_NAME, content)
     logger.info(
         "skills_materialized_into_directory",
         target_dir=str(target_dir),
@@ -575,9 +658,9 @@ async def materialize_for_agent(
     written = 0
     for name in skill_names:
         _validate_skill_name(name)
-        body = await read_global(session, name)
+        content = await _read_global_file_content(session, name)
         target = target_dir / name / _SKILL_FILE_NAME
-        if await _hash_compare_or_write(target, body):
+        if await _hash_compare_or_write(target, content):
             written += 1
     logger.info(
         "agent_skills_materialized",
@@ -765,13 +848,17 @@ async def sync_user_skills(session: Session, user_id: str, associated_names: Seq
 async def refresh_disk_from_db(session: Session, name: str | None = None) -> list[dict[str, str]]:
     """Refresh the disk SKILL.md copies from the DB bodies (DB is truth).
 
-    ``content_hash`` is the rewrite trigger: a disk file whose sha256 equals
-    the row's ``content_hash`` is left untouched (``unchanged``); anything
-    else (missing or drifted) is rewritten from the DB body
-    (``rewritten``). Legacy rows with ``body IS NULL`` (created before
+    ``content_hash`` is the sha256 of the *rendered* file (frontmatter +
+    body). A disk file matching that expected rendered content is left
+    untouched (``unchanged``); anything else (missing, drifted, or a legacy
+    body-only file whose legacy row hash happens to equal the plain-body
+    hash) is rewritten from the DB row and the row hash is resynced
+    (``rewritten``) — this is also the one-shot migration path that upgrades
+    pre-frontmatter files. Legacy rows with ``body IS NULL`` (created before
     dual-store) are backfilled from their disk file — the only surviving
-    copy — and their ``content_hash`` is resynced to it (``backfilled``);
-    when both copies are gone the entry is reported ``missing``.
+    copy — and their file is upgraded to the rendered format in the same
+    pass (``backfilled``); when both copies are gone the entry is reported
+    ``missing``.
 
     Args:
         session: SQLModel DB session.
@@ -797,34 +884,41 @@ async def refresh_disk_from_db(session: Session, name: str | None = None) -> lis
     for asset in assets:
         path = _global_skill_file(asset.name)
         if asset.body is None:
-            # Legacy pre-dual-store row: the disk file is the only copy.
+            # Legacy pre-dual-store row: the disk file is the only copy. The
+            # body is recovered frontmatter-stripped and the file is upgraded
+            # in place to the rendered format in the same pass.
             if path.exists():
-                disk_body = await asyncio.to_thread(path.read_text, "utf-8")
-                resynced_hash = _sha256(disk_body)
-                if resynced_hash != asset.content_hash:
-                    logger.warning(
-                        "skill_legacy_hash_resynced_from_disk",
-                        name=asset.name,
-                        old_hash=asset.content_hash,
-                    )
-                    asset.content_hash = resynced_hash
-                asset.body = disk_body
+                disk_text = await asyncio.to_thread(path.read_text, "utf-8")
+                asset.body = strip_frontmatter(disk_text)
+                rendered = render_skill_md(asset.name, asset.description, asset.body)
+                asset.content_hash = _sha256(rendered)
                 session.add(asset)
                 session.commit()
+                if disk_text != rendered:
+                    await asyncio.to_thread(_atomic_write, path, rendered)
+                    logger.info("skill_disk_refreshed_from_db", name=asset.name)
                 report.append({"name": asset.name, "action": "backfilled"})
             else:
                 logger.error("skill_unrecoverable_body_and_disk_lost", name=asset.name)
                 report.append({"name": asset.name, "action": "missing"})
             continue
 
+        rendered = render_skill_md(asset.name, asset.description, asset.body)
+        expected_hash = _sha256(rendered)
         disk_hash: str | None = None
         if path.exists():
-            disk_body = await asyncio.to_thread(path.read_text, "utf-8")
-            disk_hash = _sha256(disk_body)
-        if disk_hash == asset.content_hash:
+            disk_text = await asyncio.to_thread(path.read_text, "utf-8")
+            disk_hash = _sha256(disk_text)
+        if disk_hash == expected_hash:
             report.append({"name": asset.name, "action": "unchanged"})
         else:
-            await asyncio.to_thread(_atomic_write, path, asset.body)
+            await asyncio.to_thread(_atomic_write, path, rendered)
+            # Legacy rows hash the plain body; resync to the rendered content
+            # so the next refresh pass settles on ``unchanged``.
+            if asset.content_hash != expected_hash:
+                asset.content_hash = expected_hash
+                session.add(asset)
+                session.commit()
             logger.info("skill_disk_refreshed_from_db", name=asset.name)
             report.append({"name": asset.name, "action": "rewritten"})
 
@@ -835,6 +929,272 @@ async def refresh_disk_from_db(session: Session, name: str | None = None) -> lis
         unchanged=sum(1 for entry in report if entry["action"] == "unchanged"),
         backfilled=sum(1 for entry in report if entry["action"] == "backfilled"),
         missing=sum(1 for entry in report if entry["action"] == "missing"),
+    )
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Workspace sync (directory reconciliation, mirrors mcp_stdio_registry)
+# ---------------------------------------------------------------------------
+
+# Single SKILL.md upper bound for the sync scan (oversized files degrade to
+# ``invalid`` instead of being read into memory).
+_SYNC_MAX_FILE_BYTES = 1_048_576
+
+
+class SkillDirScan(TypedDict):
+    """Result of scanning the global skills directory.
+
+    Attributes:
+        valid: Parsed disk payloads keyed by skill name; each carries
+            ``name``/``description``/``body`` plus ``hash`` (sha256 of the
+            raw file content).
+        invalid: Unusable SKILL.md files with the rejection reason.
+    """
+
+    valid: dict[str, dict[str, str]]
+    invalid: list[dict[str, str]]
+
+
+def _first_description_line(body: str) -> str:
+    """Return the first non-empty, non-heading line of a markdown body.
+
+    Import fallback for legacy files without frontmatter: the description is
+    derived from the body's first prose line (empty string when none).
+    """
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    return ""
+
+
+def _parse_disk_skill(path: Path) -> dict[str, str]:
+    """Parse one on-disk SKILL.md into ``{name, description, body, hash}``.
+
+    Files WITH frontmatter take ``name``/``description`` from it (a
+    frontmatter ``name`` conflicting with the directory name is rejected);
+    legacy files WITHOUT frontmatter fall back to the directory name and the
+    body's first prose line.
+
+    Args:
+        path: Absolute path of the SKILL.md file.
+
+    Returns:
+        Parsed payload including the raw-file sha256 under ``hash``.
+
+    Raises:
+        ValueError: When the file is oversized, undecodable, empty-bodied,
+            has broken frontmatter, an invalid directory name, or a
+            frontmatter/directory name conflict.
+    """
+    raw = path.read_bytes()
+    if len(raw) > _SYNC_MAX_FILE_BYTES:
+        raise ValueError(f"file exceeds the {_SYNC_MAX_FILE_BYTES}-byte sync limit")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"file is not valid UTF-8: {exc}") from exc
+
+    dir_name = path.parent.name
+    if not _NAME_PATTERN.match(dir_name):
+        raise ValueError(f"directory name {dir_name!r} violates the skill name pattern")
+
+    body = strip_frontmatter(text)
+    if not body.strip():
+        raise ValueError("skill body is empty")
+
+    name = dir_name
+    description = ""
+    match = _FRONTMATTER_PATTERN.match(text)
+    if match is not None:
+        meta = yaml.safe_load(match.group(1))
+        if not isinstance(meta, dict):
+            raise ValueError("frontmatter is not a YAML mapping")
+        fm_name = meta.get("name")
+        if fm_name is not None and str(fm_name) != dir_name:
+            raise ValueError(
+                f"frontmatter name {str(fm_name)!r} conflicts with directory name {dir_name!r}"
+            )
+        fm_description = meta.get("description")
+        if fm_description is not None:
+            description = str(fm_description)
+    if not description:
+        description = _first_description_line(body)
+
+    return {
+        "name": name,
+        "description": description,
+        "body": body,
+        "hash": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def scan_global_dir() -> SkillDirScan:
+    """Scan ``{DATA_ROOT}/global/skills/*/SKILL.md`` into valid + invalid sets.
+
+    Broken or oversized files degrade per file (recorded with the reason)
+    and never block the rest of the directory (pattern mirrors
+    ``scan_stdio_manifests``).
+
+    Returns:
+        Parsed payloads keyed by skill name plus the invalid file list.
+    """
+    result: SkillDirScan = {"valid": {}, "invalid": []}
+    root = _skills_root()
+    if not root.is_dir():
+        logger.warning("skill_global_root_missing", root=str(root))
+        return result
+
+    for path in sorted(root.glob(f"*/{_SKILL_FILE_NAME}")):
+        rel_file = f"{path.parent.name}/{path.name}"
+        try:
+            entry = _parse_disk_skill(path)
+        except Exception as exc:  # noqa: BLE001 — per-file degradation
+            logger.warning("skill_workspace_sync_invalid_file", file=rel_file, error=str(exc))
+            result["invalid"].append({"file": rel_file, "reason": str(exc)})
+            continue
+        name = entry["name"]
+        if name in result["valid"]:
+            result["invalid"].append({"file": rel_file, "reason": f"duplicate skill name '{name}'"})
+            continue
+        result["valid"][name] = entry
+    return result
+
+
+def _init_workspace_sync_report(scan: SkillDirScan) -> dict[str, Any]:
+    """Build the empty workspace-sync report skeleton from a scan result."""
+    return {
+        "scanned": len(scan["valid"]) + len(scan["invalid"]),
+        "unchanged": [],
+        "rewritten": [],
+        "imported": [],
+        "invalid": list(scan["invalid"]),
+    }
+
+
+async def plan_workspace_sync(session: Session) -> dict[str, Any]:
+    """Dry-run the workspace sync: reconcile DB rows against the directory.
+
+    Zero writes. Outcome buckets (D2 semantics): DB row whose rendered file
+    matches disk -> ``unchanged``; drifted or missing file -> ``rewritten``
+    (DB is the source of truth); disk-only file -> ``imported``; unparseable
+    file -> ``invalid`` (per-file, never blocking).
+
+    Args:
+        session: SQLModel DB session.
+
+    Returns:
+        Report dict with ``scanned`` count and ``unchanged``/``rewritten``/
+        ``imported`` name lists plus the ``invalid`` file list.
+    """
+    scan = scan_global_dir()
+    assets = {asset.name: asset for asset in session.exec(select(SkillAsset)).all()}
+    report = _init_workspace_sync_report(scan)
+
+    for name, asset in assets.items():
+        if asset.body is None:
+            # Legacy NULL-body rows cannot be rendered; refresh's backfill
+            # path owns their recovery.
+            report["invalid"].append(
+                {"file": f"{name}/{_SKILL_FILE_NAME}", "reason": "db_row_has_null_body"}
+            )
+            continue
+        disk = scan["valid"].get(name)
+        expected_hash = _sha256(render_skill_md(asset.name, asset.description, asset.body))
+        if disk is not None and disk["hash"] == expected_hash:
+            report["unchanged"].append(name)
+        else:
+            report["rewritten"].append(name)
+
+    report["imported"].extend(name for name in scan["valid"] if name not in assets)
+    logger.info(
+        "skill_workspace_sync_completed",
+        mode="dry-run",
+        scanned=report["scanned"],
+        unchanged=len(report["unchanged"]),
+        rewritten=len(report["rewritten"]),
+        imported=len(report["imported"]),
+        invalid=len(report["invalid"]),
+    )
+    return report
+
+
+async def apply_workspace_sync(session: Session) -> dict[str, Any]:
+    """Execute the workspace sync: reconcile DB rows against the directory.
+
+    Drifted/missing files are rewritten from the DB row (DB is truth); the
+    stored ``content_hash`` is resynced to the rendered content. Disk-only
+    files are imported as new rows (``created_by="workspace-sync"``) and
+    rewritten to the normalized rendered format. Invalid files degrade per
+    file and never block the rest; a second pass reports everything
+    ``unchanged`` (idempotent).
+
+    Args:
+        session: SQLModel DB session.
+
+    Returns:
+        The executed sync report (same shape as ``plan_workspace_sync``).
+    """
+    scan = scan_global_dir()
+    assets = {asset.name: asset for asset in session.exec(select(SkillAsset)).all()}
+    report = _init_workspace_sync_report(scan)
+
+    for name, asset in assets.items():
+        if asset.body is None:
+            report["invalid"].append(
+                {"file": f"{name}/{_SKILL_FILE_NAME}", "reason": "db_row_has_null_body"}
+            )
+            continue
+        rendered = render_skill_md(asset.name, asset.description, asset.body)
+        expected_hash = _sha256(rendered)
+        disk = scan["valid"].get(name)
+        if disk is not None and disk["hash"] == expected_hash:
+            report["unchanged"].append(name)
+            continue
+        await asyncio.to_thread(_atomic_write, _global_skill_file(name), rendered)
+        # Legacy rows may still hash the plain body; resync so the next
+        # pass settles on ``unchanged``.
+        if asset.content_hash != expected_hash:
+            asset.content_hash = expected_hash
+            session.add(asset)
+            session.commit()
+        logger.info("skill_disk_refreshed_from_db", name=name)
+        report["rewritten"].append(name)
+
+    for name in sorted(scan["valid"]):
+        if name in assets:
+            continue
+        entry = scan["valid"][name]
+        rendered = render_skill_md(name, entry["description"], entry["body"])
+        row = SkillAsset(
+            name=name,
+            description=entry["description"],
+            body=entry["body"],
+            content_hash=_sha256(rendered),
+            created_by="workspace-sync",
+        )
+        session.add(row)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            report["invalid"].append(
+                {"file": f"{name}/{_SKILL_FILE_NAME}", "reason": "db_insert_conflict"}
+            )
+            continue
+        await asyncio.to_thread(_atomic_write, _global_skill_file(name), rendered)
+        logger.info("skill_imported_from_disk", name=name)
+        report["imported"].append(name)
+
+    logger.info(
+        "skill_workspace_sync_completed",
+        mode="apply",
+        scanned=report["scanned"],
+        unchanged=len(report["unchanged"]),
+        rewritten=len(report["rewritten"]),
+        imported=len(report["imported"]),
+        invalid=len(report["invalid"]),
     )
     return report
 
