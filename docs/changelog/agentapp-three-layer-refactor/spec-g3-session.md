@@ -632,3 +632,154 @@ async def test_message_count_reflects_langgraph_state(user_token, session_id):
 1. **后端回滚**：revert `app/api/v1/sessions.py` 新文件（保留 schema 注释）；旧 `/auth/session` 注释端点恢复为简化版
 2. **前端回滚**：revert `agent-web/src/api/sessions.ts` 新文件；旧 `chatbot.ts` 接口恢复
 3. **数据无影响**：本 Phase 不涉及 schema 迁移；新表（refresh_token 表是 Phase 1）已存在
+
+---
+
+## 12. G2 集成接口预留（2026-08-25 追加）
+
+> 本节是 G2（spec-g2-workspace.md）审查期间由 G2 团队指定的集成接口。G3 实施时**必须按本节约定**调用 G2 提供的函数 / 端点。
+
+### 12.1 G2 提供的接口
+
+G2 实施完成后，将提供以下接口供 G3 使用：
+
+#### 12.1.1 `ensure_user_workspace_up_to_date` 函数
+
+```python
+# app/services/agents/skills_store.py
+async def ensure_user_workspace_up_to_date(
+    session: Session,
+    *,
+    user_id: str,
+    app_id: int,
+) -> None:
+    """Lazy 校验：User 层与 (Global + Agent) 集合是否一致，不一致则增量同步。
+
+    G3 在以下时机调用：
+    - POST /sessions（创建 session，不带 session_id）入口
+    - GET /sessions/{session_id}（加载 session，带 session_id）入口
+    - 其他需要 user 层 skill 最新副本的场景
+
+    内部行为：
+    - 比对 AgentApp.workspace_hash（DB）与 user 层实际 hash
+    - 不一致 → 调用 materialize_to_user_combined 增量同步
+    - 一致 → 跳过
+    """
+```
+
+#### 12.1.2 `lazy_workspace_sync` 参数
+
+```python
+# app/services/agents/runtime.py get_runtime
+async def get_runtime(
+    session: Session,
+    agent_app_id: Optional[str],
+    *,
+    user_id: int,
+    lazy_workspace_sync: bool = True,  # G3 可显式控制
+) -> AgentAppRuntime:
+    ...
+    if lazy_workspace_sync:
+        await ensure_user_workspace_up_to_date(
+            session, user_id=str(user_id), app_id=app_cfg.id
+        )
+    ...
+```
+
+### 12.2 G3 集成点
+
+#### 12.2.1 `POST /sessions`（创建）
+
+```python
+# app/api/v1/sessions.py（建议位置）
+async def create_session(
+    payload: SessionCreate,
+    user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db_session),
+) -> ApiResponse[SessionRead]:
+    """创建 session 入口：先 lazy 校验 user 层 workspace。"""
+    app_id = payload.agent_app_id or await _resolve_default_agent_app_id(db)
+
+    # G2 集成：lazy 校验 user 层 workspace
+    await ensure_user_workspace_up_to_date(
+        db, user_id=str(user.id), app_id=app_id
+    )
+
+    # 创建 session 记录（既有逻辑）
+    session_row = await db_service.create_session(
+        user_id=user.id,
+        agent_app_id=app_id,
+        name=payload.name,
+    )
+
+    return ApiResponse.success(session_row)
+```
+
+#### 12.2.2 `GET /sessions/{session_id}`（加载）
+
+```python
+async def get_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db_session),
+) -> ApiResponse[SessionRead]:
+    """加载 session：先 lazy 校验 user 层 workspace。"""
+    session_row = await db_service.get_session(session_id, user_id=user.id)
+    if session_row is None:
+        raise HTTPException(404, "session not found")
+
+    # G2 集成：lazy 校验 user 层 workspace
+    app_id = int(session_row.agent_app_id)
+    await ensure_user_workspace_up_to_date(
+        db, user_id=str(user.id), app_id=app_id
+    )
+
+    return ApiResponse.success(session_row)
+```
+
+#### 12.2.3 `chatbot` 端点（若 G3 不废弃）
+
+若 G3 §1.2 的"chatbot 整体废弃"决策**未来被推翻**，chatbot 端点在 chat 前必须先 lazy 校验：
+
+```python
+async def chat(
+    payload: ChatRequest,
+    user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db_session),
+):
+    # G2 集成：每次 chat 前 lazy 校验
+    await ensure_user_workspace_up_to_date(
+        db, user_id=str(user.id), app_id=int(payload.agent_app_id)
+    )
+    ...
+```
+
+### 12.3 G3 session JSON 文件路径（若采用 JSON 视图层）
+
+按 G2 §1.1（v3）目录结构，session JSON 文件归属：
+
+```
+{DATA_ROOT}/agents/<app_id>/users/<user_id>/sessions/<session_id>.json
+```
+
+**清理时机**：
+- 删除 session 时同步清理 JSON 文件（DELETE /sessions/{id} 端点）
+- 删除 AgentApp 时清理整个 agents/<app_id>/ 子树（含所有 session）
+- 取消 user 关联时清理该 app 下该 user 的 sessions 目录
+
+### 12.4 G3 集成验证清单
+
+G3 实施时必须验证：
+
+- [ ] `POST /sessions` 入口调用 `ensure_user_workspace_up_to_date`
+- [ ] `GET /sessions/{session_id}` 入口调用 `ensure_user_workspace_up_to_date`
+- [ ] session JSON 文件路径符合 `{DATA_ROOT}/agents/<app_id>/users/<user_id>/sessions/<session_id>.json`
+- [ ] 删除 session 时同步清理 JSON 文件
+- [ ] 单元测试覆盖 lazy 校验触发逻辑（mock `ensure_user_workspace_up_to_date`）
+- [ ] 集成测试覆盖 user 在不同 agent 下 session 隔离
+
+### 12.5 不在 G3 集成范围
+
+- G2 路径 helper（`_data_root` / `_agent_skill_dir` / `_user_skill_file` 等）由 G2 实现，G3 不直接调用
+- G2 启动校验（`ensure_default_agent_workspace`）由 G2 在 lifespan 触发，G3 不重复
+- G2 的 `UserAgentAppAssociation` 表由 G2 管理，G3 只读
