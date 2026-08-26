@@ -635,9 +635,10 @@ async def test_message_count_reflects_langgraph_state(user_token, session_id):
 
 ---
 
-## 12. G2 集成接口预留（2026-08-25 追加）
+## 12. G2 集成接口预留（2026-08-25 追加；2026-08-26 更新签名）
 
 > 本节是 G2（spec-g2-workspace.md）审查期间由 G2 团队指定的集成接口。G3 实施时**必须按本节约定**调用 G2 提供的函数 / 端点。
+> **签名一致性说明**：此接口签名与 G2 spec §4.3、§9.3、§12.1 完全一致。
 
 ### 12.1 G2 提供的接口
 
@@ -646,13 +647,13 @@ G2 实施完成后，将提供以下接口供 G3 使用：
 #### 12.1.1 `ensure_user_workspace_up_to_date` 函数
 
 ```python
-# app/services/agents/skills_store.py
+# app/services/agents/agent_apps_service.py（统一入口）
 async def ensure_user_workspace_up_to_date(
-    session: Session,
+    session: AsyncSession,
     *,
-    user_id: str,
+    user_id: int,
     app_id: int,
-) -> None:
+) -> bool:
     """Lazy 校验：User 层与 (Global + Agent) 集合是否一致，不一致则增量同步。
 
     G3 在以下时机调用：
@@ -662,8 +663,19 @@ async def ensure_user_workspace_up_to_date(
 
     内部行为：
     - 比对 AgentApp.workspace_hash（DB）与 user 层实际 hash
-    - 不一致 → 调用 materialize_to_user_combined 增量同步
-    - 一致 → 跳过
+    - 不一致 → 调用 materialize_to_user_combined 增量同步，返回 True
+    - 一致 → 跳过，返回 False
+
+    Args:
+        session: 数据库会话（AsyncSession）
+        user_id: 用户 ID（int，从 API 层 get_current_user 获取）
+        app_id: AgentApp ID
+
+    Returns:
+        bool: True 表示执行了重新复制；False 表示 hash 命中跳过。
+
+    Raises:
+        AgentAppNotFoundError: app_id 不存在
     """
 ```
 
@@ -672,8 +684,8 @@ async def ensure_user_workspace_up_to_date(
 ```python
 # app/services/agents/runtime.py get_runtime
 async def get_runtime(
-    session: Session,
-    agent_app_id: Optional[str],
+    session: AsyncSession,
+    app_id: int,
     *,
     user_id: int,
     lazy_workspace_sync: bool = True,  # G3 可显式控制
@@ -681,7 +693,7 @@ async def get_runtime(
     ...
     if lazy_workspace_sync:
         await ensure_user_workspace_up_to_date(
-            session, user_id=str(user_id), app_id=app_cfg.id
+            session, user_id=user_id, app_id=app_cfg.id
         )
     ...
 ```
@@ -695,14 +707,14 @@ async def get_runtime(
 async def create_session(
     payload: SessionCreate,
     user: User = Depends(get_current_user),
-    db: DBSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_db_session),
 ) -> ApiResponse[SessionRead]:
     """创建 session 入口：先 lazy 校验 user 层 workspace。"""
-    app_id = payload.agent_app_id or await _resolve_default_agent_app_id(db)
+    app_id = payload.agent_app_id or await _resolve_default_agent_app_id(session)
 
     # G2 集成：lazy 校验 user 层 workspace
     await ensure_user_workspace_up_to_date(
-        db, user_id=str(user.id), app_id=app_id
+        session, user_id=user.id, app_id=app_id
     )
 
     # 创建 session 记录（既有逻辑）
@@ -721,7 +733,7 @@ async def create_session(
 async def get_session(
     session_id: str,
     user: User = Depends(get_current_user),
-    db: DBSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_db_session),
 ) -> ApiResponse[SessionRead]:
     """加载 session：先 lazy 校验 user 层 workspace。"""
     session_row = await db_service.get_session(session_id, user_id=user.id)
@@ -729,9 +741,9 @@ async def get_session(
         raise HTTPException(404, "session not found")
 
     # G2 集成：lazy 校验 user 层 workspace
-    app_id = int(session_row.agent_app_id)
+    app_id = session_row.agent_app_id
     await ensure_user_workspace_up_to_date(
-        db, user_id=str(user.id), app_id=app_id
+        session, user_id=user.id, app_id=app_id
     )
 
     return ApiResponse.success(session_row)
@@ -745,11 +757,11 @@ async def get_session(
 async def chat(
     payload: ChatRequest,
     user: User = Depends(get_current_user),
-    db: DBSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_db_session),
 ):
     # G2 集成：每次 chat 前 lazy 校验
     await ensure_user_workspace_up_to_date(
-        db, user_id=str(user.id), app_id=int(payload.agent_app_id)
+        session, user_id=user.id, app_id=payload.agent_app_id
     )
     ...
 ```
@@ -781,5 +793,5 @@ G3 实施时必须验证：
 ### 12.5 不在 G3 集成范围
 
 - G2 路径 helper（`_data_root` / `_agent_skill_dir` / `_user_skill_file` 等）由 G2 实现，G3 不直接调用
-- G2 启动校验（`ensure_default_agent_workspace`）由 G2 在 lifespan 触发，G3 不重复
+- G2 启动校验（`ensure_all_agent_workspaces`）由 G2 在 lifespan 触发，G3 不重复
 - G2 的 `UserAgentAppAssociation` 表由 G2 管理，G3 只读

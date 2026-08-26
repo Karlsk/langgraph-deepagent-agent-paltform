@@ -112,12 +112,12 @@ Phase 2 引入 Agent 层后，需要确定 `{AGENTS_ROOT}/<??>/skills/<name>/SKI
 
 ### 决策
 
-| 待决 | 占位 |
+| 待决 | 决定 |
 |---|---|
-| 选项 | ☐ `<app_id>`（推荐） ☐ `<app_name>` ☐ `<app_id>_<app_name>` |
-| 决策人 | |
-| 决策时间 | |
-| 备注 | |
+| 选项 | ✅ **采纳 `<app_id>`**（v3 修订版最终决策） |
+| 决策人 | 项目架构组 |
+| 决策时间 | 2026-08-26 |
+| 备注 | v3 评审通过；详见 `spec-g2-workspace.md` §2.1 与 `spec-g2-review.md` §1.4；主键稳定性优先，name 未来若放开可改。路径模板：`{DATA_ROOT}/agents/<app_id>/skills/<name>/SKILL.md` |
 
 ---
 
@@ -144,12 +144,12 @@ Phase 2 引入 Agent 层后，可能出现 Global 与 Agent 层同名 skill 的�
 
 ### 决策
 
-| 待决 | 占位 |
+| 待决 | 决定 |
 |---|---|
-| 选项 | ☐ Agent 覆盖 Global（推荐） ☐ Global 永远优先 ☐ 按引用顺序 |
-| 决策人 | |
-| 决策时间 | |
-| 备注 | |
+| 选项 | ✅ **采纳 "Agent 覆盖 Global"**（v3 修订版最终决策） |
+| 决策人 | 项目架构组 |
+| 决策时间 | 2026-08-26 |
+| 备注 | v3 评审通过；详见 `spec-g2-workspace.md` §4.3 与 `spec-g2-review.md` §3.4.3；Agent 层是 publish 时的快照，本质是 Agent 拥有者对 Global 的"私有化定制"，符合用户对"Agent 专属"的预期。实现逻辑：`materialize_to_user_combined` 中 `agent_path if agent_path.exists() else _global_skill_file(name)` |
 
 ---
 
@@ -251,6 +251,32 @@ Phase 2 / Phase 3 待 Phase 1 上线后观测再启动。
 
 ---
 
+## 7.1 实际决策记录
+
+### 2026-08-26 Q3 Agent 层 Skill 物理路径命名
+- **决策人**：项目架构组
+- **选项**：✅ **采纳 `<app_id>`**（v3 修订版最终决策）
+- **备注**：主键稳定性优先（name 未来若放开可改，id 永不）；跨环境（dev/staging/prod）name 可能冲突，id 不会；运维侧有 `app_id` → `app_name` 的查询接口补偿。评审发现 v3 嵌套设计后，User 层同时嵌套在 `<app_id>` 下，两层命名一致
+- **影响 spec**：
+  - `spec-g2-workspace.md` §2.1（目录结构：路径模板 `{DATA_ROOT}/agents/<app_id>/skills/<name>/SKILL.md`）
+  - `spec-g2-workspace.md` §3.3（agent_dir 字段：`{DATA_ROOT}/agents/<app_id>`）
+  - `files-risks.md` §2.2（后端文件清单：路径拼接不依赖 `AGENTS_ROOT` 配置项）
+  - `files-risks.md` §4.1（alembic 迁移：agent_dir 回填路径 `{data_root}/agents/{id}`）
+- **关联决策**：同时确认**不引入** `AGENTS_ROOT` 配置项（MVP 简化，路径直接拼接；详见 `spec-g2-review.md` §6.2 N4）
+
+### 2026-08-26 Q4 Agent 层与 Global 冲突时优先级
+- **决策人**：项目架构组
+- **选项**：✅ **采纳 "Agent 覆盖 Global"**（v3 修订版最终决策）
+- **备注**：Agent 层是 publish 时的快照，本质是 Agent 拥有者对 Global 的"私有化定制"，符合用户对"Agent 专属"的预期。若要全局生效，编辑 Global skill 即可，无需 Agent 层覆盖
+- **实现逻辑**：`materialize_to_user_combined` 中 `agent_path if agent_path.exists() else _global_skill_file(name)` —— Agent 层优先于 Global
+- **影响 spec**：
+  - `spec-g2-workspace.md` §4.3（`materialize_to_user_combined` 函数：合并去重，Agent 覆盖 Global）
+  - `spec-g2-workspace.md` §1.1 目标（重申 Agent 覆盖 Global 语义）
+  - `files-risks.md` §2.2（skills_store.py 变更描述）
+- **关联决策**：同时确认 `_read_agent_dir_skill_names` 否决（与 `app_cfg.skill_names` 冗余，详见 `spec-g2-review.md` §6.2 N1）
+
+---
+
 ## 8. 关联 spec 章节索引
 
 | Q | 影响 spec | 章节 |
@@ -284,12 +310,14 @@ Phase 2 / Phase 3 待 Phase 1 上线后观测再启动。
 |---|---|---|
 | Q1 | ☑ 已决策（无双轨兼容期） | Phase 1 spec 落地 |
 | Q2 | ☑ 已决策（7 天 access + 30 天 refresh） | Phase 1 spec 落地 |
-| Q3 | ☐ 待决 | — |
-| Q4 | ☐ 待决 | — |
+| Q3 | ☑ **已决策（采纳 `<app_id>`）** | **2026-08-26**（G2 v3 评审通过） |
+| Q4 | ☑ **已决策（采纳 "Agent 覆盖 Global"）** | **2026-08-26**（G2 v3 评审通过） |
 | Q5 | ☑ 已决策（保留 PG + JSON 视图层） | Phase 3 spec 落地 |
 | Q6 | ☐ 待决 | — |
 | Q7 | ☑ 已决策（RESTful `/sessions` + 单层 user 鉴权 + chatbot 废弃） | Phase 3 spec 落地 |
 
-> **说明**：Q1/Q2/Q5/Q7 已决策，未在 open-questions.md 主问题区出现；详见对应 spec 的 `关键决策` 小节（spec-g1-auth.md §10 / spec-g3-session.md §10）。
+> **更新说明**：2026-08-26 Q3/Q4 在 G2 spec v3 评审中正式决策（详见 §7.1 实际决策记录）。Q6（启动哪个 Phase 实现细节设计）仍待决，需项目架构组决定启动顺序（推荐：Phase 1 → Phase 2 → Phase 3 严格顺序）。
 
-> 全部 Q 决策完成前，**不应启动任何 Phase 的代码实施**。
+> **全部核心 Q 决策完成**（Q1/Q2/Q3/Q4/Q5/Q7 已决策，仅 Q6 启动顺序待决）。Q1/Q2/Q5/Q7 在对应 spec 中决策（spec-g1-auth.md / spec-g3-session.md），Q3/Q4 在本文件 §7.1 中决策。
+
+> **代码实施启动条件**：Q6（启动哪个 Phase 实现细节设计）决策后可启动代码实施；Q6 决策前仅可继续完善 spec。
