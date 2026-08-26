@@ -8,8 +8,21 @@ returned, mirroring the retired llm-config masking contract.
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
+from pydantic.fields import FieldInfo
 
-from app.schemas.agent_apps import _name_field
+from app.schemas.agent_apps import NAME_MAX_LENGTH, _name_field
+
+MODEL_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+
+
+def _model_name_field(description: str) -> FieldInfo:
+    """Build the identifier field for model names (allows dots in version strings)."""
+    return Field(
+        ...,
+        description=description,
+        pattern=MODEL_NAME_PATTERN,
+        max_length=NAME_MAX_LENGTH,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +200,7 @@ class ModelConfigCreate(BaseModel):
         enabled: Whether this model may be resolved at runtime
     """
 
-    name: str = _name_field("Model display name (unique within the provider)")  # pyright: ignore[reportAssignmentType]
+    name: str = _model_name_field("Model display name (unique within the provider)")  # pyright: ignore[reportAssignmentType]
     model_id: str = Field(..., min_length=1, max_length=128, description="Identifier sent to the provider API")
     context_size: Optional[int] = Field(default=None, ge=1, description="Context window size in tokens")
     extra_params: dict = Field(default_factory=dict, description="Model-level extra parameters")
