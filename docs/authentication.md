@@ -259,6 +259,44 @@ and required `Authorization: Bearer <session-token>`, the migration is:
 
 ---
 
+## Workspace isolation
+
+G2 ships a three-layer workspace (`spec-g2-workspace.md` v3.3); every runtime
+build is scoped to the `(app_id, user_id)` pair resolved from the caller's
+access token:
+
+```
+{DATA_ROOT}/global/skills/<name>/SKILL.md                              # Global (single source)
+{DATA_ROOT}/agents/<app_id>/skills/<name>/SKILL.md                     # Agent (publish snapshot)
+{DATA_ROOT}/agents/<app_id>/users/<user_id>/skills/<name>/SKILL.md     # User (per-user copy)
+```
+
+### Per-(app_id, user_id) boundaries
+
+- The deepagents `FilesystemBackend` of a compiled agent is rooted at
+  `{DATA_ROOT}/agents/<app_id>/users/<user_id>/` and mounts `/skills/<name>`
+  from it — a session can only read/write its own user's workspace, never the
+  Global or Agent layer, and never another user's copy.
+- User-layer copies are materialized from the Agent-layer snapshot at
+  `POST /apps/{app_id}/associate-user/{user_id}` and lazily re-synced
+  (`ensure_user_workspace_up_to_date`) whenever the stored `workspace_hash`
+  drifts. Mutating one user's files never leaks into another user's copy.
+- The runtime cache is keyed by the triple `(app_id, user_id, fingerprint)`,
+  so cached compiled graphs are also isolated per user.
+
+### Admin surface
+
+- Association management (`POST/DELETE /apps/{app_id}/associate-user/{user_id}`)
+  is the admin entry point for granting/revoking a user's workspace of a
+  published app; it is rate-limited and audit-logged (`user_app_associated` /
+  `user_app_disassociated`).
+- The workspace columns of `AgentAppRead` (`workspace_hash`,
+  `agent_workspace_status`) expose the materialization state to operators via
+  `GET /apps/{app_id}`; there is no endpoint that streams raw workspace file
+  contents across users.
+
+---
+
 ## Configuration
 
 | Env var | Default | Purpose |

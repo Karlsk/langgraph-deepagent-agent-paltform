@@ -1063,44 +1063,44 @@ runtime = await get_runtime(
 ### 7.1 接受项（26 项 · 按 Phase 分组）
 
 **Phase 0: 数据库基础设施**（阻塞后续所有 Phase）
-- [ ] **D1**: alembic 迁移：`skill_asset.scope`、`agent_app.agent_dir`、`agent_app.workspace_hash`、`agent_app.agent_workspace_status`（含 `user_agent_app_association` 新表）
-- [ ] **D2**: 数据回填：所有现有 AgentApp 的 `agent_dir` 填充、`agent_workspace_status='pending'`
+- [x] **D1**: alembic 迁移：`skill_asset.scope`、`agent_app.agent_dir`、`agent_app.workspace_hash`、`agent_app.agent_workspace_status`（含 `user_agent_app_association` 新表）
+- [x] **D2**: 数据回填：所有现有 AgentApp 的 `agent_dir` 填充、`agent_workspace_status='pending'`
 
 **Phase 1: skills_store 扩展**（依赖 Phase 0，不阻塞 API 层）
-- [ ] **D3**: `skills_store.py` 新增 v3 路径 helpers（`_agent_dir` / `_agent_skill_dir` / `_user_skill_dir`）
-- [ ] **D4**: `skills_store.py` 新增复制函数（`materialize_for_agent` / `materialize_to_user_combined` v3 新签名 / `materialize_into_combined_directory`）
-- [ ] **D5**: `skills_store.py` 新增 hash 工具（`_hash_compare_or_write`）+ workspace_hash 计算（`compute_workspace_hash` / `_compute_user_workspace_hash` / `_compute_effective_workspace_hash` v3.3）
-- [ ] **D7**: `skills_store.py` 新增 prune（`_prune_stale_user_skills`）
+- [x] **D3**: `skills_store.py` 新增 v3 路径 helpers（`_agent_dir` / `_agent_skill_dir` / `_user_skill_dir`）
+- [x] **D4**: `skills_store.py` 新增复制函数（`materialize_for_agent` / `materialize_to_user_combined` v3 新签名 / `materialize_into_combined_directory`）
+- [x] **D5**: `skills_store.py` 新增 hash 工具（`_hash_compare_or_write`）+ workspace_hash 计算（`compute_workspace_hash` / `_compute_user_workspace_hash` / `_compute_effective_workspace_hash` v3.3）
+- [x] **D7**: `skills_store.py` 新增 prune（`_prune_stale_user_skills`）
 
 **Phase 2: service 层重构**（依赖 Phase 1）
-- [ ] **D6**: lazy 校验 `ensure_user_workspace_up_to_date` 实现于 `agent_apps_service.py`（v3.3 归属修订：自 Phase 1 skills_store 移入；算法见 §4.3 动态期望指纹，hash 工具由 skills_store 提供）
-- [ ] **D10**: `agent_apps_service.py` 新建（业务编排：`publish_agent_app` / `associate_user_with_app` / `delete_agent_app` / `patch_agent_app`）
-- [ ] **D11**: `agents_service.py` 新建（`list_subagent_cfgs` / `validate_subagent_skill_visibility`）
-- [ ] **D12**: `db_service.py` 新增 association CRUD（`_get_or_create_association` / `_get_association` / `_invalidate_user_layer_cache`）
+- [x] **D6**: lazy 校验 `ensure_user_workspace_up_to_date` 实现于 `agent_apps_service.py`（v3.3 归属修订：自 Phase 1 skills_store 移入；算法见 §4.3 动态期望指纹，hash 工具由 skills_store 提供）
+- [x] **D10**: `agent_apps_service.py` 新建（业务编排：`publish_agent_app` / `associate_user_with_app` / `delete_agent_app` / `patch_agent_app`）
+- [x] **D11**: `agents_service.py` 新建（`list_subagent_cfgs` / `validate_subagent_skill_visibility`）
+- [x] **D12**: `db_service.py` 新增 association CRUD（`_get_or_create_association` / `_get_association` / `_invalidate_user_layer_cache`）
 
 **Phase 3: API 层调整**（依赖 Phase 2）
-- [ ] **D8**: `apps.py` publish 流程新增 Global → Agent 复制步骤；`workspace_hash` 计算
-- [ ] **D9**: `apps.py` 新增 `POST /apps/{id}/associate-user/{uid}` 端点（参数校验）
-- [ ] **D23**: 落点重定向（v3.3）：`chatbot.py` 已于 G1 退役（空 router）；user_id 透传由 G3 session API 承接（§6.3）；G2 无代码改动，仅本文档记录
-- [ ] **D24**: `test_runner.py` docstring MVP 限制说明
+- [x] **D8**: `apps.py` publish 流程新增 Global → Agent 复制步骤；`workspace_hash` 计算
+- [x] **D9**: `apps.py` 新增 `POST /apps/{id}/associate-user/{uid}` 端点（参数校验）
+- [x] **D23**: 落点重定向（v3.3）：`chatbot.py` 已于 G1 退役（空 router）；user_id 透传由 G3 session API 承接（§6.3）；G2 无代码改动，仅本文档记录
+- [x] **D24**: `test_runner.py` docstring MVP 限制说明
 
 **Phase 4: runtime 层改造**（依赖 Phase 2）
-- [ ] **D15**: `assembly.py` `compile_agent_app` FilesystemBackend v3 路径
-- [ ] **D16**: `assembly.py` `compile_agent_app` 接受 `user_id` 参数
-- [ ] **D17**: `assembly.py` `get_or_compile` 接受 `user_id` 透传
-- [ ] **D18**: `assembly.py` `compute_fingerprint` 维持原签名（5 输入字段，**不纳入** workspace_hash）
-- [ ] **D19**: `runtime.py` 删除 `_COMPILE_USER_ID = "system"`
-- [ ] **D20**: `runtime.py` `_runtime_cache` 升级为三元组 `(app_id, user_id, fingerprint)` + 大小限制 + TTL
-- [ ] **D21**: `runtime.py` `get_runtime` 接受 `user_id`，调用 `ensure_user_workspace_up_to_date`；`main.py` 移除 `_warm_agent_apps` 预热（v3.3，§6.1.5）
-- [ ] **D22**: `runtime.py` cache 淘汰按 `(app_id, user_id)` 维度
+- [x] **D15**: `assembly.py` `compile_agent_app` FilesystemBackend v3 路径（实施注记：采用「模式 A」root=user workspace 根 + `/skills/<name>` 虚拟挂载，与 §2.1 模板自洽；`compile_standalone_subagent` 维持模式 B）
+- [x] **D16**: `assembly.py` `compile_agent_app` 接受 `user_id` 参数
+- [x] **D17**: `assembly.py` `get_or_compile` 接受 `user_id` 透传
+- [x] **D18**: `assembly.py` `compute_fingerprint` 维持原签名（5 输入字段，**不纳入** workspace_hash）
+- [x] **D19**: `runtime.py` 删除 `_COMPILE_USER_ID = "system"`
+- [x] **D20**: `runtime.py` `_runtime_cache` 升级为三元组 `(app_id, user_id, fingerprint)` + 大小限制 + TTL
+- [x] **D21**: `runtime.py` `get_runtime` 接受 `user_id`，调用 `ensure_user_workspace_up_to_date`；`main.py` 移除 `_warm_agent_apps` 预热（v3.3，§6.1.5；实施注记：G1 契约的 default-app + MCP 工具预热保留）
+- [x] **D22**: `runtime.py` cache 淘汰按 `(app_id, user_id)` 维度
 
 **Phase 5: 启动期 + 迁移脚本**（依赖 Phase 1）
-- [ ] **D13**: `bootstrap.py` 重命名 `ensure_default_agent_workspace` → `ensure_all_agent_workspaces`；单 App 异常隔离
-- [ ] **D14**: `main.py` lifespan 调用 `ensure_all_agent_workspaces`
-- [ ] **D25**: `scripts/migrate_workspace.py` 一次性迁移脚本
+- [x] **D13**: `bootstrap.py` 重命名 `ensure_default_agent_workspace` → `ensure_all_agent_workspaces`；单 App 异常隔离
+- [x] **D14**: `main.py` lifespan 调用 `ensure_all_agent_workspaces`
+- [x] **D25**: `scripts/migrate_workspace.py` 一次性迁移脚本
 
 **Phase 6: 文档更新**（依赖所有 Phase）
-- [ ] **D26**: 文档更新（详见 §11）
+- [x] **D26**: 文档更新（详见 §11）
 
 ### 7.1.1 Phase 依赖关系图
 

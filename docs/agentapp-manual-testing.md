@@ -996,6 +996,90 @@ curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
 
 **预期**：信封 `data` 中 `status` 重新变为 `published`。
 
+### 6.6 三级 Workspace 同步（G2 冒烟 M1-M6）
+
+三级 Workspace 的物理布局（`DATA_ROOT` 默认 `./data`，docker 环境以卷挂载目录为准）：
+
+```
+{DATA_ROOT}/global/skills/<name>/SKILL.md                              # Global 层（唯一原件）
+{DATA_ROOT}/agents/<app_id>/skills/<name>/SKILL.md                     # Agent 层（publish 快照）
+{DATA_ROOT}/agents/<app_id>/users/<user_id>/skills/<name>/SKILL.md     # User 层（associate 物化）
+```
+
+前置：沿用 §6.1 创建的 `$APP_ID`（绑定 `csv-report` skill）；当前用户 id 记为 `$USER_ID`
+（§2.1 register 信封的 `data.id`）。另注册第二个用户得到 `$TOKEN2` / `$USER_ID2`（M4 需要）。
+
+#### M1：三层复制（publish 时 Global → Agent）
+
+```bash
+curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
+ls "$DATA_ROOT/global/skills/csv-report/SKILL.md" \
+   "$DATA_ROOT/agents/$APP_ID/skills/csv-report/SKILL.md"
+```
+
+**预期**：发布 200 后两个文件均存在且内容一致（信封 `data.workspace_hash` 非空、
+`data.agent_workspace_status="active"`）。User 层此刻**尚未**物化。
+
+#### M2：关联用户（associate 时 Agent → User）
+
+```bash
+curl -s -X POST "$BASE/apps/$APP_ID/associate-user/$USER_ID" \
+  -H "Authorization: Bearer $TOKEN"
+ls "$DATA_ROOT/agents/$APP_ID/users/$USER_ID/skills/csv-report/SKILL.md"
+```
+
+**预期**：200 信封；User 层文件就位，内容 = Agent 层快照（应用自身 + 子代理引用的全局 skill 并集）。
+
+#### M3：PATCH 已发布应用回退 draft（解读 B 四步）
+
+```bash
+curl -s -X PATCH "$BASE/apps/$APP_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"skill_names": ["csv-report"]}'
+```
+
+**预期**：信封 `data` 中 `status` 回退 `draft`、`workspace_hash=null`、`agent_workspace_status="pending"`、
+`version` 自增（同 §6.5，这里额外核对 G2 三个新字段）。重新 publish 可恢复。
+
+#### M4：跨用户隔离（per-(app_id, user_id) 独立副本）
+
+```bash
+curl -s -X POST "$BASE/apps/$APP_ID/associate-user/$USER_ID2" \
+  -H "Authorization: Bearer $TOKEN"
+echo tampered >> "$DATA_ROOT/agents/$APP_ID/users/$USER_ID/skills/csv-report/SKILL.md"
+diff "$DATA_ROOT/agents/$APP_ID/users/$USER_ID2/skills/csv-report/SKILL.md" \
+     "$DATA_ROOT/agents/$APP_ID/users/$USER_ID/skills/csv-report/SKILL.md"
+```
+
+**预期**：两份用户副本相互独立；手工改动 user1 的副本不影响 user2 的副本（`diff` 有差异）。
+
+#### M5：Lazy 校验（skill 编辑 + 重新发布后，下一次会话触发 User 层重同步）
+
+```bash
+curl -s -X PATCH "$BASE/skills/csv-report" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"body": "# csv-report\n\n## Steps\n1. version-2 内容\n"}'
+curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
+# 触发一次该用户 + 该应用的会话（§7.1/7.2 任意流程），随后检查：
+grep "version-2" "$DATA_ROOT/agents/$APP_ID/users/$USER_ID/skills/csv-report/SKILL.md"
+```
+
+**预期**：会话创建/启动入口的 `ensure_user_workspace_up_to_date` lazy 校验发现 hash drift，
+User 层被重新复制为 version-2 内容（日志可见 `user_workspace_lazy_synced`）。
+
+#### M6：启动期补建（删除 Agent 层后重启自动恢复）
+
+```bash
+rm -rf "$DATA_ROOT/agents/$APP_ID/skills"
+# 重启服务（make dev 或 docker compose restart api）
+ls "$DATA_ROOT/agents/$APP_ID/skills/csv-report/SKILL.md"
+```
+
+**预期**：启动期 `ensure_all_agent_workspaces` 检测到 published 应用缺失 Agent 层目录，
+从 Global 层重新物化（日志可见 `agent_skills_materialized` 与 `agent_workspace_bootstrap_completed`）。
+
 ---
 
 ## 7. Chat 全链路
@@ -1161,7 +1245,7 @@ curl -s -X DELETE "$BASE/apps/$HIL_APP_ID" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/apps/$APP_ID" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/mcp-servers/demo-stdio" -H "Authorization: Bearer $TOKEN"
-# skill 删除会级联清理用户副本（含 {SKILLS_ROOT}/users/<user_id>/ 下的物化文件），
+# skill 删除会级联清理用户副本（含三级 Workspace 中各 {DATA_ROOT}/agents/<app_id>/users/<user_id>/skills/ 下的物化文件），
 # 并校验「无人引用」（AgentApp.skill_names / SubAgentConfig.skill_names 必须先清空）。
 curl -s -X DELETE "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 ```
