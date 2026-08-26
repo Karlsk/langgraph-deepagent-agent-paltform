@@ -11,7 +11,13 @@ from sqlmodel import SQLModel
 
 from alembic import context
 from app.core.config import settings
-from app.models.agent_assets import AgentApp, McpServerConfig, SkillAsset, SubAgentConfig  # noqa: F401
+from app.models.agent_assets import (  # noqa: F401
+    AgentApp,
+    McpServerConfig,
+    SkillAsset,
+    SubAgentConfig,
+    UserAgentAppAssociation,
+)
 from app.models.provider import ModelConfig, Provider, ProviderHealth  # noqa: F401
 from app.models.session import Session  # noqa: F401
 from app.models.subagent_trace import SubAgentTestTrace  # noqa: F401

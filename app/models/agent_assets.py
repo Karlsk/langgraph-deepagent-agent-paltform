@@ -4,9 +4,10 @@ Phase-1 scope: no per-user isolation, all assets are globally shared;
 ``created_by`` is kept for auditing only.
 """
 
+from datetime import UTC, datetime
 from typing import Optional
 
-from sqlalchemy import JSON, Column, Text
+from sqlalchemy import JSON, Column, ForeignKey, Text, UniqueConstraint
 from sqlmodel import Field
 
 from app.models.base import BaseModel
@@ -67,6 +68,8 @@ class SkillAsset(BaseModel, table=True):
             decides whether the disk copy needs rewriting
         created_by: Audit-only creator identifier
         version: Monotonic configuration version counter
+        scope: Visibility scope of the skill (G2): 'global' by default,
+            Phase 5+ may extend to 'agent' (per-app private copies)
     """
 
     __tablename__ = "skill_asset"  # pyright: ignore[reportAssignmentType]
@@ -77,6 +80,7 @@ class SkillAsset(BaseModel, table=True):
     content_hash: str
     created_by: Optional[str] = Field(default=None)
     version: int = Field(default=1)
+    scope: str = Field(default="global", max_length=16, index=True)
 
 
 class AgentApp(BaseModel, table=True):
@@ -96,6 +100,12 @@ class AgentApp(BaseModel, table=True):
         published_hash: Hash snapshot of the last published revision
         version: Monotonic configuration version counter
         created_by: Audit-only creator identifier
+        agent_dir: Physical workspace base path template (G2), e.g.
+            ``{DATA_ROOT}/agents/{app_id}``; None until bootstrap/publish sets it
+        workspace_hash: Agent-layer content fingerprint (sha256 hex) computed
+            at publish time; invalidated (NULL) when a draft is patched
+        agent_workspace_status: Workspace materialization state (G2 simplified):
+            'pending' (needs bootstrap/materialization) or 'active'
     """
 
     __tablename__ = "agent_app"  # pyright: ignore[reportAssignmentType]
@@ -113,6 +123,54 @@ class AgentApp(BaseModel, table=True):
     published_hash: Optional[str] = Field(default=None)
     version: int = Field(default=1)
     created_by: Optional[str] = Field(default=None)
+    agent_dir: Optional[str] = Field(default=None, max_length=255)
+    workspace_hash: Optional[str] = Field(default=None, max_length=64)
+    agent_workspace_status: str = Field(default="pending", max_length=16)
+
+
+class UserAgentAppAssociation(BaseModel, table=True):
+    """Association row linking a user to an agent app (G2 user-layer tracking).
+
+    One row per (user, agent_app) pair. ``last_synced_workspace_hash`` records
+    the agent-layer ``workspace_hash`` observed at the last user-layer
+    materialization; the lazy workspace check compares against it to decide
+    whether the user layer needs a refresh (spec-g2-workspace v3.3 §3.4).
+
+    Attributes:
+        id: Primary key
+        user_id: FK to ``user.id`` (ON DELETE CASCADE — dropping a user
+            cleans up its associations automatically)
+        agent_app_id: FK to ``agent_app.id`` (ON DELETE CASCADE)
+        last_synced_workspace_hash: Agent workspace_hash at the last
+            user-layer sync (incremental-sync optimization); NULL until the
+            first materialization
+        associated_at: When the user was associated with the app
+    """
+
+    __tablename__ = "user_agent_app_association"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        UniqueConstraint("user_id", "agent_app_id", name="uq_user_agent_app"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(
+        sa_column=Column(
+            "user_id",
+            ForeignKey("user.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    agent_app_id: int = Field(
+        sa_column=Column(
+            "agent_app_id",
+            ForeignKey("agent_app.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    last_synced_workspace_hash: Optional[str] = Field(default=None, max_length=64)
+    associated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class McpServerConfig(BaseModel, table=True):

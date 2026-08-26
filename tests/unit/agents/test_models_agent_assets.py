@@ -8,6 +8,7 @@ from app.models.agent_assets import (
     McpServerConfig,
     SkillAsset,
     SubAgentConfig,
+    UserAgentAppAssociation,
 )
 from app.models.session import Session
 from app.models.user import User  # noqa: F401 — required to resolve Session.user relationship mapper
@@ -62,6 +63,31 @@ def test_skill_asset_defaults() -> None:
     asset = SkillAsset(name="deploy-skill", description="deploy helper", content_hash="sha256:def")
     assert asset.version == 1
     assert asset.created_by is None
+
+
+def test_skill_asset_scope_defaults_to_global() -> None:
+    """SkillAsset.scope defaults to 'global' (G2 D1; Phase 5+ may extend 'agent')."""
+    asset = SkillAsset(name="deploy-skill", description="deploy helper", content_hash="sha256:def")
+    assert asset.scope == "global"
+
+
+def test_agent_app_workspace_fields_defaults() -> None:
+    """AgentApp G2 workspace fields default: agent_dir/workspace_hash None, status 'pending'."""
+    app = AgentApp(name="support-bot", system_prompt="You are support.")
+    assert app.agent_dir is None
+    assert app.workspace_hash is None
+    assert app.agent_workspace_status == "pending"
+
+
+def test_user_agent_app_association_defaults() -> None:
+    """UserAgentAppAssociation table name + field defaults (G2 D1 v3.3 spec §3.4)."""
+    assoc = UserAgentAppAssociation(user_id=1, agent_app_id=2)
+    assert UserAgentAppAssociation.__tablename__ == "user_agent_app_association"
+    assert assoc.id is None
+    assert assoc.user_id == 1
+    assert assoc.agent_app_id == 2
+    assert assoc.last_synced_workspace_hash is None
+    assert assoc.associated_at is not None
 
 
 def test_agent_app_defaults() -> None:
