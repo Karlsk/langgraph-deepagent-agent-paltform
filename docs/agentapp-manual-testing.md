@@ -1,7 +1,11 @@
 # AgentApp 全功能手动测试指南
 
 本文档指导你从零开始手动验证 AgentApp（Agent 资产管理 + 对话）全链路功能：
-构建启动 → 认证 → Skill → MCP → SubAgent → AgentApp → Chat → HIL（人工介入）。
+构建启动 → 认证 → Skill → MCP → SubAgent → AgentApp → Chat（已退役） → HIL（已退役，人工介入）。
+
+> **G1/G2 时效性标注**：Phase 1 G1 单层认证改造后，`POST /auth/session` 与 `/chatbot/*`
+> 已退役（调用返回 404），对话运行时待 G3 阶段在新认证面上重建——第 7/8 节已改为退役说明；
+> 资产端点直接使用**用户 token**，全文不再有「会话 token」。
 
 > **核实基线**：本文所有端点、环境变量与命令均对照以下源码核实过：
 > `app/api/v1/api.py`（路由注册）、`app/api/v1/auth.py`、`app/api/v1/agent_assets_common.py`、
@@ -22,19 +26,19 @@ export EMAIL="tester@example.com"
 export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/小写/数字/特殊字符
 ```
 
-- **两类 token 的关键区别**（来自 `auth.py` 的依赖注入）：
-  - `POST /auth/register`、`POST /auth/login` 返回的是**用户 token**；
-  - `POST /auth/session` 用用户 token 换取**会话 token**；
-  - `/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/providers/*`、`/tools/*` 与 `/chatbot/*` 全部端点都依赖 `get_current_session`，**必须使用会话 token**。
-  第 2 节会给出切换 `$TOKEN` 的明确步骤。
+- **G1 单层认证**（Phase 1 G1，`auth.py` 现只有 register/login/refresh/logout）：
+  - `POST /auth/register`、`POST /auth/login` 返回**用户 token**（扁平 `LoginResponse`，含 `access_token` + `refresh_token`）；
+  - `/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/providers/*`、`/tools/*` 全部端点依赖 `get_current_user`，**直接使用用户 token**；
+  - 历史的 `POST /auth/session`（换取会话 token）已退役，调用返回 404 信封；`/chatbot/*` 同步退役（见第 7 节）。
+  第 2 节给出 `$TOKEN` 的取值步骤。
 - **统一响应信封**：除豁免端点外，所有端点返回 `{code, message, data}` 信封——`code` 数值与
   HTTP status 完全一致（资产创建端点 HTTP 201 且 `code=201`；`POST /auth/register`
   为 HTTP 200 且 `code=200`；DELETE 成功 `data=null`）。
   422 分两种形态：**请求体校验失败**为 `{code:422, message:"Validation error", data:[错误列表]}`；
   **业务规则拒绝**（如重名、immutable name）为 `{code:422, message:"<错误文案>", data:null}`。
   其余错误信封为 `{code:<状态码>, message:"<错误文案>", data:null}`。
-  **豁免端点（仍返回裸响应）**：`GET /`、`GET /health`、`GET /api/v1/health`、
-  `POST /chatbot/chat/stream`（SSE）。本文所有取值命令均按信封路径提取（如 `["data"]["token"]["access_token"]`）。
+  **豁免端点（仍返回裸响应）**：`GET /`、`GET /health`、`GET /api/v1/health`。
+  本文所有取值命令均按信封路径提取（如 `["data"]["access_token"]`）。
 - 标注 **⚠️ 需外部资源 / 会消耗 token** 的步骤需要真实 LLM API Key（或真实 MCP server 进程）。
 
 ---
@@ -64,7 +68,7 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 | `POSTGRES_HOST` | ★ | localhost | 容器内必须填 `db`（compose 服务名） |
 | `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | ★ | 5432 / food_order_db | db 容器初始化也读取这些值 |
 | `DEFAULT_LLM_MODEL` | 建议 | gpt-5-mini | 默认模型 |
-| `SKILLS_ROOT` | 建议 | ./data/skills | SKILL.md 资产根目录（容器内相对 `/app`） |
+| `DATA_ROOT` | 建议 | ./data | 三级 Workspace 根目录（`global/` + `agents/`，容器内相对 `/app` 解析为 `/app/data`）；`SKILLS_ROOT` 已废弃（G2），仅单独设置时回退为其父目录 |
 | `MCP_STDIO_ALLOWED_COMMANDS` | 可选 | `python,node,uvx,npx` | stdio 型 MCP server 命令白名单（逗号分隔） |
 | `LANGFUSE_TRACING_ENABLED` | 可选 | true | 无 Langfuse 账号时建议设 `false` 避免初始化噪音 |
 | `SESSION_NAMING_ENABLED` | 可选 | true | 会话自动命名（额外 LLM 调用） |
@@ -110,8 +114,8 @@ POSTGRES_PASSWORD=<your-db-password>
 POSTGRES_POOL_SIZE=5
 POSTGRES_MAX_OVERFLOW=10
 
-# Skill 资产目录（容器内相对 /app 解析为 /app/data/skills）
-SKILLS_ROOT=./data/skills
+# 三级 Workspace 根目录（容器内相对 /app 解析为 /app/data；SKILLS_ROOT 已废弃）
+DATA_ROOT=./data
 
 # MCP stdio 命令白名单（默认即此值，显式写出便于确认）
 MCP_STDIO_ALLOWED_COMMANDS=python,node,uvx,npx
@@ -341,8 +345,10 @@ curl -s -X POST "$BASE/auth/register" \
   -d "{\"email\": \"$EMAIL\", \"password\": \"$PASSWORD\", \"username\": \"manual-tester\"}"
 ```
 
-**预期**：HTTP 200 且 `code=200`，`data` 为 `UserResponse`：`data.id`（整数）、`data.email`、
-`data.username`、`data.token.access_token`、`data.token.token_type="bearer"`、`data.token.expires_at`。
+**预期**：HTTP 200 且 `code=200`，`data` 为扁平 `LoginResponse`：`data.access_token`、
+`data.refresh_token`、`data.token_type="bearer"`、`data.expires_at`、`data.request_id`。
+注意：G1 起**不再返回用户 id**；后续步骤（如 6.6 节）需要 `$USER_ID` 时，在 db 容器内查库：
+`psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "SELECT id FROM \"user\" WHERE email='<email>';"`。
 
 **失败排查**：
 - 422（信封 `message="Validation error"`，`data` 为错误列表）：密码不满足强度（>=8 位、大小写、数字、特殊字符各至少一个）或 email 格式非法；
@@ -360,7 +366,8 @@ curl -s -X POST "$BASE/auth/login" \
   -d "grant_type=password"
 ```
 
-**预期**：信封 `data` 为 `TokenResponse`：`data.access_token`、`data.token_type="bearer"`、`data.expires_at`。
+**预期**：信封 `data` 为 `LoginResponse`：`data.access_token`、`data.refresh_token`、
+`data.token_type="bearer"`、`data.expires_at`。
 
 **失败排查**：401（信封 `message` 提示邮箱或密码错误）；400（`grant_type` 不是 `password`）。
 
@@ -370,33 +377,25 @@ export USER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
   -d "email=$EMAIL" -d "password=$PASSWORD" -d "grant_type=password" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["access_token"])')
 ```
 
-### 2.3 创建会话并切换到会话 token
+### 2.3 设定 `$TOKEN`（G1：无需会话 token）
 
-**目的**：后续所有资产端点（`/subagents/*`、`/skills/*`、`/apps/*`、`/mcp-servers/*`、`/providers/*`、`/tools/*`）与 `/chatbot/*` 端点都要求**会话 token**。此处先不绑定
-AgentApp（body 可省略），第 7 节再创建绑定会话。
+> **退役说明**：历史的 `POST /auth/session`（用户 token → 会话 token 两步制）已在 Phase 1 G1
+> 移除，现在调用返回 `404` 信封。所有资产端点直接接受用户 token。
 
 ```bash
-export SESSION_RESP=$(curl -s -X POST "$BASE/auth/session" \
-  -H "Authorization: Bearer $USER_TOKEN")
-echo "$SESSION_RESP"
-export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
+# 直接把登录得到的用户 token 作为全文 $TOKEN
+export TOKEN=$USER_TOKEN
 ```
 
-**预期**：信封 `data` 含 `data.session_id`、`data.name`、`data.token.access_token`。
-
-**约定**：**从此处起，全文 `$TOKEN` 一律指会话 token**，所有受保护请求都带
-`-H "Authorization: Bearer $TOKEN"`。
-
-**失败排查**：
-- 401 信封：`$USER_TOKEN` 无效或过期；
-- 422 信封（`message` 为 `Agent app is not published`）/ 404 信封（`message` 为 `Agent app not found`）：只有传了 `agent_app_id` 时才会出现
-  （分别对应目标应用未发布 / 不存在）。
+**约定**：**全文 `$TOKEN` 一律指用户 token**，所有受保护请求都带
+`-H "Authorization: Bearer $TOKEN"`。token 过期（默认 7 天）后用 `POST /auth/refresh`
+（body 传 `refresh_token`）换新，或重新登录。
 
 ---
 
 ## 3. Skill 功能
 
-所有端点位于 `$BASE/skills*`，需要会话 token。
+所有端点位于 `$BASE/skills*`，需要用户 token（G1 单层认证，直接用 2.2 节登录 token）。
 `name` 规则：`^[a-z0-9][a-z0-9_-]*$`，最长 64 字符，创建后不可改名。
 
 ### 3.1 创建全局 Skill（直接输入）
@@ -890,7 +889,7 @@ curl -s -X DELETE "$BASE/providers/proxy" -H "Authorization: Bearer $TOKEN"
 
 ## 6. AgentApp 功能
 
-所有端点位于 `$BASE/apps*`。创建后 `status=draft`，需显式 publish 才能被会话绑定。
+所有端点位于 `$BASE/apps*`。创建后 `status=draft`，需显式 publish 才能关联用户（三级 Workspace 物化，见 6.6 节）；会话绑定待 G3 重建。
 
 ### 6.1 创建（关联 skill + subagent，allowed_tools 含内置 + MCP 工具）
 
@@ -1007,7 +1006,8 @@ curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
 ```
 
 前置：沿用 §6.1 创建的 `$APP_ID`（绑定 `csv-report` skill）；当前用户 id 记为 `$USER_ID`
-（§2.1 register 信封的 `data.id`）。另注册第二个用户得到 `$TOKEN2` / `$USER_ID2`（M4 需要）。
+（G1 起 register 不返回 id，在 db 容器内查库：`SELECT id FROM "user" WHERE email='$EMAIL';`）。
+另注册第二个用户得到 `$TOKEN2` / `$USER_ID2`（同样查库取 id，M4 需要）。
 
 #### M1：三层复制（publish 时 Global → Agent）
 
@@ -1054,7 +1054,7 @@ diff "$DATA_ROOT/agents/$APP_ID/users/$USER_ID2/skills/csv-report/SKILL.md" \
 
 **预期**：两份用户副本相互独立；手工改动 user1 的副本不影响 user2 的副本（`diff` 有差异）。
 
-#### M5：Lazy 校验（skill 编辑 + 重新发布后，下一次会话触发 User 层重同步）
+#### M5：Lazy 校验（skill 编辑 + 重新发布后，下一次运行时调用触发 User 层重同步）
 
 ```bash
 curl -s -X PATCH "$BASE/skills/csv-report" \
@@ -1062,18 +1062,31 @@ curl -s -X PATCH "$BASE/skills/csv-report" \
   -H "Content-Type: application/json" \
   -d '{"body": "# csv-report\n\n## Steps\n1. version-2 内容\n"}'
 curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
-# 触发一次该用户 + 该应用的会话（§7.1/7.2 任意流程），随后检查：
+# 触发一次 lazy 校验：G1 退役了会话端点，G2 阶段 lazy 校验（§12.1 G3 集成契约）唯一调用方是
+# G3 预留入口 get_runtime，直接在 app 容器内调用它触发：
+docker exec -w /app <app容器> /app/.venv/bin/python -c "
+import asyncio
+from app.api.v1.agent_assets_common import get_db_session
+from app.services.agents import runtime
+db = next(get_db_session())
+try:
+    asyncio.run(runtime.get_runtime(db, $APP_ID, user_id=$USER_ID))
+finally:
+    db.close()"
+# 随后检查：
 grep "version-2" "$DATA_ROOT/agents/$APP_ID/users/$USER_ID/skills/csv-report/SKILL.md"
 ```
 
-**预期**：会话创建/启动入口的 `ensure_user_workspace_up_to_date` lazy 校验发现 hash drift，
-User 层被重新复制为 version-2 内容（日志可见 `user_workspace_lazy_synced`）。
+**预期**：`get_runtime` 入口的 `ensure_user_workspace_up_to_date` lazy 校验发现 hash drift，
+User 层被重新复制为 version-2 内容（exec 输出可见 `user_workspace_lazy_synced` 日志；
+注意 `docker exec` 的日志不会进 `docker logs`，需在 exec 输出里看）。G3 会话 API 上线后，
+触发点将改为 session 创建/启动入口（`spec-g3-session.md` §12）。
 
 #### M6：启动期补建（删除 Agent 层后重启自动恢复）
 
 ```bash
 rm -rf "$DATA_ROOT/agents/$APP_ID/skills"
-# 重启服务（make dev 或 docker compose restart api）
+# 重启服务（make dev 或 docker compose restart app）
 ls "$DATA_ROOT/agents/$APP_ID/skills/csv-report/SKILL.md"
 ```
 
@@ -1082,156 +1095,29 @@ ls "$DATA_ROOT/agents/$APP_ID/skills/csv-report/SKILL.md"
 
 ---
 
-## 7. Chat 全链路
+## 7. Chat 全链路（已退役，待 G3 重建）
 
-端点位于 `$BASE/chatbot/*`（`/chat`、`/chat/stream`、`/messages`）。
-对话步骤均 **⚠️ 需外部资源 / 会消耗 token**。
-
-### 7.1 创建绑定 AgentApp 的会话
-
-```bash
-export SESSION_RESP=$(curl -s -X POST "$BASE/auth/session" \
-  -H "Authorization: Bearer $USER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"agent_app_id\": $APP_ID}")
-echo "$SESSION_RESP"
-export TOKEN=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
-export SESSION_ID=$(echo "$SESSION_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["session_id"])')
-```
-
-**预期**：信封 `data` 返回新的 `session_id` 与会话 token。此后 `$TOKEN` 切换为该会话 token。
-
-**失败排查**：404 信封（Agent app 不存在）；422 信封，`message` 为 `Agent app is not published`（对应未发布或已回退 draft 的应用）。
-
-### 7.2 非流式对话
-
-```bash
-curl -s -X POST "$BASE/chatbot/chat" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "请用 add 工具计算 17+25，并告诉我结果。"}]}'
-```
-
-**预期**：信封 `data.messages` 数组，最后一条为 `role="assistant"` 的回复（内容应给出 42）。
-消息体约束：`content` 长度 1~3000，role 限 `user|assistant|system`。
-
-**失败排查**：500 信封，查日志 `chat_request_failed`，常见为 LLM key 无效（401）或工具调用异常。
-
-### 7.3 SSE 流式对话
-
-```bash
-curl -N -X POST "$BASE/chatbot/chat/stream" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "用 echo 工具回显：hello agent app"}]}'
-```
-
-**预期**：`Content-Type: text/event-stream`，逐帧输出 `data: {...}` JSON，帧字段为：
-- `content`：当前增量文本；
-- `source`：来源标签——主代理为 `"coordinator"`、子代理为其名字、运行时生成帧（如中断提示）为 `"system"`；
-- `done`：结束帧为 `{"content": "", "done": true}`；流内异常时也会以一帧 `done=true` 携带错误文本收尾。
-
-### 7.4 消息历史读取与清空
-
-```bash
-curl -s "$BASE/chatbot/messages" -H "Authorization: Bearer $TOKEN"
-```
-
-**预期**：信封 `data.messages` 中包含本会话的完整历史（user/assistant 消息）。
-
-```bash
-curl -s -X DELETE "$BASE/chatbot/messages" -H "Authorization: Bearer $TOKEN"
-```
-
-**预期**：信封 `{"code": 200, "message": "Chat history cleared successfully", "data": null}`；
-再次 `GET /messages` 信封 `data.messages` 返回空列表。
-
-### 7.5 默认助理对话（不绑定 AgentApp）
-
-```bash
-export DEFAULT_RESP=$(curl -s -X POST "$BASE/auth/session" \
-  -H "Authorization: Bearer $USER_TOKEN")
-export DEFAULT_TOKEN=$(echo "$DEFAULT_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
-
-curl -s -X POST "$BASE/chatbot/chat" \
-  -H "Authorization: Bearer $DEFAULT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "你好，介绍一下你自己。"}]}'
-```
-
-**预期**：信封 `data.messages` 正常返回回复。不传 `agent_app_id` 的会话在运行时回退到系统默认 AgentApp
-（`name="default"`，由启动 bootstrap / 惰性重建保证存在），使用默认系统提示与默认模型。
+> **退役说明（Phase 1 G1）**：`/chatbot/*` 全部端点（`/chat`、`/chat/stream`、`/messages`）
+> 已随 G1 单层认证改造退役：`app/api/v1/chatbot.py` 现为空 router，`app/api/v1/api.py`
+> 不再注册它，任何 `/chatbot/*` 请求返回 **404**。对话运行时将在 G3 阶段基于新认证面
+> 与三级 Workspace（G2）重建，接口预留见 `spec-g3-session.md` §12 与
+> `spec-g2-workspace.md` §12.1（`ensure_user_workspace_up_to_date` / `get_runtime` 契约）。
+>
+> **当前可验证的替代面**：
+> - 运行时编译链路：`POST /subagents/<name>/test`（§5.3，单轮隔离运行，已含真实 LLM 与工具装配）；
+> - 用户级工作区同步：§6.6 M1-M6（含 lazy 校验与启动期补建）。
+>
+> 本节历史内容（创建绑定会话 → 非流式对话 → SSE 流式 → 消息历史 → 默认助理）保留在
+> git 历史中，G3 落地后重写。
 
 ---
 
-## 8. HIL（人工介入，可选进阶）
+## 8. HIL（人工介入，已退役，待 G3 重建）
 
-> ⚠️ 本节全程消耗 token。原理：AgentApp 的 `interrupt_on`（`dict[工具名, bool]`）透传给引擎的
-> Human-in-the-loop 中间件；命中工具调用时图执行暂停，对话侧收到中断提示；
-> 用户下一条消息若是结构化 `{"decisions": [...]}` JSON 则按决策续跑，
-> **否则（纯文本、坏 JSON 一律）按 reject 处理——不结构化回复永远不可能静默批准待决动作**。
-
-### 8.1 创建并发布一个对搜索工具中断的应用
-
-```bash
-export HIL_APP_ID=$(curl -s -X POST "$BASE/apps" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "hil-demo",
-    "system_prompt": "你是一个演示助理。当用户要求搜索时，必须调用 duckduckgo_results_json 工具。",
-    "allowed_tools": ["duckduckgo_results_json"],
-    "interrupt_on": {"duckduckgo_results_json": true}
-  }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])')
-
-curl -s -X POST "$BASE/apps/$HIL_APP_ID/publish" -H "Authorization: Bearer $TOKEN"
-```
-
-**预期**：发布成功，信封 `data.status="published"`。
-
-### 8.2 绑定会话并触发中断
-
-```bash
-export HIL_RESP=$(curl -s -X POST "$BASE/auth/session" \
-  -H "Authorization: Bearer $USER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"agent_app_id\": $HIL_APP_ID}")
-export HIL_TOKEN=$(echo "$HIL_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"]["access_token"])')
-
-curl -s -X POST "$BASE/chatbot/chat" \
-  -H "Authorization: Bearer $HIL_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "搜索一下今天的科技新闻"}]}'
-```
-
-**预期**：信封 `data.messages` 的最后一条**不是**搜索结果，而是中断提示（中断载荷的字符串化展示，或兜底文案
-"Waiting for input."）。此时该线程处于暂停态，等待续跑输入。
-
-### 8.3 批准续跑
-
-```bash
-curl -s -X POST "$BASE/chatbot/chat" \
-  -H "Authorization: Bearer $HIL_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "{\"decisions\":[{\"type\":\"approve\"}]}"}]}'
-```
-
-**预期**：图从暂停点恢复，工具实际执行，信封 `data.messages` 返回含搜索结果的正常回复。
-多个待决动作时 `decisions` 数组需按数量给出逐项决策。
-
-### 8.4 验证纯文本回复默认 reject 的安全语义
-
-再触发一次中断后，用纯文本回复：
-
-```bash
-curl -s -X POST "$BASE/chatbot/chat" \
-  -H "Authorization: Bearer $HIL_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "好的，执行吧"}]}'
-```
-
-**预期**：因回复不是合法 `{"decisions":[...]}` 结构，被解析为**等量的 reject 决策**，
-工具调用被拒绝（不会执行搜索）。这正是「默认拒绝」的安全兜底。
+> **退役说明**：HIL 依赖 `/chatbot/chat` 对话端点与已退役的会话机制（见第 7 节），
+> 当前无法端到端验证。其机制设计（`interrupt_on` 透传 Human-in-the-loop 中间件、
+> 结构化 `{"decisions": [...]}` 批准、非结构化回复默认 reject 的安全语义）将在 G3 对话
+> 运行时重建时恢复，届时重写本节（原脚本保留在 git 历史）。
 
 ---
 
@@ -1241,7 +1127,6 @@ curl -s -X POST "$BASE/chatbot/chat" \
 
 ```bash
 # 删除顺序建议：先应用，再子代理/MCP，最后 skill（避免发布引用校验干扰）
-curl -s -X DELETE "$BASE/apps/$HIL_APP_ID" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/apps/$APP_ID" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/subagents/search-helper" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$BASE/mcp-servers/demo-stdio" -H "Authorization: Bearer $TOKEN"
@@ -1263,8 +1148,9 @@ make docker-down ENV=development     # 或 make stack-down ENV=development（全
 - `docker-down/stack-down` **不删除数据卷**；需要彻底重置时手动删除命名卷：
   `postgres-data`（数据库，含全部资产与会话数据）、`valkey-data`、`grafana-storage`，
   例如 `docker volume rm pml-langgraph-agent_postgres-data`（卷名以 `docker volume ls` 为准）。
-- Skill 文件目录：默认 `SKILLS_ROOT=./data/skills` 相对容器工作目录 `/app`，**未挂载为卷**，
-  容器重建即消失；若你曾改为宿主机路径，请手动清理对应目录下的 `global/` 与 `users/` 子目录。
+- Skill/工作区文件目录：三级 Workspace 默认 `DATA_ROOT=./data`（容器内 `/app/data`），
+  已通过 `./data:/app/data` bind mount 挂载到宿主机，容器重建**不会**丢失；
+  彻底重置时需手动清理宿主机 `data/` 下的 `global/`、`agents/` 子目录（与删数据库卷配套）。
 
 ### 9.3 常见问题排查表
 
@@ -1272,10 +1158,10 @@ make docker-down ENV=development     # 或 make stack-down ENV=development（全
 |---|---|---|
 | 容器启动即退出，日志有 `required environment variables are missing` | `JWT_SECRET_KEY` 或 `OPENAI_API_KEY` 缺失 | 在 `.env.development` 补齐后 `make docker-up` 重启 |
 | 所有数据库相关端点 500 | 未执行迁移 | `make docker-migrate ENV=development` |
-| `/health` 正常但 `/api/v1/**` 401/403 | 用了用户 token 调资产/对话端点，或 token 过期 | 按第 2 节用 `/auth/session` 换会话 token |
+| `/health` 正常但 `/api/v1/**` 401/403 | token 过期或使用了 `Authorization` 之外的凭证 | 按第 2 节用 `/auth/refresh` 刷新或重新 `/auth/login` |
 | MCP server 创建后目录里看不到工具 | 探活/加载失败或超时（30s） | 看日志 `mcp_server_tool_probe_*`；确认容器内脚本路径与 `/app/.venv/bin/python` 可用 |
 | MCP 注册返回 422 命令被拒 | 命令不在 `MCP_STDIO_ALLOWED_COMMANDS`（默认 `python,node,uvx,npx`），或是 shell/内联模式 | 换白名单命令；必要时在 env 中扩展该变量并重启 |
-| 对话 500，日志 LLM 401/403 | `OPENAI_API_KEY` 无效或余额不足 | 更换有效 key 后重启容器 |
+| 子代理测试/对话 500，日志 LLM 401/403 | `OPENAI_API_KEY` 无效或余额不足 | 更换有效 key 后重启容器 |
 | 429 Too Many Requests | 触发限流（默认 `chat=30/min` 等） | 等待窗口重置，或按 0.2 节放宽 `RATE_LIMIT_*` 后重启 |
-| 会话绑定应用 422 `Agent app is not published` | 应用处于 draft（含 PATCH 后自动回退） | 重新 `POST /apps/{id}/publish` |
+| 发布/关联 422 `Agent app is not published` | 应用处于 draft（含 PATCH 后自动回退） | 重新 `POST /apps/{id}/publish` |
 | 发布 422 `allowed_tools not in tool catalog` | `allowed_tools` 超出工具目录（MCP server 被禁用/删除会导致其工具从目录消失） | 用 `/tools/catalog` 对账后修正白名单 |
