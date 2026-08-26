@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from app.core.config import settings
-from app.models.agent_assets import SkillAsset
+from app.models.agent_assets import AgentApp, SkillAsset, SubAgentConfig
 from app.services.agents import skills_store
 
 pytestmark = pytest.mark.unit
@@ -527,6 +527,256 @@ def test_shared_user_copies_move_to_top_level_users(data_root: Path, db: FakeDBS
     assert (data_root / "users" / "user-1" / "greet" / "SKILL.md").read_text(
         encoding="utf-8"
     ) == "v1"
+
+
+# ---------------------------------------------------------------------------
+# G2 hash utilities (spec v3.3 §4.3)
+# ---------------------------------------------------------------------------
+
+
+def test_hash_compare_or_write_no_op_when_match(data_root: Path) -> None:
+    """An identical existing file is left untouched (mtime preserved)."""
+    target = data_root / "agents" / "1" / "skills" / "greet" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("v1", encoding="utf-8")
+    before = target.stat().st_mtime_ns
+
+    written = asyncio.run(skills_store._hash_compare_or_write(target, "v1"))
+
+    assert written is False
+    assert target.stat().st_mtime_ns == before
+
+
+def test_hash_compare_or_write_writes_when_diff_or_missing(data_root: Path) -> None:
+    """A missing or drifted target is (re)written atomically."""
+    missing = data_root / "agents" / "1" / "skills" / "new" / "SKILL.md"
+    assert asyncio.run(skills_store._hash_compare_or_write(missing, "v1")) is True
+    assert missing.read_text(encoding="utf-8") == "v1"
+
+    assert asyncio.run(skills_store._hash_compare_or_write(missing, "v2")) is True
+    assert missing.read_text(encoding="utf-8") == "v2"
+
+
+def test_compute_workspace_hash_stable(data_root: Path) -> None:
+    """The Agent-layer fingerprint is stable across recomputation."""
+    skills_dir = data_root / "agents" / "1" / "skills"
+    for name, body in (("alpha", "a-body"), ("beta", "b-body")):
+        path = skills_dir / name / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+    first = skills_store.compute_workspace_hash(skills_dir)
+    second = skills_store.compute_workspace_hash(skills_dir)
+    assert first == second
+    assert len(first) == 64  # sha256 hex
+
+
+def test_compute_workspace_hash_ignores_nested_user_layer(data_root: Path) -> None:
+    """The glob (non-recursive) must not include the nested users/ subdirectory."""
+    skills_dir = data_root / "agents" / "1" / "skills"
+    agent_file = skills_dir / "greet" / "SKILL.md"
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text("agent-copy", encoding="utf-8")
+    user_file = skills_dir / "users" / "7" / "skills" / "greet" / "SKILL.md"
+    user_file.parent.mkdir(parents=True)
+    user_file.write_text("user-copy", encoding="utf-8")
+
+    with_agent = skills_store.compute_workspace_hash(skills_dir)
+    agent_file.unlink()
+    without_agent = skills_store.compute_workspace_hash(skills_dir)
+
+    assert with_agent != without_agent  # the user-layer copy must not keep the hash up
+
+
+def test_compute_workspace_hash_different_for_diff_content(data_root: Path) -> None:
+    """Different content produces a different fingerprint."""
+    skills_dir = data_root / "agents" / "1" / "skills"
+    path = skills_dir / "greet" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("v1", encoding="utf-8")
+    hash_v1 = skills_store.compute_workspace_hash(skills_dir)
+
+    path.write_text("v2", encoding="utf-8")
+    assert skills_store.compute_workspace_hash(skills_dir) != hash_v1
+
+
+def test_compute_user_workspace_hash_includes_nested_files(data_root: Path) -> None:
+    """The User-layer fingerprint uses rglob (any depth below the dir)."""
+    user_dir = data_root / "agents" / "1" / "users" / "7" / "skills"
+    deep = user_dir / "greet" / "SKILL.md"
+    deep.parent.mkdir(parents=True)
+    deep.write_text("body", encoding="utf-8")
+
+    with_file = skills_store._compute_user_workspace_hash(user_dir)
+    deep.unlink()
+    without_file = skills_store._compute_user_workspace_hash(user_dir)
+
+    assert with_file != without_file
+
+
+def test_compute_effective_workspace_hash_agent_overrides_global(data_root: Path) -> None:
+    """Expected fingerprint resolves the Agent layer first, then Global."""
+    global_file = data_root / "global" / "skills" / "greet" / "SKILL.md"
+    global_file.parent.mkdir(parents=True)
+    global_file.write_text("global-body", encoding="utf-8")
+
+    from_global = skills_store._compute_effective_workspace_hash(1, ["greet"])
+
+    agent_file = data_root / "agents" / "1" / "skills" / "greet" / "SKILL.md"
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text("agent-body", encoding="utf-8")
+
+    from_agent = skills_store._compute_effective_workspace_hash(1, ["greet"])
+
+    assert from_global != from_agent  # the Agent copy changes the expectation
+
+
+def test_compute_effective_workspace_hash_missing_source_empty_slot(data_root: Path) -> None:
+    """A name with no source contributes an empty slot (position-stable)."""
+    global_file = data_root / "global" / "skills" / "greet" / "SKILL.md"
+    global_file.parent.mkdir(parents=True)
+    global_file.write_text("body", encoding="utf-8")
+
+    only_greet = skills_store._compute_effective_workspace_hash(1, ["greet"])
+    greet_plus_ghost = skills_store._compute_effective_workspace_hash(1, ["greet", "ghost"])
+
+    assert only_greet != greet_plus_ghost  # ghost's empty slot shifts the aggregate
+
+
+# ---------------------------------------------------------------------------
+# G2 materialize_for_agent (publish-time Global -> Agent copy, spec §4.1/§4.3)
+# ---------------------------------------------------------------------------
+
+
+def test_materialize_for_agent_creates_files(data_root: Path, db: FakeDBSession) -> None:
+    """The publish-time copy lands under {DATA_ROOT}/agents/<app_id>/skills/."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="d", body="hello"))
+
+    asyncio.run(skills_store.materialize_for_agent(db, app_id=3, skill_names=["greet"]))
+
+    agent_file = data_root / "agents" / "3" / "skills" / "greet" / "SKILL.md"
+    assert agent_file.read_text(encoding="utf-8") == "hello"
+
+
+def test_materialize_for_agent_hash_skip(data_root: Path, db: FakeDBSession) -> None:
+    """An up-to-date Agent-layer copy is left untouched (no rewrite)."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="d", body="v1"))
+    asyncio.run(skills_store.materialize_for_agent(db, app_id=3, skill_names=["greet"]))
+    agent_file = data_root / "agents" / "3" / "skills" / "greet" / "SKILL.md"
+    before = agent_file.stat().st_mtime_ns
+
+    asyncio.run(skills_store.materialize_for_agent(db, app_id=3, skill_names=["greet"]))
+
+    assert agent_file.stat().st_mtime_ns == before
+
+
+# ---------------------------------------------------------------------------
+# G2 User-layer combined materialization (spec v3.3 §4.2/§4.3)
+# ---------------------------------------------------------------------------
+
+
+def _make_app(app_id: int, skill_names: list[str]) -> AgentApp:
+    """Build a detached AgentApp row for combined-materialization tests."""
+    return AgentApp(id=app_id, name=f"app-{app_id}", system_prompt="x", skill_names=skill_names)
+
+
+def _make_subagent(name: str, skill_names: list[str]) -> SubAgentConfig:
+    """Build a detached SubAgentConfig row for combined-materialization tests."""
+    return SubAgentConfig(
+        name=name,
+        description=f"{name} sub",
+        when_to_use="always",
+        system_prompt="x",
+        content_hash="hash",
+        skill_names=skill_names,
+    )
+
+
+def test_materialize_to_user_combined_aggregates_global_and_agent(
+    data_root: Path, db: FakeDBSession
+) -> None:
+    """App + SubAgent skill sets are unioned (deduped) into the User layer."""
+    asyncio.run(skills_store.create_global(db, name="shared", description="d", body="shared-body"))
+    asyncio.run(skills_store.create_global(db, name="sub-only", description="d", body="sub-body"))
+    app_cfg = _make_app(1, ["shared"])
+    subagents = [_make_subagent("helper", ["sub-only"])]
+
+    asyncio.run(
+        skills_store.materialize_to_user_combined(
+            db, app_cfg=app_cfg, user_id=7, subagent_cfgs=subagents
+        )
+    )
+
+    user_dir = data_root / "agents" / "1" / "users" / "7" / "skills"
+    assert (user_dir / "shared" / "SKILL.md").read_text(encoding="utf-8") == "shared-body"
+    assert (user_dir / "sub-only" / "SKILL.md").read_text(encoding="utf-8") == "sub-body"
+
+
+def test_agent_skill_overrides_global_in_combined(data_root: Path, db: FakeDBSession) -> None:
+    """A skill present in both layers resolves to the Agent-layer copy."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="d", body="global-body"))
+    agent_file = data_root / "agents" / "1" / "skills" / "greet" / "SKILL.md"
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text("agent-body", encoding="utf-8")
+    app_cfg = _make_app(1, ["greet"])
+
+    asyncio.run(
+        skills_store.materialize_to_user_combined(db, app_cfg=app_cfg, user_id=7, subagent_cfgs=[])
+    )
+
+    user_file = data_root / "agents" / "1" / "users" / "7" / "skills" / "greet" / "SKILL.md"
+    assert user_file.read_text(encoding="utf-8") == "agent-body"
+
+
+def test_materialize_to_user_combined_prunes_stale(data_root: Path, db: FakeDBSession) -> None:
+    """Skill dirs outside the effective set are pruned from the User layer."""
+    asyncio.run(skills_store.create_global(db, name="keep", description="d", body="v1"))
+    stale_dir = data_root / "agents" / "1" / "users" / "7" / "skills" / "stale"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "SKILL.md").write_text("stale", encoding="utf-8")
+    app_cfg = _make_app(1, ["keep"])
+
+    asyncio.run(
+        skills_store.materialize_to_user_combined(db, app_cfg=app_cfg, user_id=7, subagent_cfgs=[])
+    )
+
+    assert not stale_dir.exists()
+    assert (data_root / "agents" / "1" / "users" / "7" / "skills" / "keep" / "SKILL.md").exists()
+
+
+def test_prune_stale_user_skills(data_root: Path) -> None:
+    """_prune_stale_user_skills(target_dir, keep) removes non-kept skill dirs."""
+    target = data_root / "agents" / "1" / "users" / "7" / "skills"
+    keep_dir = target / "keep-1"
+    stale_dir = target / "old"
+    keep_dir.mkdir(parents=True)
+    stale_dir.mkdir()
+
+    skills_store._prune_stale_user_skills(target, {"keep-1"})
+
+    assert keep_dir.is_dir()
+    assert not stale_dir.exists()
+
+
+def test_materialize_into_combined_directory_resolves_layers(
+    data_root: Path, db: FakeDBSession, tmp_path: Path
+) -> None:
+    """test_runner helper copies Agent-first with Global fallback into a tmp dir."""
+    asyncio.run(skills_store.create_global(db, name="greet", description="d", body="global-body"))
+    asyncio.run(skills_store.create_global(db, name="solo", description="d", body="solo-body"))
+    agent_file = data_root / "agents" / "1" / "skills" / "greet" / "SKILL.md"
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text("agent-body", encoding="utf-8")
+    target = tmp_path / "standalone-combined"
+
+    asyncio.run(
+        skills_store.materialize_into_combined_directory(
+            db, target, app_id=1, skill_names=["greet", "solo"]
+        )
+    )
+
+    assert (target / "greet" / "SKILL.md").read_text(encoding="utf-8") == "agent-body"
+    assert (target / "solo" / "SKILL.md").read_text(encoding="utf-8") == "solo-body"
 
 
 # ---------------------------------------------------------------------------

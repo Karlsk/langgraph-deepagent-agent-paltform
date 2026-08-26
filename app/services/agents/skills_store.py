@@ -50,7 +50,7 @@ from app.core.logging import logger
 from app.core.metrics import skill_sync_total
 from app.schemas.base import PageResult
 from app.core.observability import langfuse_callback_handler
-from app.models.agent_assets import SkillAsset
+from app.models.agent_assets import AgentApp, SkillAsset, SubAgentConfig
 from app.services.llm import llm_service
 
 _SKILL_FILE_NAME = "SKILL.md"
@@ -520,6 +520,210 @@ async def materialize_into_directory(
         target_dir=str(target_dir),
         skill_count=len(list(skill_names)),
     )
+
+
+# ---------------------------------------------------------------------------
+# G2 copy + hash utilities (spec v3.3 §4.3)
+# ---------------------------------------------------------------------------
+
+
+async def _hash_compare_or_write(target: Path, body: str) -> bool:
+    """Hash-compare and write only on mismatch (spec v3.3 §4.3).
+
+    Args:
+        target: Destination SKILL.md path.
+        body: Fresh content to compare against / write.
+
+    Returns:
+        True when the file was (re)written; False when the existing copy
+        already matches and was left untouched.
+    """
+    new_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if target.exists():
+        existing_hash = hashlib.sha256(await asyncio.to_thread(target.read_bytes)).hexdigest()
+        if existing_hash == new_hash:
+            return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(_atomic_write, target, body)
+    return True
+
+
+async def materialize_for_agent(
+    session: Session, *, app_id: int, skill_names: Sequence[str]
+) -> None:
+    """Copy the given global skills into the Agent layer (publish time).
+
+    Idempotent: an Agent-layer copy whose sha256 already matches the fresh
+    Global body is left untouched (hash-compare write, spec §4.1).
+
+    Args:
+        session: SQLModel DB session (passed through to ``read_global``).
+        app_id: Target AgentApp id.
+        skill_names: Names of global skills to snapshot.
+
+    Raises:
+        ValueError: If any skill name is invalid or the skill exists neither
+            on disk nor in the DB (dual-store miss).
+    """
+    target_dir = _agent_skill_dir(app_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for name in skill_names:
+        _validate_skill_name(name)
+        body = await read_global(session, name)
+        target = target_dir / name / _SKILL_FILE_NAME
+        if await _hash_compare_or_write(target, body):
+            written += 1
+    logger.info(
+        "agent_skills_materialized",
+        app_id=app_id,
+        skill_count=len(list(skill_names)),
+        files_written=written,
+    )
+
+
+def compute_workspace_hash(agent_skill_dir: Path) -> str:
+    """Compute the content fingerprint of an Agent-layer skills directory.
+
+    Only the one-level ``<name>/SKILL.md`` files are hashed (non-recursive
+    glob) so the nested ``users/`` workspace never leaks into the
+    Agent-layer fingerprint.
+
+    Args:
+        agent_skill_dir: Must be ``_agent_skill_dir(app_id)`` — NOT
+            ``_agent_dir(app_id)`` (which would include the users/ subtree).
+
+    Returns:
+        sha256 hex of the sorted per-file sha256 digests joined by newlines.
+    """
+    if not agent_skill_dir.is_dir():
+        return hashlib.sha256(b"").hexdigest()
+    file_hashes: list[str] = []
+    for path in sorted(agent_skill_dir.glob(f"*/{_SKILL_FILE_NAME}")):
+        file_hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    return hashlib.sha256("\n".join(file_hashes).encode("utf-8")).hexdigest()
+
+
+def _compute_user_workspace_hash(user_dir: Path) -> str:
+    """Compute the User-layer content fingerprint (lazy validation input).
+
+    Uses rglob so every SKILL.md at any depth below ``user_dir`` counts.
+    """
+    if not user_dir.is_dir():
+        return hashlib.sha256(b"").hexdigest()
+    file_hashes: list[str] = []
+    for path in sorted(user_dir.rglob(_SKILL_FILE_NAME)):
+        file_hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    return hashlib.sha256("\n".join(file_hashes).encode("utf-8")).hexdigest()
+
+
+def _compute_effective_workspace_hash(app_id: int, effective_skill_names: Sequence[str]) -> str:
+    """Compute the expected User-layer fingerprint (v3.3 dynamic algorithm).
+
+    Source resolution mirrors :func:`materialize_to_user_combined` exactly
+    (Agent layer first, Global fallback); a name with no source anywhere
+    contributes an empty slot so positions stay stable and a missing skill
+    remains distinguishable. This is why the lazy check cannot simply compare
+    against ``AgentApp.workspace_hash``: the effective set is the union of
+    App + SubAgent skills and can be larger than the Agent-layer snapshot.
+    """
+    file_hashes: list[str] = []
+    for name in sorted(effective_skill_names):
+        _validate_skill_name(name)
+        agent_path = _agent_skill_file(app_id, name)
+        source = agent_path if agent_path.exists() else _global_skill_file(name)
+        if source.exists():
+            file_hashes.append(hashlib.sha256(source.read_bytes()).hexdigest())
+        else:
+            file_hashes.append("")
+    return hashlib.sha256("\n".join(file_hashes).encode("utf-8")).hexdigest()
+
+
+async def materialize_to_user_combined(
+    session: Session,
+    *,
+    app_cfg: AgentApp,
+    user_id: int,
+    subagent_cfgs: Sequence[SubAgentConfig],
+) -> None:
+    """Aggregate (Global + Agent) into the per-(app, user) workspace (v3).
+
+    Merge semantics: the effective set is the union of the App's and every
+    SubAgent's ``skill_names`` (deduped); each name resolves Agent-layer
+    first with a Global fallback; copies are hash-compared so unchanged
+    files are left untouched; directories outside the effective set are
+    pruned.
+
+    Args:
+        session: SQLModel DB session (kept in the v3 signature for parity).
+        app_cfg: AgentApp configuration (id drives the workspace path).
+        user_id: Target user id (from the API layer's authenticated user).
+        subagent_cfgs: SubAgentConfig rows bound to the app.
+    """
+    effective_skill_names = sorted(
+        set(app_cfg.skill_names or [])
+        | {n for cfg in subagent_cfgs for n in (cfg.skill_names or [])}
+    )
+    target_dir = _user_skill_dir(app_cfg.id, user_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    for name in effective_skill_names:
+        agent_path = _agent_skill_file(app_cfg.id, name)
+        source = agent_path if agent_path.exists() else _global_skill_file(name)
+        if source.exists():
+            body = await asyncio.to_thread(source.read_text, "utf-8")
+            target = target_dir / name / _SKILL_FILE_NAME
+            if await _hash_compare_or_write(target, body):
+                written += 1
+        else:
+            logger.warning(
+                "user_materialize_source_missing",
+                source=str(source),
+                app_id=app_cfg.id,
+                user_id=user_id,
+            )
+
+    # Prune skill dirs that are no longer part of the effective set.
+    await asyncio.to_thread(_prune_stale_user_skills, target_dir, set(effective_skill_names))
+
+    logger.info(
+        "user_workspace_materialized_combined",
+        user_id=user_id,
+        app_id=app_cfg.id,
+        skill_count=len(effective_skill_names),
+        files_written=written,
+    )
+
+
+async def materialize_into_combined_directory(
+    session: Session,
+    target_dir: Path,
+    *,
+    app_id: int,
+    skill_names: Sequence[str],
+) -> None:
+    """Aggregate (Global + Agent) into a caller-supplied directory.
+
+    Standalone test_runner helper (spec §4.3): resolves each name
+    Agent-layer first with a Global fallback and writes into
+    ``<target_dir>/<name>/SKILL.md`` (FilesystemBackend layout). MVP keeps
+    this Global-only in practice — real combined usage arrives with G3+.
+
+    Args:
+        session: SQLModel DB session (kept in the v3 signature for parity).
+        target_dir: Destination root; created when missing.
+        app_id: AgentApp id whose Agent layer is consulted first.
+        skill_names: Skill names to materialize.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name in skill_names:
+        _validate_skill_name(name)
+        agent_path = _agent_skill_file(app_id, name)
+        source = agent_path if agent_path.exists() else _global_skill_file(name)
+        if source.exists():
+            body = await asyncio.to_thread(source.read_text, "utf-8")
+            await asyncio.to_thread(_atomic_write, target_dir / name / _SKILL_FILE_NAME, body)
 
 
 async def sync_user_skills(session: Session, user_id: str, associated_names: Sequence[str]) -> None:
