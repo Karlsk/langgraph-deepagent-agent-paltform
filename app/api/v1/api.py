@@ -15,6 +15,7 @@ from app.api.v1.apps import router as apps_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.mcp_servers import router as mcp_servers_router
 from app.api.v1.providers import router as providers_router
+from app.api.v1.sessions import router as sessions_router
 from app.api.v1.skills import router as skills_router
 from app.api.v1.subagents import router as subagents_router
 from app.core.logging import logger
@@ -29,6 +30,7 @@ api_router.include_router(skills_router, tags=["Skills"])
 api_router.include_router(apps_router, tags=["Agent Apps"])
 api_router.include_router(mcp_servers_router, tags=["MCP Servers"])
 api_router.include_router(providers_router, tags=["Providers"])
+api_router.include_router(sessions_router, tags=["Sessions"])
 api_router.include_router(workflow_router, tags=["Workflow"])
 
 
