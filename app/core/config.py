@@ -157,6 +157,9 @@ class Settings:
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
+        # G3 §11.4.4: global fallback compression threshold (tokens) used when
+        # AgentApp.context_size is NULL; every app gets SummarizationMiddleware.
+        self.DEFAULT_AGENT_CONTEXT_SIZE = int(os.getenv("DEFAULT_AGENT_CONTEXT_SIZE", "128000"))
 
         # Long term memory Configuration
         self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", "gpt-5-nano")
@@ -267,6 +270,7 @@ class Settings:
             "subagent": ["60 per minute"],
             "skill": ["60 per minute"],
             "agent_app": ["60 per minute"],
+            "sessions": ["60 per minute"],
             "mcp_server": ["60 per minute"],
             "mcp_tools_debug": ["30 per minute"],
             "provider": ["60 per minute"],

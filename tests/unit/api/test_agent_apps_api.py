@@ -40,7 +40,7 @@ from app.core.limiter import limiter
 from app.core.mcp_client import MCPUpstreamError, ToolSummary
 from app.models.agent_assets import AgentApp
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
-from app.models.subagent_trace import SubAgentTestTrace
+from app.models.subagent_trace import SubAgentTrace
 from app.models.user import User
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents import agent_apps_service, skills_store
@@ -382,8 +382,8 @@ def test_subagent_test_runner_failure_500(client: TestClient, monkeypatch: pytes
 # ---------------------------------------------------------------------------
 
 
-def _seed_trace(db_session: DBSession, **overrides: Any) -> SubAgentTestTrace:
-    """Persist a SubAgentTestTrace row with sensible defaults for API tests."""
+def _seed_trace(db_session: DBSession, **overrides: Any) -> SubAgentTrace:
+    """Persist a SubAgentTrace row with sensible defaults for API tests."""
     defaults: dict[str, Any] = {
         "name": "researcher",
         "status": "success",
@@ -397,7 +397,7 @@ def _seed_trace(db_session: DBSession, **overrides: Any) -> SubAgentTestTrace:
         "created_by": "ann",
     }
     defaults.update(overrides)
-    trace = SubAgentTestTrace(**defaults)
+    trace = SubAgentTrace(**defaults)
     db_session.add(trace)
     db_session.commit()
     db_session.refresh(trace)

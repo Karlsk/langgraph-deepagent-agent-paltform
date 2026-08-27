@@ -1,5 +1,9 @@
-"""This file contains the session model for the application."""
+"""Session model for storing chat sessions."""
 
+from datetime import (
+    UTC,
+    datetime,
+)
 from typing import (
     TYPE_CHECKING,
     Optional,
@@ -25,7 +29,10 @@ class Session(BaseModel, table=True):
         name: Name of the session (defaults to empty string)
         username: Display name copied from the user at session creation
         created_at: When the session was created
-        agent_app_id: Id of the agent app bound to this session (no FK constraint)
+        updated_at: When the session was last updated (set on PATCH rename;
+            G3 §11.4.1 — onupdate stamps every subsequent UPDATE)
+        agent_app_id: Id of the agent app bound to this session (no FK constraint;
+            G3 §11.4.1 — int aligned with AgentApp.id)
         messages: Relationship to session messages
         user: Relationship to the session owner
     """
@@ -34,5 +41,9 @@ class Session(BaseModel, table=True):
     user_id: int = Field(foreign_key="user.id")
     name: str = Field(default="")
     username: Optional[str] = Field(default=None)
-    agent_app_id: Optional[str] = Field(default=None, index=True)
+    agent_app_id: Optional[int] = Field(default=None, index=True)
+    updated_at: Optional[datetime] = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
+    )
     user: "User" = Relationship(back_populates="sessions")

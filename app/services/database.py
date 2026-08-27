@@ -137,7 +137,7 @@ class DatabaseService:
         user_id: int,
         name: str = "",
         username: str | None = None,
-        agent_app_id: str | None = None,
+        agent_app_id: int | None = None,
     ) -> ChatSession:
         """Create a new chat session.
 
@@ -146,7 +146,7 @@ class DatabaseService:
             user_id: The ID of the user who owns the session
             name: Optional name for the session (defaults to empty string)
             username: Display name copied from the user for LLM personalization
-            agent_app_id: Optional AgentApp binding (str(AgentApp.id)); None
+            agent_app_id: Optional AgentApp binding (AgentApp.id); None
                 leaves the session on the system default AgentApp at runtime
 
         Returns:

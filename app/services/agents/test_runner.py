@@ -27,7 +27,7 @@ from app.core.logging import logger
 from app.core.metrics import agent_test_runs_total, subagent_task_duration_seconds
 from app.core.observability import langfuse_callback_handler
 from app.models.agent_assets import SubAgentConfig
-from app.models.subagent_trace import SubAgentTestTrace
+from app.models.subagent_trace import SubAgentTrace
 from app.schemas.agent_apps import SubAgentTestResult
 from app.services.agents.assembly import compile_standalone_subagent, resolve_tools
 from app.services.agents.mcp_manager import build_tool_catalog, get_mcp_tools
@@ -72,7 +72,7 @@ def _persist_trace(
         failure is logged but the test run's own result/exception wins).
     """
     try:
-        trace = SubAgentTestTrace(
+        trace = SubAgentTrace(
             name=name,
             status=status,
             prompt=prompt,
@@ -120,7 +120,7 @@ async def run_subagent_once(
             the directory's lifecycle (typically a ``tmp_path`` fixture) so
             no state leaks back to ``settings.SKILLS_ROOT``.
         created_by: Audit-only identifier of the user triggering the run,
-            recorded on the persisted ``SubAgentTestTrace`` row.
+            recorded on the persisted ``SubAgentTrace`` row.
 
     Returns:
         SubAgentTestResult with the final AIMessage text, the number of model

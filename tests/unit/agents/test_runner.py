@@ -22,7 +22,7 @@ from app.core.config import settings
 from app.core.metrics import agent_test_runs_total, subagent_task_duration_seconds
 from app.models.agent_assets import SubAgentConfig, SkillAsset
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
-from app.models.subagent_trace import SubAgentTestTrace
+from app.models.subagent_trace import SubAgentTrace
 from app.services.agents import test_runner
 
 pytestmark = pytest.mark.unit
@@ -514,7 +514,7 @@ def test_run_subagent_once_without_skill_names_skips_tmp_root(
 
 
 # ---------------------------------------------------------------------------
-# Execution trace persistence (SubAgentTestTrace)
+# Execution trace persistence (SubAgentTrace)
 # ---------------------------------------------------------------------------
 
 
@@ -540,9 +540,9 @@ class ExplodingChatModel(BaseChatModel):
         raise RuntimeError("model exploded")
 
 
-def _traces_for(session: Session, name: str) -> list[SubAgentTestTrace]:
+def _traces_for(session: Session, name: str) -> list[SubAgentTrace]:
     """Fetch every persisted trace row recorded for ``name``."""
-    return list(session.exec(select(SubAgentTestTrace).where(SubAgentTestTrace.name == name)).all())
+    return list(session.exec(select(SubAgentTrace).where(SubAgentTrace.name == name)).all())
 
 
 def test_run_subagent_once_persists_success_trace(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -555,7 +555,7 @@ def test_run_subagent_once_persists_success_trace(db_session: Session, monkeypat
     )
 
     assert result.trace_id is not None
-    trace = db_session.get(SubAgentTestTrace, result.trace_id)
+    trace = db_session.get(SubAgentTrace, result.trace_id)
     assert trace is not None
     assert trace.name == "helper"
     assert trace.status == "success"
@@ -592,7 +592,7 @@ def test_run_subagent_once_trace_captures_tool_chain_in_order(
 
     result = asyncio.run(test_runner.run_subagent_once(db_session, name="helper", prompt="echo hi"))
 
-    trace = db_session.get(SubAgentTestTrace, result.trace_id)
+    trace = db_session.get(SubAgentTrace, result.trace_id)
     assert trace is not None
     types = [event["type"] for event in trace.events]
     assert types == ["llm_call", "tool_call", "llm_call", "run_finished"]

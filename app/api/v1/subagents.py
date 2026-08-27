@@ -27,7 +27,7 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.logging import logger
 from app.models.agent_assets import AgentApp, SubAgentConfig
-from app.models.subagent_trace import SubAgentTestTrace
+from app.models.subagent_trace import SubAgentTrace
 from app.models.user import User
 from app.schemas.agent_apps import (
     SubAgentCreate,
@@ -412,12 +412,12 @@ async def list_subagent_test_traces(
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
         result = paginate_by_name(
             db,
-            SubAgentTestTrace,
+            SubAgentTrace,
             page=page,
             page_size=page_size,
             keyword=None,
-            order_by=col(SubAgentTestTrace.created_at).desc(),
-            extra_where=[col(SubAgentTestTrace.name) == name],
+            order_by=col(SubAgentTrace.created_at).desc(),
+            extra_where=[col(SubAgentTrace.name) == name],
         )
         items = [SubAgentTraceSummary.model_validate(row, from_attributes=True) for row in result.items]
         return ApiResponse.success(
@@ -458,7 +458,7 @@ async def get_subagent_test_trace(
     try:
         if db.get(SubAgentConfig, name) is None:
             raise HTTPException(status_code=404, detail=f"subagent '{name}' not found")
-        trace = db.get(SubAgentTestTrace, trace_id)
+        trace = db.get(SubAgentTrace, trace_id)
         if trace is None or trace.name != name:
             raise HTTPException(status_code=404, detail=f"trace {trace_id} not found for subagent '{name}'")
         return ApiResponse.success(SubAgentTraceDetail.model_validate(trace, from_attributes=True))

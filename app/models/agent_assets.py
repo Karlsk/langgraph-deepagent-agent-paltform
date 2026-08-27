@@ -95,6 +95,9 @@ class AgentApp(BaseModel, table=True):
         skill_names: Names of SkillAsset entries bound to this app
         subagent_names: Names of SubAgentConfig entries bound to this app
         interrupt_on: Interrupt configuration passed to the engine
+        context_size: Optional absolute token threshold for conversation
+            compaction (G3 §11.4.2); NULL falls back to
+            ``settings.DEFAULT_AGENT_CONTEXT_SIZE`` at compile time
         engine: Execution engine backend
         status: Lifecycle status (draft|published)
         published_hash: Hash snapshot of the last published revision
@@ -118,6 +121,7 @@ class AgentApp(BaseModel, table=True):
     skill_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     subagent_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     interrupt_on: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    context_size: Optional[int] = Field(default=None)
     engine: str = Field(default="deepagents")
     status: str = Field(default="draft")
     published_hash: Optional[str] = Field(default=None)
