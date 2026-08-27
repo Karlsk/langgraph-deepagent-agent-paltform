@@ -785,6 +785,20 @@ curl -s -X POST "$BASE/subagents/search-helper/test" \
 **失败排查**：404（信封 `message` 提示 subagent 不存在）；500 多为 LLM 调用失败（查日志 `subagent_test_failed`）；
 429（信封 `message="Rate limit exceeded"`）默认限流 5 次/分钟。
 
+**查看运行记录（G3 更名后路径 `/traces`）**：
+
+```bash
+# 分页列表（最新在前；列表行为摘要，不含事件流），pageSize 上限 100
+curl -s "$BASE/subagents/search-helper/traces?page=1&pageSize=10" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 详情（含完整事件流：llm_call / tool_call / run_finished）
+curl -s "$BASE/subagents/search-helper/traces/$TRACE_ID" -H "Authorization: Bearer $TOKEN"
+```
+
+**预期**：列表信封含刚才测试运行产生的记录；详情返回该记录的完整事件流。
+不存在的 `trace_id` 返 404 信封。
+
 ### 5.4 负向用例：PATCH name 被 422 拒绝
 
 ```bash
@@ -947,7 +961,7 @@ curl -s -X DELETE "$BASE/providers/proxy" -H "Authorization: Bearer $TOKEN"
 
 ## 6. AgentApp 功能
 
-所有端点位于 `$BASE/apps*`。创建后 `status=draft`，需显式 publish 才能关联用户（三级 Workspace 物化，见 6.6 节）；会话绑定待 G3 重建。
+所有端点位于 `$BASE/apps*`。创建后 `status=draft`，需显式 publish 才能关联用户（三级 Workspace 物化，见 6.6 节）；会话绑定由 G3 落地——`POST /sessions` 携 `agent_app_id` 创建会话并自动幂等 associate（见第 7.1 节）。
 
 ### 6.1 创建（关联 skill + subagent，allowed_tools 含内置 + MCP 工具）
 
@@ -1120,8 +1134,8 @@ curl -s -X PATCH "$BASE/skills/csv-report" \
   -H "Content-Type: application/json" \
   -d '{"body": "# csv-report\n\n## Steps\n1. version-2 内容\n"}'
 curl -s -X POST "$BASE/apps/$APP_ID/publish" -H "Authorization: Bearer $TOKEN"
-# 触发一次 lazy 校验：G1 退役了会话端点，G2 阶段 lazy 校验（§12.1 G3 集成契约）唯一调用方是
-# G3 预留入口 get_runtime，直接在 app 容器内调用它触发：
+# 触发一次 lazy 校验：lazy 校验唯一入口仍是 get_runtime——G3 的 `POST /sessions` 走
+# associate_user_with_app 的是即时物化（非 lazy），故手动触发仍在 app 容器内直接调用它：
 docker exec -w /app <app容器> /app/.venv/bin/python -c "
 import asyncio
 from app.api.v1.agent_assets_common import get_db_session
@@ -1137,8 +1151,10 @@ grep "version-2" "$DATA_ROOT/agents/$APP_ID/users/$USER_ID/skills/csv-report/SKI
 
 **预期**：`get_runtime` 入口的 `ensure_user_workspace_up_to_date` lazy 校验发现 hash drift，
 User 层被重新复制为 version-2 内容（exec 输出可见 `user_workspace_lazy_synced` 日志；
-注意 `docker exec` 的日志不会进 `docker logs`，需在 exec 输出里看）。G3 会话 API 上线后，
-触发点将改为 session 创建/启动入口（`spec-g3-session.md` §12）。
+注意 `docker exec` 的日志不会进 `docker logs`，需在 exec 输出里看）。G3 已定案触发语义：
+`POST /sessions` 自动 associate 完成 (Global+Agent)→User 物化并盖 hash 章（即时，非 lazy）；
+`GET /sessions/{sid}` 为纯元数据读、不触发 lazy 校验；lazy 校验的消费者为 export 的
+L1 fallback 与 G4 续聊（均经 `get_runtime`）。
 
 #### M6：启动期补建（删除 Agent 层后重启自动恢复）
 
