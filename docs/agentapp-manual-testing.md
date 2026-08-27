@@ -547,8 +547,8 @@ curl -s -X POST "$BASE/skills/workspace-sync" -H "Authorization: Bearer $TOKEN"
 
 ### 4.1 准备最小本地 stdio MCP server
 
-将以下脚本保存为 **`app/tmp_mcp_demo_server.py`**（注意：必须放在仓库的 `app/` 目录下，
-因为 compose 只把 `./app` 挂载进容器的 `/app/app`（另挂载 `./logs:/app/logs`），脚本才能在容器内被访问到；测试完请删除该文件）：
+将以下脚本保存为 **`mcp-servers/tmp_mcp_demo_server.py`**（compose 已将 `./mcp-servers` 挂载进容器的
+`/app/mcp-servers`，脚本才能在容器内被访问到；该目录专放 MCP 相关文件，不要放进 `app/` 源码目录；测试完请删除该文件）：
 
 ```python
 """Minimal stdio MCP server for manual testing (2 tools: add / echo)."""
@@ -578,7 +578,7 @@ if __name__ == "__main__":
 （默认 `python,node,uvx,npx`）内；shell 解释器（bash/sh/zsh 等）无条件禁止；
 `python -c` / `python -m`、`node -e/--eval` 等内联执行模式也被禁止。
 容器内 `mcp` 库安装在项目 venv 中，因此命令使用 **`/app/.venv/bin/python`**
-（basename 为 `python`，在白名单内），脚本路径为容器内路径 `/app/app/tmp_mcp_demo_server.py`。
+（basename 为 `python`，在白名单内），脚本路径为容器内路径 `/app/mcp-servers/tmp_mcp_demo_server.py`。
 
 ### 4.2 注册 MCP server
 
@@ -590,7 +590,7 @@ curl -s -X POST "$BASE/mcp-servers" \
     "name": "demo-stdio",
     "transport": "stdio",
     "command": "/app/.venv/bin/python",
-    "args": ["/app/app/tmp_mcp_demo_server.py"],
+    "args": ["/app/mcp-servers/tmp_mcp_demo_server.py"],
     "description": "本地演示用 stdio MCP server（add/echo）"
   }'
 ```
@@ -685,7 +685,7 @@ curl -s -X POST "$BASE/mcp-servers" \
     "name": "demo-stdio-dup",
     "transport": "stdio",
     "command": "/app/.venv/bin/python",
-    "args": ["/app/app/tmp_mcp_demo_server.py"]
+    "args": ["/app/mcp-servers/tmp_mcp_demo_server.py"]
   }'
 ```
 
@@ -1260,7 +1260,7 @@ curl -s -X DELETE "$BASE/skills/csv-report" -H "Authorization: Bearer $TOKEN"
 
 每个 DELETE 成功返回信封 `{"code": 200, "message": "...", "data": null}`；对不存在的资源返回 404 信封；
 被引用的 SubAgent/Skill 返回 422 信封（参考 5.6 节）。另请删除第 4.1 步放入的
-`app/tmp_mcp_demo_server.py` 测试脚本文件。
+`mcp-servers/tmp_mcp_demo_server.py` 测试脚本文件。
 
 ### 9.2 停止容器与清理数据
 

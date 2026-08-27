@@ -15,9 +15,12 @@ idempotently at startup:
    into the row. A legacy row still holding a frozen rendered prompt is
    migrated in place (content differs from the template -> UPDATE + new
    fingerprint).
-2. Rewrite every session row whose ``agent_app_id`` is NULL or the
-   ``"system-default"`` placeholder to ``str(default_app.id)`` with a single
-   UPDATE (idempotent: repeat runs affect zero rows).
+2. Rewrite every session row whose ``agent_app_id`` is NULL to the default
+   app's integer id with a single UPDATE (idempotent: repeat runs affect
+   zero rows). The legacy ``"system-default"`` string placeholder predates
+   the G3 migration (``i4b6d8f0a2c5``): rows holding it could not survive
+   ``USING agent_app_id::int``, so on any schema where this code runs the
+   column is strictly integer and only NULL needs backfilling.
 
 Multi-worker safety: the insert catches ``IntegrityError`` (unique-name race
 between concurrent workers), rolls back and re-queries the winning row.
@@ -35,14 +38,13 @@ the default pair must exist before any fingerprint is computed.
 import os
 from typing import Any
 
-from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select, update
 
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.prompts import load_static_system_prompt
-from app.models.agent_assets import DEFAULT_AGENT_APP_ID, AgentApp
+from app.models.agent_assets import AgentApp
 from app.models.provider import DEFAULT_MODEL_NAME, DEFAULT_MODEL_REF, DEFAULT_PROVIDER_NAME, ModelConfig, Provider
 from app.models.session import Session as ChatSession
 from app.services.agents import assembly, skills_store
@@ -156,7 +158,11 @@ async def ensure_default_provider_and_model(session: Session) -> tuple[Provider,
 
 
 def _backfill_legacy_sessions(session: Session, default_app: AgentApp) -> None:
-    """Rewrite NULL / placeholder agent_app_id rows to the default app's id.
+    """Rewrite NULL agent_app_id rows to the default app's id.
+
+    ``session.agent_app_id`` is an Integer column since the G3 migration
+    (``i4b6d8f0a2c5_g3_session_context``); comparing it against the legacy
+    string placeholder raised ``InvalidTextRepresentation`` on PostgreSQL.
 
     Args:
         session: SQLModel database session.
@@ -164,8 +170,8 @@ def _backfill_legacy_sessions(session: Session, default_app: AgentApp) -> None:
     """
     statement = (
         update(ChatSession)
-        .where(or_(col(ChatSession.agent_app_id).is_(None), col(ChatSession.agent_app_id) == DEFAULT_AGENT_APP_ID))
-        .values(agent_app_id=str(default_app.id))
+        .where(col(ChatSession.agent_app_id).is_(None))
+        .values(agent_app_id=default_app.id)
     )
     result: Any = session.exec(statement)
     session.commit()

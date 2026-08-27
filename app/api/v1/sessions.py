@@ -124,7 +124,7 @@ async def create_session(
         agent_app_id=body.agent_app_id,
         auto_associated=True,
     )
-    return ApiResponse.success(sessions_service.to_read(new_session))
+    return ApiResponse.success(sessions_service.to_read(new_session), code=201)
 
 
 @router.patch("/sessions/{session_id}", response_model=ApiResponse[SessionRead])
