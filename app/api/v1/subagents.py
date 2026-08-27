@@ -377,13 +377,13 @@ async def test_subagent(
 
 
 # ---------------------------------------------------------------------------
-# Test run traces
+# Run traces (test runs and chat-embedded sub-agent runs share one store)
 # ---------------------------------------------------------------------------
 
 
-@router.get("/subagents/{name}/test-traces", response_model=ApiResponse[PageResult[SubAgentTraceSummary]])
+@router.get("/subagents/{name}/traces", response_model=ApiResponse[PageResult[SubAgentTraceSummary]])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
-async def list_subagent_test_traces(
+async def list_subagent_traces(
     request: Request,
     name: str,
     page: int = Query(1, ge=1),
@@ -391,7 +391,7 @@ async def list_subagent_test_traces(
     db: DBSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
-    """List persisted test-run traces of a sub-agent, newest first.
+    """List persisted run traces of a sub-agent, newest first.
 
     Args:
         request: The FastAPI request object for rate limiting.
@@ -426,20 +426,20 @@ async def list_subagent_test_traces(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("subagent_test_trace_list_failed", name=name)
+        logger.exception("subagent_trace_list_failed", name=name)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/subagents/{name}/test-traces/{trace_id}", response_model=ApiResponse[SubAgentTraceDetail])
+@router.get("/subagents/{name}/traces/{trace_id}", response_model=ApiResponse[SubAgentTraceDetail])
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["subagent"][0])
-async def get_subagent_test_trace(
+async def get_subagent_trace(
     request: Request,
     name: str,
     trace_id: int,
     db: DBSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ) -> ApiResponse[Any]:
-    """Fetch one persisted test-run trace including its full event stream.
+    """Fetch one persisted run trace including its full event stream.
 
     Args:
         request: The FastAPI request object for rate limiting.
@@ -465,5 +465,5 @@ async def get_subagent_test_trace(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("subagent_test_trace_read_failed", name=name, trace_id=trace_id)
+        logger.exception("subagent_trace_read_failed", name=name, trace_id=trace_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

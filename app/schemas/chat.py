@@ -92,21 +92,3 @@ class StreamResponse(BaseResponse):
     content: str = Field(default="", description="The content of the current chunk")
     done: bool = Field(default=False, description="Whether the stream is complete")
     source: Optional[str] = Field(default=None, description="Origin tag of the chunk (subagent name or system)")
-
-
-class SessionTitle(BaseModel):
-    """Structured output schema for session title generation."""
-
-    title: str = Field(
-        ...,
-        min_length=1,
-        max_length=60,
-    )
-
-    @field_validator("title")
-    @classmethod
-    def _normalize(cls, v: str) -> str:
-        v = " ".join(v.split()).strip(" \"'`.,:;!?-")
-        if not v:
-            raise ValueError("empty title after normalization")
-        return v

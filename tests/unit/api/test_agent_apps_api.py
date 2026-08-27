@@ -404,8 +404,8 @@ def _seed_trace(db_session: DBSession, **overrides: Any) -> SubAgentTrace:
     return trace
 
 
-def test_list_test_traces_returns_summaries_newest_first(client: TestClient, db_session: DBSession) -> None:
-    """GET /subagents/{name}/test-traces paginates summaries without events."""
+def test_list_traces_returns_summaries_newest_first(client: TestClient, db_session: DBSession) -> None:
+    """GET /subagents/{name}/traces paginates summaries without events."""
     client.post("/subagents", json=_subagent_body())
     base = datetime(2026, 8, 24, 8, 0, 0, tzinfo=UTC)
     older = _seed_trace(db_session, prompt="first", created_at=base)
@@ -413,7 +413,7 @@ def test_list_test_traces_returns_summaries_newest_first(client: TestClient, db_
         db_session, prompt="second", status="error", error="RuntimeError: boom", created_at=base.replace(hour=9)
     )
 
-    response = client.get("/subagents/researcher/test-traces")
+    response = client.get("/subagents/researcher/traces")
     assert response.status_code == 200
     payload = unwrap(response)
     assert payload["total"] == 2
@@ -427,26 +427,26 @@ def test_list_test_traces_returns_summaries_newest_first(client: TestClient, db_
     assert payload["items"][0]["created_by"] == "ann"
 
 
-def test_list_test_traces_filters_by_subagent_name(client: TestClient, db_session: DBSession) -> None:
+def test_list_traces_filters_by_subagent_name(client: TestClient, db_session: DBSession) -> None:
     """Only traces of the addressed sub-agent are returned."""
     client.post("/subagents", json=_subagent_body())
     client.post("/subagents", json=_subagent_body(name="writer"))
     _seed_trace(db_session)  # researcher
     _seed_trace(db_session, name="writer")
 
-    response = client.get("/subagents/researcher/test-traces")
+    response = client.get("/subagents/researcher/traces")
     payload = unwrap(response)
     assert payload["total"] == 1
     assert payload["items"][0]["prompt"] == "hello"
 
 
-def test_list_test_traces_unknown_subagent_404(client: TestClient) -> None:
+def test_list_traces_unknown_subagent_404(client: TestClient) -> None:
     """Listing traces of a missing sub-agent returns 404."""
-    assert client.get("/subagents/ghost/test-traces").status_code == 404
+    assert client.get("/subagents/ghost/traces").status_code == 404
 
 
-def test_get_test_trace_detail_includes_events(client: TestClient, db_session: DBSession) -> None:
-    """GET /subagents/{name}/test-traces/{trace_id} returns the full event stream."""
+def test_get_trace_detail_includes_events(client: TestClient, db_session: DBSession) -> None:
+    """GET /subagents/{name}/traces/{trace_id} returns the full event stream."""
     client.post("/subagents", json=_subagent_body())
     trace = _seed_trace(
         db_session,
@@ -456,7 +456,7 @@ def test_get_test_trace_detail_includes_events(client: TestClient, db_session: D
         ],
     )
 
-    response = client.get(f"/subagents/researcher/test-traces/{trace.id}")
+    response = client.get(f"/subagents/researcher/traces/{trace.id}")
     assert response.status_code == 200
     payload = unwrap(response)
     assert payload["id"] == trace.id
@@ -464,16 +464,16 @@ def test_get_test_trace_detail_includes_events(client: TestClient, db_session: D
     assert [event["type"] for event in payload["events"]] == ["llm_call", "run_finished"]
 
 
-def test_get_test_trace_unknown_id_or_owner_404(client: TestClient, db_session: DBSession) -> None:
+def test_get_trace_unknown_id_or_owner_404(client: TestClient, db_session: DBSession) -> None:
     """A missing trace id or an owner mismatch returns 404."""
     client.post("/subagents", json=_subagent_body())
     client.post("/subagents", json=_subagent_body(name="writer"))
     trace = _seed_trace(db_session, name="writer")
 
-    assert client.get("/subagents/researcher/test-traces/9999").status_code == 404
+    assert client.get("/subagents/researcher/traces/9999").status_code == 404
     # The trace exists but belongs to "writer", not "researcher".
-    assert client.get(f"/subagents/researcher/test-traces/{trace.id}").status_code == 404
-    assert client.get("/subagents/ghost/test-traces/1").status_code == 404
+    assert client.get(f"/subagents/researcher/traces/{trace.id}").status_code == 404
+    assert client.get("/subagents/ghost/traces/1").status_code == 404
 
 
 # ---------------------------------------------------------------------------

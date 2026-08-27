@@ -100,7 +100,7 @@ def test_subagent_test_run_persists_queryable_trace(
     assert trace_id is not None
 
     # The list endpoint exposes the run as a summary (no event stream).
-    listing = client.get(f"{API}/subagents/traceable/test-traces", headers=headers)
+    listing = client.get(f"{API}/subagents/traceable/traces", headers=headers)
     assert listing.status_code == 200, listing.text
     page = unwrap(listing)
     assert page["total"] == 1
@@ -111,7 +111,7 @@ def test_subagent_test_run_persists_queryable_trace(
     assert "events" not in summary
 
     # The detail endpoint carries the full structured event stream.
-    detail = client.get(f"{API}/subagents/traceable/test-traces/{trace_id}", headers=headers)
+    detail = client.get(f"{API}/subagents/traceable/traces/{trace_id}", headers=headers)
     assert detail.status_code == 200, detail.text
     trace = unwrap(detail)
     types = [event["type"] for event in trace["events"]]

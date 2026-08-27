@@ -157,8 +157,7 @@ virtual mounts, so a session never escapes its own user layer.
 | LangGraph Agent | `app/core/langgraph/graph.py` | Orchestrates the conversation loop |
 | LLM Service | `app/services/llm/` | Model registry, retries, circular fallback, structured output |
 | Memory Service | `app/services/memory.py` | mem0 semantic memory + cache |
-| Session Naming | `app/services/session_naming.py` | Background LLM title generation for new sessions |
-| Database Service | `app/services/database.py` | User/session CRUD |
+| Database Service | `app/services/database.py` | User account CRUD |
 | Cache Service | `app/core/cache.py` | Valkey/Redis with in-memory fallback |
 | Middleware | `app/core/middleware.py` | Metrics, logging context, profiling |
 | Auth | `app/api/v1/auth.py` | JWT creation, session management |

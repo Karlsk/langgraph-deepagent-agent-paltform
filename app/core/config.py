@@ -152,7 +152,6 @@ class Settings:
         # Ordered model fallback chain for LLMService; falls back to the
         # default model when unset so the registry is never empty.
         self.LLM_MODELS = parse_list_from_env("LLM_MODELS", []) or [self.DEFAULT_LLM_MODEL]
-        self.SESSION_NAMING_ENABLED = os.getenv("SESSION_NAMING_ENABLED", "true").lower() == "true"
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))

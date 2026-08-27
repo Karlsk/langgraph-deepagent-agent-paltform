@@ -88,11 +88,11 @@ def _persist_trace(
         session.commit()
         session.refresh(trace)
         logger.info(
-            "subagent_test_trace_persisted", name=name, status=status, trace_id=trace.id, event_count=len(events)
+            "subagent_trace_persisted", name=name, status=status, trace_id=trace.id, event_count=len(events)
         )
         return trace.id
     except Exception:  # noqa: BLE001 — trace persistence must never mask the run outcome
-        logger.exception("subagent_test_trace_persist_failed", name=name, status=status)
+        logger.exception("subagent_trace_persist_failed", name=name, status=status)
         try:
             session.rollback()
         except Exception:  # noqa: BLE001, S110 — best-effort rollback, original outcome wins

@@ -12,9 +12,6 @@ _PROMPTS_DIR = os.path.dirname(__file__)
 with open(os.path.join(_PROMPTS_DIR, "system.md"), "r") as _f:
     _SYSTEM_PROMPT_TEMPLATE = _f.read()
 
-with open(os.path.join(_PROMPTS_DIR, "session_title.md"), "r") as _f:
-    SESSION_TITLE_PROMPT = _f.read()
-
 # Lines carrying per-request dynamic segments (user context, long-term memory,
 # current date/time). They are stripped from the static template persisted in
 # the AgentApp row and re-injected per model call by assembly.MemoryMiddleware.

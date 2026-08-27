@@ -182,7 +182,6 @@ def clean_process_caches() -> Generator[None, None, None]:
 @pytest.fixture(autouse=True)
 def settings_isolation(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     """Point mutable settings at test-local values (zero network side effects)."""
-    monkeypatch.setattr(settings, "SESSION_NAMING_ENABLED", False)
     monkeypatch.setattr(settings, "LANGFUSE_TRACING_ENABLED", False)
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setattr(settings, "SKILLS_ROOT", str(tmp_path / "skills"))

@@ -166,7 +166,7 @@ class SubAgentTestResult(BaseModel):
         duration_seconds: Wall-clock duration of the run
         model: LLM model that executed the run
         trace_id: Id of the persisted execution trace (queryable via
-            ``GET /subagents/{name}/test-traces/{trace_id}``); None only
+            ``GET /subagents/{name}/traces/{trace_id}``); None only
             when trace persistence failed
     """
 
