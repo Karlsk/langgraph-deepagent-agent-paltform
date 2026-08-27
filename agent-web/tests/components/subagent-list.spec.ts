@@ -141,8 +141,8 @@ const { apiMock } = vi.hoisted(() => {
     patchSubAgent: vi.fn(),
     deleteSubAgent: vi.fn(),
     testSubAgent: vi.fn(),
-    listSubAgentTestTraces: vi.fn(),
-    getSubAgentTestTrace: vi.fn(),
+    listSubAgentTraces: vi.fn(),
+    getSubAgentTrace: vi.fn(),
   }
   return { apiMock: mock }
 })
@@ -616,8 +616,8 @@ beforeEach(() => {
       trace_id: 7,
     }),
   )
-  apiMock.listSubAgentTestTraces.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 10 })
-  apiMock.getSubAgentTestTrace.mockResolvedValue(null)
+  apiMock.listSubAgentTraces.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 10 })
+  apiMock.getSubAgentTrace.mockResolvedValue(null)
   // 工具目录默认返回 2 builtin + 2 mcp（覆盖 el-option-group 分组渲染路径）。
   // mcp 条目 name 与真实后端 build_tool_catalog 一致：已是 `${server}__${tool}`
   // 命名空间名（非裸名）——历史上 mock 写成裸名，掩盖了表单双重拼接 bug。

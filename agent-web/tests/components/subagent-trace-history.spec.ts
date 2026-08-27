@@ -2,7 +2,7 @@
 /**
  * SubAgentTraceHistoryDialog 视图测试（测试历史弹窗）：
  * - stub Element Plus 组件（不做真实渲染）；
- * - mock `@/api/subagents` 的 listSubAgentTestTraces（零网络）；
+ * - mock `@/api/subagents` 的 listSubAgentTraces（零网络）；
  * - 覆盖：打开拉第 1 页、翻页带 page 参数、详情上抛、失败收敛为空数据。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -15,7 +15,7 @@ import type { SubAgentTraceSummary } from '@/api/subagents'
 import type { PageResult } from '@/types'
 
 const { apiMock } = vi.hoisted(() => ({
-  apiMock: { listSubAgentTestTraces: vi.fn() },
+  apiMock: { listSubAgentTraces: vi.fn() },
 }))
 vi.mock('@/api/subagents', () => apiMock)
 
@@ -164,7 +164,7 @@ function pageResult(items: SubAgentTraceSummary[], page = 1, total = items.lengt
 
 beforeEach(() => {
   vi.clearAllMocks()
-  apiMock.listSubAgentTestTraces.mockResolvedValue(pageResult(TRACE_ROWS.map((row) => ({ ...row }))))
+  apiMock.listSubAgentTraces.mockResolvedValue(pageResult(TRACE_ROWS.map((row) => ({ ...row }))))
 })
 
 describe('SubAgentTraceHistoryDialog 测试历史弹窗', () => {
@@ -172,7 +172,7 @@ describe('SubAgentTraceHistoryDialog 测试历史弹窗', () => {
     const wrapper = mountDialog()
     await flushPromises()
 
-    expect(apiMock.listSubAgentTestTraces).toHaveBeenCalledWith('isis-config-debug', {
+    expect(apiMock.listSubAgentTraces).toHaveBeenCalledWith('isis-config-debug', {
       page: 1,
       pageSize: 10,
     })
@@ -191,11 +191,11 @@ describe('SubAgentTraceHistoryDialog 测试历史弹窗', () => {
     mountDialog(false)
     await flushPromises()
 
-    expect(apiMock.listSubAgentTestTraces).not.toHaveBeenCalled()
+    expect(apiMock.listSubAgentTraces).not.toHaveBeenCalled()
   })
 
-  it('翻页以目标 page 调 listSubAgentTestTraces', async () => {
-    apiMock.listSubAgentTestTraces
+  it('翻页以目标 page 调 listSubAgentTraces', async () => {
+    apiMock.listSubAgentTraces
       .mockResolvedValueOnce(pageResult(TRACE_ROWS.map((row) => ({ ...row })), 1, 12))
       .mockResolvedValueOnce(pageResult(TRACE_ROWS.map((row) => ({ ...row })), 2, 12))
     const wrapper = mountDialog()
@@ -204,7 +204,7 @@ describe('SubAgentTraceHistoryDialog 测试历史弹窗', () => {
     await wrapper.find('.el-pagination-stub').trigger('click')
     await flushPromises()
 
-    expect(apiMock.listSubAgentTestTraces).toHaveBeenLastCalledWith('isis-config-debug', {
+    expect(apiMock.listSubAgentTraces).toHaveBeenLastCalledWith('isis-config-debug', {
       page: 2,
       pageSize: 10,
     })
@@ -224,7 +224,7 @@ describe('SubAgentTraceHistoryDialog 测试历史弹窗', () => {
   })
 
   it('请求失败收敛为空数据且不重复 toast（无 ElMessage 依赖）', async () => {
-    apiMock.listSubAgentTestTraces.mockRejectedValue(new Error('500'))
+    apiMock.listSubAgentTraces.mockRejectedValue(new Error('500'))
     const wrapper = mountDialog()
     await flushPromises()
 

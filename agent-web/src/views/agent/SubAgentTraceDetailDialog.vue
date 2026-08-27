@@ -2,7 +2,7 @@
 /**
  * SubAgentTraceDetailDialog 子代理测试追踪详情弹窗：
  * - 由 SubAgentList 统一持有（历史弹窗「详情」或测试弹窗「查看执行详情」触发）；
- * - 数据来源：GET /subagents/{name}/test-traces/{traceId}（摘要 + 完整事件流）；
+ * - 数据来源：GET /subagents/{name}/traces/{traceId}（摘要 + 完整事件流）；
  * - 布局：左栏事件流（按 seq 顺序，类型徽标 + 折叠展开），右栏运行概览
  *   （状态 / 轮次 / 耗时 / 模型 / 总 token / prompt / final_message / error）；
  * - 事件字段契约见后端 `app/services/agents/run_tracer.py`；
@@ -11,7 +11,7 @@
 import { computed, ref, watch } from 'vue'
 
 import {
-  getSubAgentTestTrace,
+  getSubAgentTrace,
   type TraceEvent,
 } from '@/api/subagents'
 import { useRequest } from '@/composables/useRequest'
@@ -34,7 +34,7 @@ const emit = defineEmits<{
 /*  数据加载                                                                   */
 /* -------------------------------------------------------------------------- */
 
-const { data: detail, loading, execute } = useRequest(getSubAgentTestTrace)
+const { data: detail, loading, execute } = useRequest(getSubAgentTrace)
 
 async function loadDetail(): Promise<void> {
   if (props.traceId === null) {

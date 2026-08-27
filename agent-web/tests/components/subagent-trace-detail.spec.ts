@@ -2,7 +2,7 @@
 /**
  * SubAgentTraceDetailDialog 视图测试（追踪详情弹窗）：
  * - stub Element Plus 组件（不做真实渲染）；
- * - mock `@/api/subagents` 的 getSubAgentTestTrace（零网络）；
+ * - mock `@/api/subagents` 的 getSubAgentTrace（零网络）；
  * - fixture 事件结构与基线真实 trace（isis-config-debug）及后端
  *   run_tracer 契约对齐：llm_call / tool_call / run_finished；
  * - 覆盖：事件流顺序与类型徽标、折叠展开、总 token 求和、
@@ -17,7 +17,7 @@ import SubAgentTraceDetailDialog from '@/views/agent/SubAgentTraceDetailDialog.v
 import type { SubAgentTraceDetail } from '@/api/subagents'
 
 const { apiMock } = vi.hoisted(() => ({
-  apiMock: { getSubAgentTestTrace: vi.fn() },
+  apiMock: { getSubAgentTrace: vi.fn() },
 }))
 vi.mock('@/api/subagents', () => apiMock)
 
@@ -141,7 +141,7 @@ function mountDetail(traceId: number | null = 1, visible = true): VueWrapper {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  apiMock.getSubAgentTestTrace.mockResolvedValue({ ...DETAIL, events: DETAIL.events.map((e) => ({ ...e })) })
+  apiMock.getSubAgentTrace.mockResolvedValue({ ...DETAIL, events: DETAIL.events.map((e) => ({ ...e })) })
 })
 
 describe('SubAgentTraceDetailDialog 追踪详情弹窗', () => {
@@ -149,17 +149,17 @@ describe('SubAgentTraceDetailDialog 追踪详情弹窗', () => {
     mountDetail()
     await flushPromises()
 
-    expect(apiMock.getSubAgentTestTrace).toHaveBeenCalledWith('isis-config-debug', 1)
+    expect(apiMock.getSubAgentTrace).toHaveBeenCalledWith('isis-config-debug', 1)
   })
 
   it('traceId 为 null 或弹窗关闭时不发请求', async () => {
     mountDetail(null)
     await flushPromises()
-    expect(apiMock.getSubAgentTestTrace).not.toHaveBeenCalled()
+    expect(apiMock.getSubAgentTrace).not.toHaveBeenCalled()
 
     mountDetail(1, false)
     await flushPromises()
-    expect(apiMock.getSubAgentTestTrace).not.toHaveBeenCalled()
+    expect(apiMock.getSubAgentTrace).not.toHaveBeenCalled()
   })
 
   it('事件流按 seq 升序渲染且徽标类型正确（LLM / 工具 / 结束）', async () => {
@@ -213,7 +213,7 @@ describe('SubAgentTraceDetailDialog 追踪详情弹窗', () => {
   })
 
   it('error 路径：状态标签 danger + 事件错误文案红色展示', async () => {
-    apiMock.getSubAgentTestTrace.mockResolvedValue({
+    apiMock.getSubAgentTrace.mockResolvedValue({
       ...DETAIL,
       status: 'error',
       error: 'RuntimeError: boom',
@@ -237,7 +237,7 @@ describe('SubAgentTraceDetailDialog 追踪详情弹窗', () => {
   })
 
   it('请求失败收敛：不展示事件流且不抛异常', async () => {
-    apiMock.getSubAgentTestTrace.mockRejectedValue(new Error('404'))
+    apiMock.getSubAgentTrace.mockRejectedValue(new Error('404'))
     const wrapper = mountDetail()
     await flushPromises()
 

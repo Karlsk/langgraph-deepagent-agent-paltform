@@ -6,8 +6,8 @@
  * - CRUD：`POST/GET/PATCH/DELETE /subagents[/<name>]`
  * - 分页：`GET /subagents/page`
  * - 单轮测试：`POST /subagents/<name>/test`（消耗 LLM token）
- * - 测试追踪：`GET /subagents/<name>/test-traces[/<trace_id>]`（历史摘要分页 /
- *   单条含完整事件流）
+ * - 运行追踪：`GET /subagents/<name>/traces[/<trace_id>]`（历史摘要分页 /
+ *   单条含完整事件流；测试运行与 chat 内嵌调用同源）
  *
  * 约定：
  * - 响应信封 {code, message, data} 已由 request.ts 拦截器解包，本模块函数
@@ -91,7 +91,7 @@ export interface SubAgentTestResult {
   duration_seconds: number
   model: string
   /**
-   * 持久化执行追踪的 id（可经 `getSubAgentTestTrace` 查询完整事件流）；
+   * 持久化执行追踪的 id（可经 `getSubAgentTrace` 查询完整事件流）；
    * 仅当后端落盘失败时为 null。
    */
   trace_id: number | null
@@ -117,7 +117,7 @@ export interface TraceEvent {
   [key: string]: unknown
 }
 
-/** 测试运行追踪摘要行（对应后端 SubAgentTraceSummary，不含事件流） */
+/** 运行追踪摘要行（对应后端 SubAgentTraceSummary，不含事件流） */
 export interface SubAgentTraceSummary {
   id: number
   status: string
@@ -131,7 +131,7 @@ export interface SubAgentTraceSummary {
   created_at: string
 }
 
-/** 测试运行追踪详情（对应后端 SubAgentTraceDetail = 摘要 + 完整事件流） */
+/** 运行追踪详情（对应后端 SubAgentTraceDetail = 摘要 + 完整事件流） */
 export interface SubAgentTraceDetail extends SubAgentTraceSummary {
   events: TraceEvent[]
 }
@@ -209,33 +209,33 @@ export function testSubAgent(
 }
 
 // ---------------------------------------------------------------------------
-// 测试运行追踪（只读查询，不消耗 token）
+// 运行追踪（只读查询，不消耗 token）
 // ---------------------------------------------------------------------------
 
 /**
- * 测试追踪分页摘要：GET /subagents/{name}/test-traces。
+ * 运行追踪分页摘要：GET /subagents/{name}/traces。
  *
- * 返回该 SubAgent 的历史测试运行摘要（不含事件流），最新在前。
+ * 返回该 SubAgent 的历史运行摘要（不含事件流），最新在前。
  * 后端仅支持 page / pageSize（keyword 不透传，传了也会被忽略）。
  * 404 当 subagent 不存在。
  */
-export function listSubAgentTestTraces(
+export function listSubAgentTraces(
   name: string,
   query: { page?: number; pageSize?: number } = {},
 ): Promise<PageResult<SubAgentTraceSummary>> {
   return get<PageResult<SubAgentTraceSummary>>(
-    `/subagents/${encodeURIComponent(name)}/test-traces`,
+    `/subagents/${encodeURIComponent(name)}/traces`,
     { params: { page: query.page, pageSize: query.pageSize } },
   )
 }
 
 /**
- * 单条测试追踪详情（含完整事件流）：GET /subagents/{name}/test-traces/{traceId}。
+ * 单条运行追踪详情（含完整事件流）：GET /subagents/{name}/traces/{traceId}。
  *
  * 404 当 subagent / trace 不存在，或 trace 不属于该 subagent。
  */
-export function getSubAgentTestTrace(name: string, traceId: number): Promise<SubAgentTraceDetail> {
+export function getSubAgentTrace(name: string, traceId: number): Promise<SubAgentTraceDetail> {
   return get<SubAgentTraceDetail>(
-    `/subagents/${encodeURIComponent(name)}/test-traces/${traceId}`,
+    `/subagents/${encodeURIComponent(name)}/traces/${traceId}`,
   )
 }

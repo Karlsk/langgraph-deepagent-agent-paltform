@@ -2,7 +2,7 @@
 /**
  * SubAgentTraceHistoryDialog 子代理测试历史弹窗：
  * - 父组件 SubAgentList 在用户点击「历史」按钮时设置 agentName 并打开本弹窗；
- * - 数据来源：GET /subagents/{name}/test-traces（分页摘要，不含事件流）；
+ * - 数据来源：GET /subagents/{name}/traces（分页摘要，不含事件流）；
  * - 行内「详情」按钮上抛 `open-detail`（携带 trace id），由父级打开详情弹窗，
  *   避免三层弹窗嵌套状态耦合；
  * - 请求失败由 request.ts 全局拦截器提示，本组件收敛为空数据，不重复 toast。
@@ -10,7 +10,7 @@
 import { ref, watch } from 'vue'
 
 import {
-  listSubAgentTestTraces,
+  listSubAgentTraces,
   type SubAgentTraceSummary,
 } from '@/api/subagents'
 import { useRequest } from '@/composables/useRequest'
@@ -39,7 +39,7 @@ const page = ref(1)
 const total = ref(0)
 const rows = ref<SubAgentTraceSummary[]>([])
 
-const { loading, execute } = useRequest(listSubAgentTestTraces)
+const { loading, execute } = useRequest(listSubAgentTraces)
 
 async function loadPage(nextPage: number): Promise<void> {
   const result = await execute(props.agentName, { page: nextPage, pageSize: PAGE_SIZE })
