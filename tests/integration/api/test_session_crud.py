@@ -183,3 +183,33 @@ def test_message_count_reflects_langgraph_state(
     detail = client.get(f"{API}/sessions/{session_id}", headers=user_headers)
     assert detail.status_code == 200, detail.text
     assert detail.json()["data"]["message_count"] == 4
+
+
+def test_delete_agent_app_cascades_sessions_and_checkpoints(
+    client: Any,
+    user_headers: dict[str, str],
+    db_engine: Any,
+    user: User,
+    scripted_model: ScriptedChatModel,
+    memory_checkpointer: MemorySaver,
+) -> None:
+    """Hard-deleting the app wipes Session rows, checkpoints and the dir (§11.5.2)."""
+    from app.services.agents import skills_store
+
+    app_id = _seed_published_app(db_engine, name="doom-app")
+    session_id = _create_session(client, user_headers, app_id)
+    scripted_model.responses = [AIMessage(content="before-doom")]
+
+    rt = _get_runtime(db_engine, app_id, user)
+    asyncio.run(_invoke_and_drain(rt, session_id=session_id, user_id=user.id, text="last message"))
+    config = {"configurable": {"thread_id": session_id}}
+    assert asyncio.run(memory_checkpointer.aget_tuple(config)) is not None
+    agent_dir = skills_store._agent_dir(app_id)  # noqa: SLF001 — integration assert
+    assert agent_dir.exists()
+
+    resp = client.delete(f"{API}/apps/{app_id}", headers=user_headers)
+    assert resp.status_code == 200, resp.text
+
+    assert asyncio.run(memory_checkpointer.aget_tuple(config)) is None
+    assert client.get(f"{API}/sessions/{session_id}", headers=user_headers).status_code == 404
+    assert not agent_dir.exists()  # rmtree cascaded the L2 JSONL with it

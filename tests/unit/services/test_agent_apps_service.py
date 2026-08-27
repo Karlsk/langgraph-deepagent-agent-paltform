@@ -298,6 +298,60 @@ def test_delete_cascades_user_layer(
     assert not skills_store._agent_dir(app_row.id).exists()
 
 
+def test_delete_agent_app_cascades_sessions_and_checkpoints(
+    db: DBSession, data_root: Path, owner: User, member: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hard delete clears session checkpoints before the rows vanish (§11.5.2)."""
+    from app.models.session import Session as SessionRow
+    from app.services.agents import runtime as runtime_module
+
+    app_row = _seed_app(db, name="cascade-app", skill_names=[], status="published")
+    for sid in ("t1", "t2"):
+        db.add(SessionRow(id=sid, user_id=member.id, agent_app_id=app_row.id))
+    db.commit()
+    calls: list[str] = []
+
+    async def fake_checkpoint(session_id: str) -> None:
+        # Order constraint: thread ids are collected before the Session rows
+        # are deleted, so the row must still be visible here.
+        assert db.get(SessionRow, session_id) is not None
+        calls.append(session_id)
+
+    monkeypatch.setattr(runtime_module, "delete_thread_checkpoint", fake_checkpoint)
+
+    asyncio.run(
+        agent_apps_service.delete_agent_app(db, app_id=app_row.id, current_user_id=owner.id)
+    )
+
+    assert sorted(calls) == ["t1", "t2"]
+    assert db.exec(select(SessionRow)).all() == []  # Session rows went in the same delete
+    assert db.get(AgentApp, app_row.id) is None
+
+
+def test_delete_agent_app_checkpoint_failure_not_blocking(
+    db: DBSession, data_root: Path, owner: User, member: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint cleanup failure logs but never blocks the DB delete."""
+    from app.models.session import Session as SessionRow
+    from app.services.agents import runtime as runtime_module
+
+    app_row = _seed_app(db, name="resilient-app", skill_names=[], status="published")
+    db.add(SessionRow(id="stuck", user_id=member.id, agent_app_id=app_row.id))
+    db.commit()
+
+    async def boom(session_id: str) -> None:
+        raise RuntimeError("checkpoint pool down")
+
+    monkeypatch.setattr(runtime_module, "delete_thread_checkpoint", boom)
+
+    asyncio.run(
+        agent_apps_service.delete_agent_app(db, app_id=app_row.id, current_user_id=owner.id)
+    )  # must not raise
+
+    assert db.get(AgentApp, app_row.id) is None
+    assert db.exec(select(SessionRow)).all() == []
+
+
 # ---------------------------------------------------------------------------
 # lazy workspace check (spec §4.3 v3.3)
 # ---------------------------------------------------------------------------

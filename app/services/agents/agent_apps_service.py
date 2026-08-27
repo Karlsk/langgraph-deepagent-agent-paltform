@@ -26,6 +26,7 @@ from app.models.agent_assets import (
     SubAgentConfig,
     UserAgentAppAssociation,
 )
+from app.models.session import Session as ChatSession
 from app.models.user import User
 from app.schemas.agent_apps import AgentAppUpdate
 from app.services import db_service
@@ -315,12 +316,14 @@ async def patch_agent_app(
 async def delete_agent_app(
     session: Session, *, app_id: int, current_user_id: int
 ) -> None:
-    """Delete an AgentApp: DB row + associations + whole workspace dir (§3.4).
+    """Delete an AgentApp: checkpoints, DB rows + workspace dir (§3.4/§11.5.2).
 
-    The association rows are deleted explicitly (the FK CASCADE is the
-    production safety net; explicit deletes keep the behaviour identical on
-    SQLite, where foreign-key enforcement is off by default). Removing the
-    agent dir cascades the nested User layers with it.
+    G3 order-sensitive cascade: the session thread ids must be collected
+    BEFORE the Session rows are deleted (the weak agent_app_id link has no
+    FK — once the rows are gone the checkpoints are unreachable); each
+    checkpoint is then cleared best-effort (logged, never blocking), and
+    finally the association + Session + app rows go in one commit followed
+    by the workspace rmtree (which cascades the L2 JSONL files).
 
     Raises:
         AgentAppNotFoundError: The app does not exist.
@@ -337,20 +340,48 @@ async def delete_agent_app(
             "the system default agent app is protected and cannot be deleted"
         )
 
+    # (1) Collect thread ids first — after the row delete they are gone.
+    thread_ids = [
+        row.id
+        for row in session.exec(
+            select(ChatSession).where(ChatSession.agent_app_id == app_id)
+        ).all()
+    ]
+
+    # (2) Best-effort checkpoint cleanup (admin op, low frequency; failures
+    # are logged and never block the DB delete, §11.5.2).
+    for tid in thread_ids:
+        try:
+            await runtime.delete_thread_checkpoint(tid)
+        except Exception:  # noqa: BLE001 — best-effort: log, never block
+            logger.exception(
+                "app_delete_checkpoint_cleanup_failed", thread_id=tid, app_id=app_id
+            )
+
+    # (3) One transaction: associations + Session rows + the app itself.
     for assoc in session.exec(
         select(UserAgentAppAssociation).where(
             UserAgentAppAssociation.agent_app_id == app_id
         )
     ).all():
         session.delete(assoc)
+    for row in session.exec(
+        select(ChatSession).where(ChatSession.agent_app_id == app_id)
+    ).all():
+        session.delete(row)
     session.delete(app_cfg)
     session.commit()
 
+    # (4) Workspace rmtree cascades the nested User layers + L2 JSONL.
     agent_dir = skills_store._agent_dir(app_id)
     if agent_dir.exists():
         await asyncio.to_thread(shutil.rmtree, agent_dir)
 
-    logger.info("agent_app_deleted", app_id=app_id)
+    logger.info(
+        "agent_app_deleted",
+        app_id=app_id,
+        session_threads_cleaned=len(thread_ids),
+    )
 
 
 async def ensure_user_workspace_up_to_date(
