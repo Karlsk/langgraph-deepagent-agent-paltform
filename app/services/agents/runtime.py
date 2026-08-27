@@ -35,6 +35,8 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Optional, cast, override
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -64,13 +66,41 @@ from app.models.agent_assets import (
 )
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.schemas import Message
-from app.services.agents import assembly
+from app.services.agents import assembly, context_store
 from app.services.agents.mcp_manager import load_mcp_servers
 from app.services.llm.llm_store import compute_model_config_hash, parse_model_ref
 from app.services.memory import memory_service
 from app.utils import dump_messages, extract_text_content
 
 _INTERRUPT_FALLBACK_TEXT = "Waiting for input."
+
+
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO8601 ``...Z`` string (L2 row ``ts`` field)."""
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _coerce_numeric_user_id(user_id: Optional[str]) -> Optional[int]:
+    """Return the user id as an int when it is a numeric string, else None."""
+    if user_id is None:
+        return None
+    try:
+        return int(user_id)
+    except ValueError:
+        return None
+
+
+async def _append_context_rows(path: Path, user_content: str, assistant_content: str) -> None:
+    """Append one turn (user + assistant rows) to the L2 JSONL file."""
+    seq = await context_store.next_seq(path)
+    ts = _utc_now_iso()
+    rows: list[dict[str, Any]] = []
+    if user_content:
+        rows.append({"seq": seq, "ts": ts, "type": "message", "role": "user", "content": user_content})
+    if assistant_content:
+        rows.append({"seq": seq + 1, "ts": ts, "type": "message", "role": "assistant", "content": assistant_content})
+    if rows:
+        await context_store.append_rows(path, rows)
 
 # Strong references to fire-and-forget memory write-back tasks (prevents GC
 # before completion); done callbacks remove entries and log failures.
@@ -126,6 +156,10 @@ class AgentAppRuntime(ABC):
     method applies the shared cross-cutting semantics described in the module
     docstring.
     """
+
+    # Owning AgentApp id for L2 context records; None on abstract/fake
+    # runtimes disables the hook (set by concrete __init__ implementations).
+    app_id: Optional[int] = None
 
     def _build_config(self, session_id: str, user_id: Optional[str], username: Optional[str]) -> RunnableConfig:
         """Build the RunnableConfig used for every graph operation."""
@@ -245,6 +279,67 @@ class AgentAppRuntime(ABC):
 
         task.add_done_callback(_on_done)
 
+    def _fire_context_record(
+        self,
+        messages: Sequence[Message],
+        response_messages: Sequence[BaseMessage],
+        *,
+        session_id: str,
+        user_id: Optional[str],
+    ) -> None:
+        """Fire-and-forget L2 context record write (G3 §4.1.2, success paths).
+
+        Records the turn's user input (from the invoke arguments) and the
+        assistant's final reply (last AIMessage of the response state) into
+        the session JSONL file. Like ``_fire_memory_add`` the task is anchored
+        in ``_pending_tasks`` and its failure is logged, never raised — a
+        broken L2 write must not block the response. Runtimes without an
+        ``app_id`` or with a non-numeric ``user_id`` cannot address the L2
+        path and skip the write.
+        """
+        app_id = self.app_id
+        numeric_user_id = _coerce_numeric_user_id(user_id)
+        if app_id is None or numeric_user_id is None:
+            logger.debug(
+                "context_record_skipped_no_address",
+                session_id=session_id,
+                app_id=app_id,
+                user_id=user_id,
+            )
+            return
+
+        user_message = next(
+            (message for message in reversed(list(messages)) if message.role == "user"), None
+        )
+        assistant_text = next(
+            (
+                extract_text_content(message.content)
+                for message in reversed(list(response_messages))
+                if isinstance(message, AIMessage)
+            ),
+            "",
+        )
+        user_content = str(user_message.content) if user_message is not None else ""
+        path = context_store.session_file_path(app_id, numeric_user_id, session_id)
+        task = asyncio.create_task(_append_context_rows(path, user_content, str(assistant_text)))
+        _pending_tasks.add(task)
+
+        def _on_record_done(done: asyncio.Task[Any]) -> None:
+            _pending_tasks.discard(done)
+            if done.cancelled():
+                return
+            exception = done.exception()
+            if exception is not None:
+                logger.error(
+                    "context_record_failed",
+                    session_id=session_id,
+                    app_id=app_id,
+                    error=str(exception),
+                    error_type=type(exception).__name__,
+                )
+
+        task.add_done_callback(_on_record_done)
+
     def _process_messages(self, messages: Sequence[BaseMessage]) -> list[Message]:
         """Project raw messages to user/assistant chat Messages."""
         openai_style_messages = convert_to_openai_messages(list(messages))
@@ -290,6 +385,9 @@ class AgentAppRuntime(ABC):
 
             response_messages = cast(list[BaseMessage], response["messages"])
             self._fire_memory_add(response_messages, user_id, config)
+            self._fire_context_record(
+                messages, response_messages, session_id=session_id, user_id=user_id
+            )
             return self._process_messages(response_messages)
         except GraphInterrupt:
             state = await self._get_state(config)
@@ -340,7 +438,11 @@ class AgentAppRuntime(ABC):
 
                 state = await self._get_state(config)
                 if state.values and "messages" in state.values:
-                    self._fire_memory_add(cast(list[BaseMessage], state.values["messages"]), user_id, config)
+                    final_messages = cast(list[BaseMessage], state.values["messages"])
+                    self._fire_memory_add(final_messages, user_id, config)
+                    self._fire_context_record(
+                        messages, final_messages, session_id=session_id, user_id=user_id
+                    )
             except GraphInterrupt:
                 llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
                 state = await self._get_state(config)
@@ -405,6 +507,7 @@ class DeepAgentsAppRuntime(AgentAppRuntime):
         self._graph = graph
         self._checkpointer = checkpointer
         self.resolved_model_name = resolved_model_name
+        self.app_id = app_cfg.id
 
     @override
     def _build_resume_value(self, messages: list[Message], interrupt_value: Any) -> Any:
@@ -512,6 +615,7 @@ class WorkflowAppRuntime(AgentAppRuntime):
         """
         self.app_cfg = app_cfg
         self.resolved_model_name = resolved_model_name
+        self.app_id = app_cfg.id
 
     @override
     async def _get_state(self, config: RunnableConfig) -> StateSnapshot:
@@ -743,6 +847,22 @@ async def _build_checkpointer() -> BaseCheckpointSaver | None:
                 await checkpointer.setup()
                 _checkpointer_setup_done = True
     return checkpointer
+
+
+async def delete_thread_checkpoint(session_id: str) -> None:
+    """Delete every checkpoint of one thread WITHOUT requiring an AgentApp.
+
+    G3 §11.5.1: unlike ``clear_chat_history`` (an instance method bound to a
+    loaded app config), this module-level helper only depends on the shared
+    connection pool, so it stays callable after the app was deleted or
+    unpublished. A unavailable pool (``None``) skips the cleanup with a
+    warning instead of blocking the cascade.
+    """
+    checkpointer = await _build_checkpointer()
+    if checkpointer is None:
+        logger.warning("session_cascade_checkpoint_skipped_no_pool", session_id=session_id)
+        return
+    await checkpointer.adelete_thread(session_id)
 
 
 async def get_runtime(session: Session, app_id: int, *, user_id: int) -> AgentAppRuntime:
