@@ -66,6 +66,13 @@ agent_test_runs_total = Counter(
     ["status"],  # "success" | "error"
 )
 
+# G3 session-layer metrics (spec-g3-session §4.2)
+context_compression_total = Counter(
+    "context_compression_total",
+    "Total context-window compression events (SummarizationMiddleware)",
+    ["app_id", "status"],  # status: "occurred"
+)
+
 skill_sync_total = Counter(
     "skill_sync_total",
     "Total skill synchronization operations",

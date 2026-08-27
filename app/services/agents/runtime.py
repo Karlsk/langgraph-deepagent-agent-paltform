@@ -33,7 +33,7 @@ import asyncio
 import json
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,7 +57,11 @@ from sqlmodel import Session, col, select
 from app.core.config import settings
 from app.core.langgraph.pool import get_shared_connection_pool
 from app.core.logging import logger
-from app.core.metrics import llm_inference_duration_seconds, subagent_task_duration_seconds
+from app.core.metrics import (
+    context_compression_total,
+    llm_inference_duration_seconds,
+    subagent_task_duration_seconds,
+)
 from app.core.observability import langfuse_callback_handler
 from app.models.agent_assets import (
     AgentApp,
@@ -160,6 +164,12 @@ class AgentAppRuntime(ABC):
     # Owning AgentApp id for L2 context records; None on abstract/fake
     # runtimes disables the hook (set by concrete __init__ implementations).
     app_id: Optional[int] = None
+
+    # Per-session fingerprints of already-reported summarization events
+    # (initialised by concrete __init__ implementations); the private
+    # ``_summarization_event`` state key persists in the checkpoint, so
+    # without dedup every post-compression turn would recount.
+    _compression_seen: dict[str, tuple]
 
     def _build_config(self, session_id: str, user_id: Optional[str], username: Optional[str]) -> RunnableConfig:
         """Build the RunnableConfig used for every graph operation."""
@@ -340,6 +350,37 @@ class AgentAppRuntime(ABC):
 
         task.add_done_callback(_on_record_done)
 
+    def _observe_compression(self, state_values: Optional[Mapping[str, Any]], *, session_id: str) -> None:
+        """Log + count a NEW summarization event in the final state (G3 §4.2).
+
+        ``SummarizationMiddleware`` records its latest event under the private
+        ``_summarization_event`` state key where it persists across turns; a
+        per-session fingerprint registry ensures each distinct event is
+        reported exactly once per runtime instance.
+        """
+        if not isinstance(state_values, Mapping):
+            return
+        event = state_values.get("_summarization_event")
+        if not isinstance(event, dict):
+            return
+        summary_message = event.get("summary_message")
+        fingerprint = (
+            event.get("cutoff_index"),
+            str(getattr(summary_message, "content", summary_message))[:128],
+            event.get("file_path"),
+        )
+        if self._compression_seen.get(session_id) == fingerprint:
+            return
+        self._compression_seen[session_id] = fingerprint
+        logger.info(
+            "context_compression_occurred",
+            session_id=session_id,
+            app_id=self.app_id,
+            cutoff_index=event.get("cutoff_index"),
+            file_path=event.get("file_path"),
+        )
+        context_compression_total.labels(app_id=str(self.app_id), status="occurred").inc()
+
     def _process_messages(self, messages: Sequence[BaseMessage]) -> list[Message]:
         """Project raw messages to user/assistant chat Messages."""
         openai_style_messages = convert_to_openai_messages(list(messages))
@@ -388,6 +429,7 @@ class AgentAppRuntime(ABC):
             self._fire_context_record(
                 messages, response_messages, session_id=session_id, user_id=user_id
             )
+            self._observe_compression(response, session_id=session_id)
             return self._process_messages(response_messages)
         except GraphInterrupt:
             state = await self._get_state(config)
@@ -443,6 +485,7 @@ class AgentAppRuntime(ABC):
                     self._fire_context_record(
                         messages, final_messages, session_id=session_id, user_id=user_id
                     )
+                self._observe_compression(state.values, session_id=session_id)
             except GraphInterrupt:
                 llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
                 state = await self._get_state(config)
@@ -508,6 +551,7 @@ class DeepAgentsAppRuntime(AgentAppRuntime):
         self._checkpointer = checkpointer
         self.resolved_model_name = resolved_model_name
         self.app_id = app_cfg.id
+        self._compression_seen: dict[str, tuple] = {}
 
     @override
     def _build_resume_value(self, messages: list[Message], interrupt_value: Any) -> Any:
@@ -616,6 +660,7 @@ class WorkflowAppRuntime(AgentAppRuntime):
         self.app_cfg = app_cfg
         self.resolved_model_name = resolved_model_name
         self.app_id = app_cfg.id
+        self._compression_seen: dict[str, tuple] = {}
 
     @override
     async def _get_state(self, config: RunnableConfig) -> StateSnapshot:

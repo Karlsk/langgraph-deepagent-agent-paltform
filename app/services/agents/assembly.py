@@ -55,6 +55,7 @@ from typing import Any, Optional, cast, override
 
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import FilesystemBackend
+from deepagents.middleware import SummarizationMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
@@ -65,6 +66,7 @@ from langgraph.types import Checkpointer
 from sqlmodel import Session
 
 from app.core.langgraph.tools import tools as builtin_tools
+from app.core.config import settings
 from app.core.logging import logger
 from app.core.metrics import agent_graph_cache_hits_total, agent_graph_compile_duration_seconds
 from app.models.agent_assets import AgentApp, SubAgentConfig
@@ -494,11 +496,25 @@ async def compile_agent_app(
     backend = FilesystemBackend(root_dir=str(user_root))
     interrupt_on = cast(Optional[dict[str, Any]], app_cfg.interrupt_on or None)
 
+    # G3 (spec-g3-session §4.2): context compression is on by default. The
+    # token trigger prefers the per-app AgentApp.context_size and falls back
+    # to the global settings default; deepagents replaces its base-stack
+    # SummarizationMiddleware in place because the custom instance reports
+    # the same middleware name (no double stack).
+    context_threshold = app_cfg.context_size or settings.DEFAULT_AGENT_CONTEXT_SIZE
+
     graph = create_deep_agent(
         model=model,
         tools=tools,
         system_prompt=app_cfg.system_prompt,
-        middleware=[MemoryMiddleware()],
+        middleware=[
+            SummarizationMiddleware(
+                model=model,
+                backend=backend,
+                trigger=("tokens", context_threshold),
+            ),
+            MemoryMiddleware(),
+        ],
         subagents=subagents or None,
         skills=parent_skills or None,
         backend=backend,
@@ -595,6 +611,7 @@ _APP_FIELDS = (
     "subagent_names",
     "interrupt_on",
     "engine",
+    "context_size",
 )
 _SUBAGENT_FIELDS = (
     "name",
