@@ -95,6 +95,47 @@ Grafana dashboards are pre-configured in `grafana/`. Start the full stack with `
 
 ---
 
+## Session debug export (G3)
+
+Chat sessions are stored in three layers: **L0** metadata rows in PostgreSQL
+(`sessions` table), **L1** LangGraph checkpoints (thread id == session id),
+and **L2** product-level JSONL transcripts under
+`{DATA_ROOT}/agents/<app_id>/users/<user_id>/sessions/<session_id>.jsonl`.
+
+To inspect what a session actually recorded, use the export endpoint (the
+project's first file-download endpoint — it bypasses the ApiResponse envelope
+and streams with `Content-Disposition: attachment`):
+
+```bash
+# JSON: metadata header (session_id / name / agent_app_id / created_at /
+# exported_at / message_count) + the message rows
+curl -OJ -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/v1/sessions/<session_id>/export?format=json"
+
+# JSONL: one message row per line (application/x-ndjson)
+curl -OJ -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/v1/sessions/<session_id>/export?format=jsonl"
+```
+
+Semantics worth knowing when debugging:
+
+- **L2 first, L1 fallback**: if the JSONL file is missing (e.g. the hook was
+  skipped before G3), the export rebuilds rows from the L1 checkpoint and
+  writes the file back (self-heal). If the bound AgentApp was deleted, only
+  the surviving L2 content is returned — the export never 500s on orphans.
+- **Ownership is 404, never 403** (anti-enumeration), same as every other
+  `/sessions` endpoint.
+- Empty transcripts export as a valid empty payload, not a 404.
+
+Related structured log events: `session_created` / `session_renamed` /
+`session_deleted` (the delete event carries `checkpoint_cleaned` and
+`jsonl_cleaned` booleans describing which cascade layers succeeded), plus
+`app_delete_checkpoint_cleanup_failed` for best-effort cleanup failures when
+an AgentApp is hard-deleted. Compression activity is tracked by the
+`context_compression_total` counter (see `app/core/metrics.py`).
+
+---
+
 ## Request profiling (debug only)
 
 When `DEBUG=true`, `ProfilingMiddleware` profiles every request using [pyinstrument](https://github.com/joerick/pyinstrument). When a request exceeds `PROFILING_THRESHOLD_SECONDS`, a JSON report is saved to `PROFILING_DIR`.

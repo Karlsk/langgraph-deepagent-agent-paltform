@@ -1,17 +1,19 @@
 # AgentApp 全功能手动测试指南
 
-本文档指导你从零开始手动验证 AgentApp（Agent 资产管理 + 对话）全链路功能：
-构建启动 → 认证 → Skill → MCP → SubAgent → AgentApp → Chat（已退役） → HIL（已退役，人工介入）。
+本文档指导你从零开始手动验证 AgentApp（Agent 资产管理 + 会话）全链路功能：
+构建启动 → 认证 → Skill → MCP → SubAgent → AgentApp → 会话管理（G3：/sessions CRUD + 导出）
+→ 聊天区（待 G4） → HIL（待 G4，人工介入）。
 
-> **G1/G2 时效性标注**：Phase 1 G1 单层认证改造后，`POST /auth/session` 与 `/chatbot/*`
-> 已退役（调用返回 404），对话运行时待 G3 阶段在新认证面上重建——第 7/8 节已改为退役说明；
+> **时效性标注**：Phase 1 G1 单层认证改造后，`POST /auth/session` 与 `/chatbot/*`
+> 已退役（调用返回 404）。G3 已重建会话元数据层（`/sessions` 6 端点 + 三层存储，
+> 见第 7 节）；对话运行时（消息流 / 流式 / HIL）待 G4 重建——第 8 节仍为待重建说明；
 > 资产端点直接使用**用户 token**，全文不再有「会话 token」。
 
 > **核实基线**：本文所有端点、环境变量与命令均对照以下源码核实过：
 > `app/api/v1/api.py`（路由注册）、`app/api/v1/auth.py`、`app/api/v1/agent_assets_common.py`、
 > `app/api/v1/subagents.py`、`app/api/v1/skills.py`、`app/api/v1/apps.py`、`app/api/v1/mcp_servers.py`、
-> `app/api/v1/providers.py`、`app/api/v1/chatbot.py`、`app/schemas/agent_apps.py`、`app/schemas/auth.py`、
-> `app/schemas/chat.py`、`app/core/config.py`、`Makefile`、`Dockerfile`、`docker-compose.yml`、
+> `app/api/v1/providers.py`、`app/api/v1/sessions.py`、`app/schemas/agent_apps.py`、`app/schemas/auth.py`、
+> `app/schemas/session.py`、`app/core/config.py`、`Makefile`、`Dockerfile`、`docker-compose.yml`、
 > `scripts/docker-entrypoint.sh`。
 > 若代码变更，请以源码为准。
 
@@ -71,12 +73,11 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 | `DATA_ROOT` | 建议 | ./data | 三级 Workspace 根目录（`global/` + `agents/`，容器内相对 `/app` 解析为 `/app/data`）；`SKILLS_ROOT` 已废弃（G2），仅单独设置时回退为其父目录 |
 | `MCP_STDIO_ALLOWED_COMMANDS` | 可选 | `python,node,uvx,npx` | stdio 型 MCP server 命令白名单（逗号分隔） |
 | `LANGFUSE_TRACING_ENABLED` | 可选 | true | 无 Langfuse 账号时建议设 `false` 避免初始化噪音 |
-| `SESSION_NAMING_ENABLED` | 可选 | true | 会话自动命名（额外 LLM 调用） |
 | `RATE_LIMIT_*` | 可选 | 见下 | 各端点限流；手动测试建议放宽 |
 | `VALKEY_HOST` | 可选 | 空 | 置空即禁用缓存（compose 仍会启动 valkey 容器但不被使用） |
 
 内置限流默认值（`config.py`）：`chat=30/min`、`chat_stream=20/min`、`messages=50/min`、
-`register=10/hour`、`login=20/min`、`subagent/skill/agent_app/mcp_server/provider/model_config/tools_catalog=60/min`、
+`register=10/hour`、`login=20/min`、`subagent/skill/agent_app/sessions/mcp_server/provider/model_config/tools_catalog=60/min`、
 `subagent_test=5/min`、`skill_generate=5/min`。均可用同名大写环境变量覆盖，如
 `RATE_LIMIT_CHAT`、`RATE_LIMIT_SUBAGENT_TEST` 等。
 
@@ -91,11 +92,10 @@ API_V1_STR=/api/v1
 
 # ★ LLM（必填真实值）
 # 以下变量在 Agent 链路中仅作启动时 default provider/model 对的一次性种子（入库后以 /providers API 管理，见 0.5 节）；
-# 系统级 LLM 调用（会话命名、skill 草稿等）仍直接读取这些变量。
+# 系统级 LLM 调用（skill 草稿等）仍直接读取这些变量。
 OPENAI_API_KEY=<your-llm-api-key>
 DEFAULT_LLM_MODEL=gpt-5-mini
 DEFAULT_LLM_TEMPERATURE=0.2
-SESSION_NAMING_ENABLED=true
 # 无法直连 OpenAI 官方端点时，改用 OpenAI 兼容代理（用法与限制见 0.5 节）：
 # OPENAI_BASE_URL=https://your-proxy.example.com/v1
 # OPENAI_API_BASE=https://your-proxy.example.com/v1
@@ -198,7 +198,7 @@ curl -s -X PATCH "$BASE/providers/default/models/default" \
 （`DELETE /providers/default` 与 `DELETE /providers/default/models/default` 恒返回 422，
 见 5.5 节负向用例），不能走「删除 + 重启重建」路径；正确做法是直接 PATCH 覆盖（同上方方式一）。
 
-#### b. 系统级链路：env 回退（会话命名 / skill 草稿等）
+#### b. 系统级链路：env 回退（skill 草稿等）
 
 系统级调用在 `.env.development` 配置两行同值变量后重启生效：
 
@@ -1153,28 +1153,77 @@ ls "$DATA_ROOT/agents/$APP_ID/skills/csv-report/SKILL.md"
 
 ---
 
-## 7. Chat 全链路（已退役，待 G3 重建）
+## 7. 会话管理（G3：/sessions CRUD + 导出；聊天区待 G4）
 
-> **退役说明（Phase 1 G1）**：`/chatbot/*` 全部端点（`/chat`、`/chat/stream`、`/messages`）
-> 已随 G1 单层认证改造退役：`app/api/v1/chatbot.py` 现为空 router，`app/api/v1/api.py`
-> 不再注册它，任何 `/chatbot/*` 请求返回 **404**。对话运行时将在 G3 阶段基于新认证面
-> 与三级 Workspace（G2）重建，接口预留见 `spec-g3-session.md` §12 与
-> `spec-g2-workspace.md` §12.1（`ensure_user_workspace_up_to_date` / `get_runtime` 契约）。
+> **背景**：`/chatbot/*` 全部端点已随 G1 退役（任何 `/chatbot/*` 请求返回 **404**）。
+> G3 重建了会话元数据层：`/sessions` 全新 RESTful 6 端点（list / get / create /
+> patch / delete / export）+ 三层存储（L0 PG 元数据 / L1 LangGraph checkpoint /
+> L2 JSONL 产品级记录）。**对话运行时（消息流 / 流式 / HIL）仍归 G4**，届时重写对话小节。
 >
-> **当前可验证的替代面**：
-> - 运行时编译链路：`POST /subagents/<name>/test`（§5.3，单轮隔离运行，已含真实 LLM 与工具装配）；
-> - 用户级工作区同步：§6.6 M1-M6（含 lazy 校验与启动期补建）。
->
-> 本节历史内容（创建绑定会话 → 非流式对话 → SSE 流式 → 消息历史 → 默认助理）保留在
-> git 历史中，G3 落地后重写。
+> 前置：按第 2 节登录拿到 `$TOKEN`；按第 3/5 节有一个 **published** 的 AgentApp（下文记 `$APP_ID`）。
+
+### 7.1 会话 CRUD 闭环
+
+```bash
+BASE="http://localhost:8000/api/v1"
+
+# 创建（agent_app_id 必填；后端自动幂等 associate，201 信封）
+curl -s -X POST "$BASE/sessions" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"agent_app_id\": $APP_ID, \"name\": \"手动测试会话\"}"
+# → data.session_id 记为 $SID；未发布的 app 返 422，不存在的 app 返 404
+
+# 列表（资源根直接分页，无 /page 后缀；agent_app_id 可选过滤）
+curl -s "$BASE/sessions?page=1&pageSize=10&agent_app_id=$APP_ID" \
+  -H "Authorization: Bearer $TOKEN"
+# → 列表行 message_count 恒为 null（避免 N+1；仅详情端点填充）
+
+# 详情（含 message_count：L2 行数，缺失时从 checkpoint 现算）
+curl -s "$BASE/sessions/$SID" -H "Authorization: Bearer $TOKEN"
+
+# 重命名（仅 name 可改，1-100 字；后端同步更新 updated_at）
+curl -s -X PATCH "$BASE/sessions/$SID" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name": "新会话名"}'
+
+# 删除（级联三层：L1 checkpoint → L2 JSONL → L0 行；尽力清理不阻断）
+curl -s -X DELETE "$BASE/sessions/$SID" -H "Authorization: Bearer $TOKEN"
+# → 再 GET 返 404；日志可见 session_deleted 携 checkpoint_cleaned / jsonl_cleaned
+```
+
+**越权验证**：注册第二个用户（第 2 节）拿 `$TOKEN_B`，用它访问 `$SID`（GET/PATCH/DELETE/export）——
+全部端点返 **404**（不是 403，防枚举语义）。
+
+### 7.2 导出 session 历史
+
+```bash
+# JSON：元数据头（session_id / name / agent_app_id / created_at / exported_at /
+# message_count）+ messages 行；带 Content-Disposition: attachment
+curl -OJ -s "$BASE/sessions/$SID/export?format=json" \
+  -H "Authorization: Bearer $TOKEN"
+
+# JSONL：一行一条消息（application/x-ndjson）
+curl -OJ -s "$BASE/sessions/$SID/export?format=jsonl" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**预期与验证点**：
+- 导出**不套信封**（项目首个文件下载端点）；`-OJ` 按 Content-Disposition 落盘 `<session_id>.json|.jsonl`。
+- `format=xml` 等非法值返 **422**（Query pattern 校验）。
+- 空会话导出为空载荷（200），不是 404。
+- L2 JSONL 缺失时从 L1 checkpoint 重建并写回自愈：可先手动删除
+  `{DATA_ROOT}/agents/$APP_ID/users/<uid>/sessions/$SID.jsonl` 再导出，
+  导出后该文件应重新出现。
+- 应用已删的孤儿会话：仅返回 L2 现存内容，不报错。
+- 前端入口：对话页（`/chat`）会话列表行内「导出」下拉（JSON / JSONL）触发浏览器下载。
+
 
 ---
 
-## 8. HIL（人工介入，已退役，待 G3 重建）
+## 8. HIL（人工介入，待 G4 重建）
 
-> **退役说明**：HIL 依赖 `/chatbot/chat` 对话端点与已退役的会话机制（见第 7 节），
+> **待重建说明**：HIL 依赖对话端点与会话消息流（旧 `/chatbot/chat` 已退役，见第 7 节背景），
 > 当前无法端到端验证。其机制设计（`interrupt_on` 透传 Human-in-the-loop 中间件、
-> 结构化 `{"decisions": [...]}` 批准、非结构化回复默认 reject 的安全语义）将在 G3 对话
+> 结构化 `{"decisions": [...]}` 批准、非结构化回复默认 reject 的安全语义）将在 G4 对话
 > 运行时重建时恢复，届时重写本节（原脚本保留在 git 历史）。
 
 ---
