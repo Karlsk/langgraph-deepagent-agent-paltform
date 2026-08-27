@@ -3,7 +3,7 @@
  * ChatView 会话列表页测试（G3 spec-g3-session §11.6/§11.8）：
  * - stub Element Plus 组件（不做真实渲染），挂载真实
  *   WebAgentTable + WebAgentFormDialog；
- * - mock `@/api/sessions` 6 函数与 `@/api/assets` 的 listAgentApps（零网络）；
+ * - mock `@/api/sessions` 6 函数与 `@/api/agentapps` 的 listAgentApps（零网络）；
  * - 覆盖：首次分页加载 / agent_app 过滤 / 新建 / 重命名 / 删除确认（级联文案）/
  *   导出下载（json + jsonl，blob → a[download]）/ 越权 404 失败不刷新。
  */
@@ -14,7 +14,7 @@ import type { VueWrapper } from '@vue/test-utils'
 
 import ChatView from '@/views/chat/ChatView.vue'
 import type { SessionRead } from '@/api/sessions'
-import type { AgentAppRow } from '@/api/assets'
+import type { AgentAppRow } from '@/api/agentapps'
 import type { PageResult } from '@/types'
 
 const { elMessageMock, elMessageBoxMock } = vi.hoisted(() => {
@@ -36,7 +36,7 @@ vi.mock('element-plus', () => ({
 
 const confirmMock = elMessageBoxMock.confirm
 
-const { sessionsMock, assetsMock } = vi.hoisted(() => ({
+const { sessionsMock, agentappsMock } = vi.hoisted(() => ({
   sessionsMock: {
     listSessions: vi.fn(),
     getSession: vi.fn(),
@@ -45,13 +45,13 @@ const { sessionsMock, assetsMock } = vi.hoisted(() => ({
     deleteSession: vi.fn(),
     exportSessionHistory: vi.fn(),
   },
-  assetsMock: {
+  agentappsMock: {
     listAgentApps: vi.fn(),
   },
 }))
 
 vi.mock('@/api/sessions', () => sessionsMock)
-vi.mock('@/api/assets', () => assetsMock)
+vi.mock('@/api/agentapps', () => agentappsMock)
 
 const ROWS: SessionRead[] = [
   {
@@ -81,10 +81,13 @@ const APPS: AgentAppRow[] = [
     model: null,
     skill_names: [],
     subagent_names: [],
-    interrupt_on: null,
+    interrupt_on: {},
     engine: 'deepagents',
     status: 'published',
     published_hash: 'abc',
+    agent_dir: null,
+    workspace_hash: null,
+    agent_workspace_status: 'ready',
     version: 1,
     created_by: 'admin',
   },
@@ -96,10 +99,13 @@ const APPS: AgentAppRow[] = [
     model: null,
     skill_names: [],
     subagent_names: [],
-    interrupt_on: null,
+    interrupt_on: {},
     engine: 'deepagents',
     status: 'published',
     published_hash: 'def',
+    agent_dir: null,
+    workspace_hash: null,
+    agent_workspace_status: 'ready',
     version: 1,
     created_by: 'admin',
   },
@@ -111,10 +117,13 @@ const APPS: AgentAppRow[] = [
     model: null,
     skill_names: [],
     subagent_names: [],
-    interrupt_on: null,
+    interrupt_on: {},
     engine: 'deepagents',
     status: 'draft',
     published_hash: null,
+    agent_dir: null,
+    workspace_hash: null,
+    agent_workspace_status: 'pending',
     version: 1,
     created_by: 'admin',
   },
@@ -410,7 +419,7 @@ beforeEach(() => {
   sessionsMock.deleteSession.mockResolvedValue(null)
   sessionsMock.exportSessionHistory.mockResolvedValue(new Blob(['{}']))
 
-  assetsMock.listAgentApps.mockResolvedValue(APPS.map((row) => ({ ...row })))
+  agentappsMock.listAgentApps.mockResolvedValue(APPS.map((row) => ({ ...row })))
 })
 
 afterEach(() => {

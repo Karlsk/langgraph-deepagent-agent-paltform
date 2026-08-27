@@ -5,7 +5,7 @@
  *   WebAgentTable + WebAgentFormDialog + SkillContentDialog；
  * - mock `@/api/assets` 的 10 个函数（listSkills / listSkillsPage / getSkill /
  *   getSkillContent / createSkill / patchSkill / deleteSkill + listSubAgents /
- *   listSubAgentsPage / listAgentApps 三个占位防 import 副作用）；
+ *   listSubAgentsPage 两个占位防 import 副作用）；
  * - 关键字搜索走 300ms 防抖，用 fake timers 推进；422 / 401 等错误由 mock throw，
  *   统一拦截器提示路径在 request.spec.ts 覆盖，本视图只断言 useConfirm 调用、
  *   刷新策略与通知文案。
@@ -113,7 +113,6 @@ const { apiMock } = vi.hoisted(() => {
     // 占位：防止测试时触发真实网络或运行期 import 副作用
     listSubAgents: vi.fn(),
     listSubAgentsPage: vi.fn(),
-    listAgentApps: vi.fn(),
   }
   return { apiMock: mock }
 })
@@ -434,7 +433,6 @@ beforeEach(() => {
     page: 1,
     pageSize: 10,
   } satisfies PageResult<unknown>)
-  apiMock.listAgentApps.mockResolvedValue([])
 })
 
 afterEach(() => {

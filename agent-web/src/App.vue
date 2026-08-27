@@ -10,6 +10,7 @@ import {
   FullScreen,
   MagicStick,
   Moon,
+  Platform,
   Pointer,
   Setting,
   User,
@@ -72,6 +73,10 @@ async function handleLogout(): Promise<void> {
         <el-menu-item index="/chat">
           <el-icon><ChatDotRound /></el-icon>
           <template #title>对话</template>
+        </el-menu-item>
+        <el-menu-item index="/agentapp">
+          <el-icon><Platform /></el-icon>
+          <template #title>AgentApp 总览</template>
         </el-menu-item>
         <el-menu-item index="/agent">
           <el-icon><User /></el-icon>

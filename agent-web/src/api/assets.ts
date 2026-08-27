@@ -1,7 +1,7 @@
 /**
- * Agent 资产 API 模块：对接后端 3 大资产模块（Skills / AgentApps /
- * LLM Configs）。MCP Servers 已迁移至 `@/api/mcp`，SubAgents 已迁移至
- * `@/api/subagents`（两者均含 CRUD + 调试/测试端点，独立承载更清晰）。
+ * Agent 资产 API 模块：对接后端 2 大资产模块（Skills / LLM Configs）。
+ * MCP Servers 已迁移至 `@/api/mcp`，SubAgents 已迁移至 `@/api/subagents`，
+ * AgentApps 已迁移至 `@/api/agentapps`（各自独立承载更清晰）。
  *
  * 约定：
  * - 响应信封 {code, message, data} 已由 request.ts 拦截器解包，本模块函数
@@ -19,23 +19,6 @@ export interface SkillRow {
   name: string
   description: string
   content_hash: string
-  version: number
-  created_by: string | null
-}
-
-/** AgentApp 资产行（对应后端 AgentAppRead） */
-export interface AgentAppRow {
-  id: number
-  name: string
-  system_prompt: string
-  allowed_tools: string[] | null
-  model: string | null
-  skill_names: string[]
-  subagent_names: string[]
-  interrupt_on: Record<string, unknown> | null
-  engine: string
-  status: 'draft' | 'published'
-  published_hash: string | null
   version: number
   created_by: string | null
 }
@@ -214,20 +197,6 @@ export function generateSkill(payload: SkillGeneratePayload): Promise<SkillGener
   return post<SkillGenerateResponse>('/skills/generate', payload, {
     timeout: 300_000,
   })
-}
-
-// ---------------------------------------------------------------------------
-// Agent Apps
-// ---------------------------------------------------------------------------
-
-/** 全量列表：GET /apps */
-export function listAgentApps(): Promise<AgentAppRow[]> {
-  return get<AgentAppRow[]>('/apps')
-}
-
-/** 分页列表：GET /apps/page */
-export function listAgentAppsPage(query: PageQuery = {}): Promise<PageResult<AgentAppRow>> {
-  return get<PageResult<AgentAppRow>>('/apps/page', { params: toParams(query) })
 }
 
 // ---------------------------------------------------------------------------

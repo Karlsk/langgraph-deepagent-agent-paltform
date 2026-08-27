@@ -28,6 +28,7 @@ describe('控制台导航路由', () => {
 
     expect(routes).toEqual([
       { name: 'agent', path: '/agent' },
+      { name: 'agentapp', path: '/agentapp' },
       { name: 'chat', path: '/chat' },
       { name: 'llm', path: '/llm' },
       { name: 'llm-trash', path: '/llm/trash' },

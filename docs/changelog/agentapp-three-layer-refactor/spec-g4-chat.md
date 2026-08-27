@@ -8,13 +8,20 @@
 > **修订记录**：
 > - 2026-08-27 议题 1 落盘：端点拓扑定案——寻址用 X-Session-Id header（G1 §1.1 原案兑现，CRUD 保持 path 参数，管理面/交互面两种视图并存）；端点集合 3+1（POST /chat 非流式信封 + POST /chat/stream SSE + GET /messages 历史 + POST /rebuild 灾难恢复本期落地）；clear 端点砍掉（DELETE 级联已覆盖）；workflow 引擎接入排除（独立 spec 体系）；限流 key 复用 3 个现成 key（chat/chat_stream/messages）+ 新增 rebuild。
 > - 2026-08-27 议题 2 落盘：SSE 事件协议升级 type 多事件（message/interrupt/summary/error/done）+ 15s 心跳；interrupt 投影稳定 schema（tool+args，不透出 deepagents 内部字段）；压缩事件本期推送（实现取轮末 state 检测，避免复合流改造）；非流式端点 interrupt 自动批准（用户决策：循环到完成，上限 10 次可配，流式端点保持人在环审批）。
+> - 2026-08-27 议题 2 澄清：SSE 事件协议增加 tool_call type（6 类 type 帧：message/tool_call/interrupt/summary/error/done）；tool_call 帧载荷为 {name, content, source}，由 runtime _stream 检测 ToolMessage 时触发；StreamChunk 扩展 type 和 name 字段。
 > - 2026-08-27 议题 3 落盘：HIL 交互闭环——审批复用消息通道（decisions JSON 塞 content，零新端点，与 runtime _build_resume_value 零适配）；本期仅 approve+reject（edit/respond 记待办）；刷新恢复 = GET /messages 加 pending_interrupt 可选字段；pending 时普通文本 = 全 reject（自然语义）。
+> - 2026-08-27 议题 3 确认：interrupt 帧后 done 帧（interrupted=true 元数据）+ 连接关闭/thread 保持 pending 语义确认；审批提交复用消息通道确认；普通文本 pending 语义（全 reject）确认；刷新恢复 GET /messages 扩展 pending_interrupt 字段确认。
 > - 2026-08-27 议题 4 落盘：GET /messages = L2 行投影（type 维度 message|tool_call|summary，前端可渲染工具折叠/压缩提示，信息零丢失，数据源 read_or_rebuild_l2）；rebuild = message 行照灌 + summary 行转 HumanMessage（与 SummarizationMiddleware 自身形态一致），tool_call 行跳过记入 skipped；边界：L2 无数据 422 / pending 中断 409 / 重建前清旧 thread 同 id 重灌。
 > - 2026-08-27 议题 5 落盘：RunTracer 挂 chat 链——每轮一行（name=app 名，events 内补 agent 字段区分 coordinator|subagent）；表加 source(test|chat) + session_id 两字段（与 G3 更名迁移合并）；新端点 GET /chat/traces（X-Session-Id 会话维度）；CHAT_TRACE_ENABLED 默认 true。
+> - 2026-08-27 议题 5 确认：lc_agent_name 传递机制验证通过——deepagents 创建 subagent 时设置 metadata，LangGraph ensure_config 传递 parent metadata，RunTracer callback 可接收 lc_agent_name。
 > - 2026-08-27 议题 6 落盘：会话自动起名 = 截断+LLM覆盖两级（首轮即时首条消息截 20 字；后台 fire-and-forget LLM 起名成功后覆盖；SESSION_NAMING_ENABLED 开关沿用）；session_naming 链从 git 历史恢复并适配新架构（sessions_service 调用面）。
+> - 2026-08-27 议题 6 确认：两级策略、开关、恢复清单、适配点全部确认。
 > - 2026-08-27 议题 7 落盘：前端聊天界面——两路由跳转（/chat 列表页 G3 已定 + /chat/:sessionId 聊天页新增）；SSE 客户端自研 fetch-based（utils/sse.ts，token/分帧/心跳/abort/401 重试，零依赖）；消息流 P0 全量（气泡/source 标签/工具折叠/压缩提示/HIL 审批卡片/decisions 胶囊/pending 恢复）；运行轨迹抽屉本期落地（复用 trace 渲染模式）；Markdown 纯文本先行（记待办）。
+> - 2026-08-27 议题 7 确认：路由设计、SSE客户端、消息流UI P0清单、运行轨迹抽屉、组件拆分全部确认。
 > - 2026-08-27 议题 8 落盘：服务层落点 app/services/agents/chat_service.py（5 职责：非流式 auto-approve / 流式 SSE generator / 历史 / rebuild / traces；依赖同包零跨包）；rebuild 编排归 chat_service（graph.aupdate_state 操作与 chat 链同域，维持 sessions_service 轻量边界）；chatbot.py 不复活（G3 议题 6 已定删除，新端点进新文件 api/v1/chat.py）；schemas/chat.py 单文件重组（新增 7 / 删 StreamResponse / 扩展 ChatResponse）。
-> - 2026-08-27 议题 9 落盘（收口）：终评风险中 / 工时 3 周；集成测试全闭环（流式帧序 / HIL resume / pending 恢复 / rebuild 续聊，mock LLM）；待办汇总 8 项；回滚方案与实施顺序定稿；头部初评更新为终评。
+> - 2026-08-27 议题 8 确认：chat_service落点、chatbot.py处置、路由层职责、schemas重组全部确认。
+> - 2026-08-27 议题 9 落盘（收口）：终评风险中 / 工时 3 周；集成测试全闭环（流式帧序 / HIL resume / pending 恢复 / rebuild 续聊，mock LLM）；待办汇总 8 项；回滚方案与实施顺序定案；头部初评更新为终评。
+> - 2026-08-27 议题 9 确认：待办汇总、终评、验证策略、回滚方案、实施顺序全部确认。G4 规格讨论完毕。
 
 ---
 
@@ -117,7 +124,8 @@ POST /api/v1/rebuild         X-Session-Id: <session_id>   灾难恢复（详设�
 
 | type | 触发时机 | 载荷 | 说明 |
 |---|---|---|---|
-| `message` | 正文分片（每个 StreamChunk） | `{content, source}` | source = subagent 名 / `coordinator` / `system` |
+| `message` | 正文分片（AIMessage） | `{content, source}` | source = subagent 名 / `coordinator` / `system` |
+| `tool_call` | 工具调用（ToolMessage） | `{name, content, source}` | 由 runtime _stream 检测 ToolMessage 时触发；前端可渲染为折叠面板 |
 | `interrupt` | 轮末检测到 pending interrupt（未自动批准路径） | `{action_requests: [{tool, args}]}` | 投影 schema（§4.2）；修复旧 str() 化缺陷 |
 | `summary` | 轮末检测到本轮发生压缩（§4.3） | `{summary_text}` | 在 done 帧前发出；summary 文本与 L2 summary 行同源 |
 | `error` | 执行异常 | `{message}` | 发出后仍发 done 帧（终止语义不丢） |
@@ -174,8 +182,10 @@ class ChatResponse(BaseResponse):
 
 ### 4.6 议题 2 DoD 增量
 
-- [ ] SSE 事件协议实现（5 类 type 帧 + 15s 心跳注释帧）
+- [ ] SSE 事件协议实现（6 类 type 帧：message/tool_call/interrupt/summary/error/done + 15s 心跳注释帧）
 - [ ] `runtime.get_pending_interrupt(session_id)` 公开探测方法（返回 §4.2 投影或 None）
+- [ ] `runtime._stream` 扩展支持 tool_call 帧（检测 ToolMessage 时触发）
+- [ ] `StreamChunk` 扩展 `type` 和 `name` 字段
 - [ ] summary 轮末检测推送（`_summarization_event` 快照对比）
 - [ ] 非流式 auto-approve 循环（chat service 层；上限 `CHAT_AUTO_APPROVE_MAX_ROUNDS`）
 - [ ] `schemas/chat.py`：`StreamEvent`（SSE 帧）/ `InterruptPayload` / `ChatResponse` 扩展；旧 `StreamResponse` 废弃
@@ -344,6 +354,12 @@ class ChatTraceItem(BaseModel):
 - [ ] `GET /chat/traces` 端点（X-Session-Id，倒序 limit 100）
 - [ ] `CHAT_TRACE_ENABLED` 配置项（默认 true）
 - [ ] 单测：chat 轮落表（source/session_id/agent 字段）；开关关闭不落
+
+**lc_agent_name 传递机制验证**（2026-08-27 调查确认）：
+- deepagents 创建 subagent 时通过 `with_config` 设置 `metadata: {"lc_agent_name": spec["name"]}`（`langchain/agents/factory.py:1834`）
+- LangGraph 的 `ensure_config` 会将 parent config 的 metadata 传递给 subagent（`langgraph#7926` 合并策略）
+- RunTracer 的 `on_chat_model_start` 等回调接收的 metadata 中包含 `lc_agent_name`
+- 结论：lc_agent_name 可正确传递到 RunTracer，需修改 RunTracer 实现从 metadata 中提取 agent 字段
 
 ## 8. 会话自动起名（议题 6 定案：截断 + LLM 覆盖两级）
 

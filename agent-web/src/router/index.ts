@@ -46,6 +46,12 @@ const router = createRouter({
       meta: { title: 'Agent 管理' },
     },
     {
+      path: '/agentapp',
+      name: 'agentapp',
+      component: () => import('@/views/agent/AgentAppOverview.vue'),
+      meta: { title: 'AgentApp 总览' },
+    },
+    {
       path: '/subagent',
       name: 'subagent',
       component: () => import('@/views/agent/SubAgentList.vue'),

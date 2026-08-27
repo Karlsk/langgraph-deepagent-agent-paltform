@@ -21,7 +21,7 @@ import type { FormRules } from 'element-plus'
 import WebAgentFormDialog from '@/components/WebAgentFormDialog.vue'
 import WebAgentTable from '@/components/WebAgentTable.vue'
 import type { TableColumnConfig } from '@/components/WebAgentTable.vue'
-import { listAgentApps, type AgentAppRow } from '@/api/assets'
+import { listAgentApps, type AgentAppRow } from '@/api/agentapps'
 import {
   createSession,
   deleteSession,
