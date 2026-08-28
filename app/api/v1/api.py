@@ -13,6 +13,7 @@ from fastapi import APIRouter
 
 from app.api.v1.apps import router as apps_router
 from app.api.v1.auth import router as auth_router
+from app.api.v1.chat import router as chat_router
 from app.api.v1.mcp_servers import router as mcp_servers_router
 from app.api.v1.providers import router as providers_router
 from app.api.v1.sessions import router as sessions_router
@@ -31,6 +32,7 @@ api_router.include_router(apps_router, tags=["Agent Apps"])
 api_router.include_router(mcp_servers_router, tags=["MCP Servers"])
 api_router.include_router(providers_router, tags=["Providers"])
 api_router.include_router(sessions_router, tags=["Sessions"])
+api_router.include_router(chat_router, tags=["Chat"])
 api_router.include_router(workflow_router, tags=["Workflow"])
 
 
