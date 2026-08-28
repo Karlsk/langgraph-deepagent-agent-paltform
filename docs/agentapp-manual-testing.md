@@ -1169,12 +1169,12 @@ ls "$DATA_ROOT/agents/$APP_ID/skills/csv-report/SKILL.md"
 
 ---
 
-## 7. 会话管理（G3：/sessions CRUD + 导出；聊天区待 G4）
+## 7. 会话管理（G3：/sessions CRUD + 导出）
 
 > **背景**：`/chatbot/*` 全部端点已随 G1 退役（任何 `/chatbot/*` 请求返回 **404**）。
 > G3 重建了会话元数据层：`/sessions` 全新 RESTful 6 端点（list / get / create /
 > patch / delete / export）+ 三层存储（L0 PG 元数据 / L1 LangGraph checkpoint /
-> L2 JSONL 产品级记录）。**对话运行时（消息流 / 流式 / HIL）仍归 G4**，届时重写对话小节。
+> L2 JSONL 产品级记录）。**对话运行时（消息流 / 流式 / HIL）已由 G4 重建，见第 8 节。**
 >
 > 前置：按第 2 节登录拿到 `$TOKEN`；按第 3/5 节有一个 **published** 的 AgentApp（下文记 `$APP_ID`）。
 
@@ -1235,12 +1235,145 @@ curl -OJ -s "$BASE/sessions/$SID/export?format=jsonl" \
 
 ---
 
-## 8. HIL（人工介入，待 G4 重建）
+## 8. /chat 对话调试（G4：非流式 / 流式 SSE / HIL / 历史 / 重建 / 轨迹）
 
-> **待重建说明**：HIL 依赖对话端点与会话消息流（旧 `/chatbot/chat` 已退役，见第 7 节背景），
-> 当前无法端到端验证。其机制设计（`interrupt_on` 透传 Human-in-the-loop 中间件、
-> 结构化 `{"decisions": [...]}` 批准、非结构化回复默认 reject 的安全语义）将在 G4 对话
-> 运行时重建时恢复，届时重写本节（原脚本保留在 git 历史）。
+> **背景**：G4 重建了对话交互层：5 个端点（`POST /chat`、`POST /chat/stream`、
+> `GET /messages`、`POST /rebuild`、`GET /chat/traces`）全部要求 **`X-Session-Id` 请求头**
+> 指向一个属于自己的会话（他人会话与不存在会话一律 **404**，防枚举）。流式端点返回
+> SSE（`Cache-Control: no-cache` / `X-Accel-Buffering: no`），空闲 15 秒发 `: ping` 心跳注释帧。
+>
+> 前置：按第 2 节登录拿到 `$TOKEN`；按第 3/5 节有一个 **published** 的 AgentApp
+> （下文记 `$APP_ID`，含可用工具），再按 7.1 创建会话记 `$SID`。
+
+### 8.1 非流式对话（auto-approve）
+
+```bash
+BASE="http://localhost:8000/api/v1"
+
+curl -s -X POST "$BASE/chat" -H "Authorization: Bearer $TOKEN" \
+  -H "X-Session-Id: $SID" -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "用一句话介绍你自己"}]}'
+```
+
+**预期与验证点**：
+- 响应是标准信封，`data.messages` 只含**本轮** assistant 回复（不含历史轮，避免前端重复渲染）；
+  `data.interrupt` 正常时为 `null`。
+- 非流式循环**自动批准**所有工具中断（上限 `CHAT_AUTO_APPROVE_MAX_ROUNDS`，默认 10）：
+  若应用配置了 `interrupt_on`，工具仍会执行；超限时 `data.interrupt` 携带待审批投影
+  （`action_requests[].tool/args`）且线程保持暂停。
+- 每轮落一条 `source="chat"` 的轨迹行（见 8.6）；会话首条消息触发自动起名
+  （`SESSION_NAMING_ENABLED`，默认开，失败静默回退占位名）。
+- 轮次完成后 `GET /messages`（8.4）应看到本轮 user/assistant 两行 L2 记录。
+
+### 8.2 流式对话（SSE 帧序列）
+
+```bash
+curl -N -s -X POST "$BASE/chat/stream" -H "Authorization: Bearer $TOKEN" \
+  -H "X-Session-Id: $SID" -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "搜索今天的AI新闻并总结"}]}'
+```
+
+**帧类型与顺序**（`data:` JSON，`type` 字段区分）：
+
+| type | 触发时机 | 关键字段 |
+|---|---|---|
+| `message` | assistant 文本段（可能多段） | `content`、`source`（子代理名，coordinator 时缺省） |
+| `tool_call` | 工具返回 | `name`（工具名）、`content`（输出摘要）、`source` |
+| `summary` | 轮内真实上下文压缩 | `summary_text`（摘要文本） |
+| `interrupt` | 命中 `interrupt_on` 暂停 | `action_requests[].tool/args` |
+| `error` | 流内异常 | `message` |
+| `done` | **尾帧（必有）** | `message_count`、`compressed`、`interrupted` |
+
+**预期与验证点**：
+- 所有内容帧先于 `done`；`done.interrupted=false` 时无 `interrupt` 帧；工具轮应看到
+  `message → tool_call → message → done` 这样的交替。
+- `summary` 帧仅当本轮真的发生压缩（token 超过 app 的 `context_size` **且**消息数超过
+  保留窗口 20 条）时出现，此时 `done.compressed=true`；一般短对话 `compressed=false` 属正常。
+- 长时间工具执行（>15s）期间应观察到 `: ping` 注释帧（curl `-N` 不缓冲才能看到）。
+- 中断连接（Ctrl-C）后线程不损坏：再次 `POST /chat/stream` 续发新消息即可继续。
+
+### 8.3 HIL：中断审批与恢复（interrupt_on）
+
+前置：创建/发布一个 `interrupt_on` 含某工具（内置 `duckduckgo_results_json` 或任一
+MCP 工具）的 AgentApp（`"interrupt_on": {"duckduckgo_results_json": true}`），
+新建会话记 `$SID2`。
+
+```bash
+# 1) 触发中断：模型决定调工具时流在工具执行前暂停
+curl -N -s -X POST "$BASE/chat/stream" -H "Authorization: Bearer $TOKEN" \
+  -H "X-Session-Id: $SID2" -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "搜索 LangGraph 最新版本号"}]}'
+# → 应看到 interrupt 帧（action_requests[0].tool=duckduckgo_results_json）+ done(interrupted=true)
+
+# 2a) 批准：工具执行，对话继续到完成
+curl -N -s -X POST "$BASE/chat/stream" -H "Authorization: Bearer $TOKEN" \
+  -H "X-Session-Id: $SID2" -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "{\"decisions\": [{\"type\": \"approve\"}]}"}]}'
+# → tool_call 帧（真实执行）+ 后续 message + done(interrupted=false)
+
+# 2b) 或拒绝：工具不执行，模型收到拒绝后自行组织回复
+curl -N -s -X POST "$BASE/chat/stream" -H "Authorization: Bearer $TOKEN" \
+  -H "X-Session-Id: $SID2" -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "{\"decisions\": [{\"type\": \"reject\"}]}"}]}'
+```
+
+**预期与验证点**：
+- `decisions` 数量须与 `action_requests` 一致；**非结构化回复（普通文本）默认全拒绝**
+  （安全语义：无法解析的回复绝不可能静默批准）。
+- 中断后刷新页面/重开浏览器，`GET /messages` 的 `data.pending_interrupt` 非空，
+  前端审批卡应重现（8.4）。
+- 同一会话在中断未处理前调用 `POST /rebuild` 返 **409**。
+
+### 8.4 历史与 pending 恢复（GET /messages）
+
+```bash
+curl -s "$BASE/messages" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SID"
+```
+
+**预期与验证点**：
+- `data.messages` 为 L2 行投影：`type` ∈ `message | tool_call | summary`，
+  `message` 行带 `role`（user/assistant）与 `content`；`seq` 递增。
+- L2 JSONL 缺失时自动从 checkpoint 重建（自愈，与 7.2 导出同源）。
+- 中断未决时 `data.pending_interrupt.action_requests` 非空；正常时 `null`。
+- 无 `X-Session-Id` 头返 **422**；错误会话 id 返 **404**。
+
+### 8.5 灾难重建（POST /rebuild）
+
+```bash
+# 模拟 L1 checkpoint 丢失：删线程 checkpoint 后重建
+# （手动模拟可直接清空 PG 中 checkpoints 表对应 thread，或删 data/ 下 checkpoint 存储）
+curl -s -X POST "$BASE/rebuild" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SID"
+# → {"rebuilt_messages": N, "skipped_tool_calls": M, "l2_source_lines": L}
+```
+
+**预期与验证点**：
+- 重建后继续对话：模型仍能引用重建前的历史（连贯性）；`GET /messages` 不变（L2 是源）。
+- 边界：L2 无可读行返 **422**；中断未决返 **409**（先处理审批）。
+- `tool_call` 行无法重灌（tool_call_id 配对不可恢复），计入 `skipped_tool_calls`；
+  `summary` 行以 HumanMessage 形式回灌。前端入口：会话页顶栏「重建」按钮（确认弹窗）。
+
+### 8.6 运行轨迹（GET /chat/traces）
+
+```bash
+curl -s "$BASE/chat/traces" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SID"
+```
+
+**预期与验证点**：
+- 仅返回本会话 `source="chat"` 的轨迹行，`created_at` 倒序，默认上限 100；
+  每行含 `status`（success/error）、`turns`、`duration_seconds`、`error`、`events`
+  （llm_call/tool_call/run_finished 事件流，含 `agent` 字段区分子代理）。
+- `CHAT_TRACE_ENABLED=false`（默认 true）时新轮不再落行。
+- 前端入口：会话页顶栏「运行轨迹」抽屉，行展开可看事件流。
+
+### 8.7 前端页面走查（/chat/:sessionId）
+
+1. 会话列表（`/chat`）行内「进入聊天」→ 跳转 `/chat/:sessionId`；
+2. 输入框 Enter 发送，流式气泡逐段出现；子代理回复带 source 标签；工具轮显示可折叠
+   tool_call 面板；压缩轮出现「已压缩历史」提示条；
+3. 配置 `interrupt_on` 的应用：审批卡展示工具名与参数，可逐项批准/拒绝，提交后流继续；
+   pending 时输入框占位提示「审批待处理：发送文本将拒绝所有待审批操作」；
+4. 刷新页面：历史与审批卡从 `GET /messages` 恢复；
+5. 顶栏「重建」「运行轨迹」分别对应 8.5/8.6；streaming 中「停止」按钮可中断流。
 
 ---
 
