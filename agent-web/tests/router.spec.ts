@@ -30,6 +30,7 @@ describe('控制台导航路由', () => {
       { name: 'agent', path: '/agent' },
       { name: 'agentapp', path: '/agentapp' },
       { name: 'chat', path: '/chat' },
+      { name: 'chatSession', path: '/chat/:sessionId' },
       { name: 'llm', path: '/llm' },
       { name: 'llm-trash', path: '/llm/trash' },
       { name: 'login', path: '/login' },

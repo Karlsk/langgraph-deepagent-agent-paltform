@@ -34,6 +34,11 @@ vi.mock('element-plus', () => ({
   ElMessageBox: elMessageBoxMock,
 }))
 
+const pushMock = vi.fn()
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push: pushMock }),
+}))
+
 const confirmMock = elMessageBoxMock.confirm
 
 const { sessionsMock, agentappsMock } = vi.hoisted(() => ({
@@ -621,5 +626,16 @@ describe('ChatView 列展示', () => {
     // message_count 列表恒 null → 占位「—」
     const text = wrapper.text()
     expect(text.includes('—')).toBe(true)
+  })
+
+  it('行内「进入聊天」跳转会话聊天页', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findRowButton(wrapper, '进入聊天', 0).trigger('click')
+    expect(pushMock).toHaveBeenCalledWith({
+      name: 'chatSession',
+      params: { sessionId: 's-001' },
+    })
   })
 })

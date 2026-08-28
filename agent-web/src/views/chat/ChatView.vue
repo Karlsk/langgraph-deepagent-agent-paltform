@@ -16,6 +16,7 @@
  *   （非信封文件下载，§11.5.3 先例）。
  */
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import type { FormRules } from 'element-plus'
 
 import WebAgentFormDialog from '@/components/WebAgentFormDialog.vue'
@@ -39,8 +40,10 @@ const columns: TableColumnConfig[] = [
   { label: 'Agent 应用', prop: 'agent_app_id', width: 180, slot: 'agentApp' },
   { label: '消息数', prop: 'message_count', width: 100, slot: 'messageCount' },
   { label: '创建时间', prop: 'created_at', width: 180, slot: 'createdAt' },
-  { label: '操作', prop: 'actions', width: 240, slot: 'actions' },
+  { label: '操作', prop: 'actions', width: 300, slot: 'actions' },
 ]
+
+const router = useRouter()
 
 /** 表格数据源：透传到 listSessions；agentAppId 过滤经 WebAgentTable query 注入 */
 async function api(query: PageQuery): Promise<PageResult<SessionRead>> {
@@ -243,6 +246,19 @@ async function handleExport(row: SessionRead, format: 'json' | 'jsonl'): Promise
           <span class="session-created-at">{{ createdAtLabel(row as SessionRead) }}</span>
         </template>
         <template #actions="{ row }">
+          <el-button
+            link
+            type="primary"
+            size="small"
+            @click="
+              router.push({
+                name: 'chatSession',
+                params: { sessionId: (row as SessionRead).session_id },
+              })
+            "
+          >
+            进入聊天
+          </el-button>
           <el-button link type="primary" size="small" @click="handleRename(row as SessionRead)">
             重命名
           </el-button>

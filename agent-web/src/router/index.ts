@@ -40,6 +40,12 @@ const router = createRouter({
       meta: { title: '对话' },
     },
     {
+      path: '/chat/:sessionId',
+      name: 'chatSession',
+      component: () => import('@/views/chat/ChatSessionView.vue'),
+      meta: { title: '会话聊天' },
+    },
+    {
       path: '/agent',
       name: 'agent',
       component: () => import('@/views/agent/AgentList.vue'),
