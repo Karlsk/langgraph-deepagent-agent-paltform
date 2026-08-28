@@ -3,13 +3,15 @@ set -e
 
 # Script to securely build Docker images without exposing secrets in build output
 
-if [ $# -ne 1 ]; then
-    echo "Usage: $0 <environment>"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <environment> [mode]"
     echo "Environments: development, staging, production"
+    echo "Modes: backend (default), full (backend + frontend)"
     exit 1
 fi
 
 ENV=$1
+MODE=${2:-backend}
 
 # Validate environment
 if [[ ! "$ENV" =~ ^(development|staging|production)$ ]]; then
@@ -60,6 +62,7 @@ echo "API keys: ******** (masked for security)"
 
 # Build the Docker image with secrets but without showing them in console output
 docker build --no-cache \
+    -f deploy/Dockerfile.backend \
     --build-arg APP_ENV="$ENV" \
     --build-arg OPENAI_API_KEY="$OPENAI_API_KEY" \
     --build-arg LANGFUSE_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY" \
@@ -68,3 +71,12 @@ docker build --no-cache \
     -t fastapi-langgraph-template:"$ENV" .
 
 echo "Docker image fastapi-langgraph-template:$ENV built successfully"
+
+# Build frontend image when MODE=full
+if [ "$MODE" = "full" ]; then
+    echo "Building frontend image for $ENV environment"
+    docker build --no-cache \
+        -f deploy/Dockerfile.frontend \
+        -t agent-web:"$ENV" .
+    echo "Docker image agent-web:$ENV built successfully"
+fi

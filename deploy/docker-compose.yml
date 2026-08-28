@@ -5,7 +5,7 @@ services:
     image: pgvector/pgvector:pg17
     platform: linux/amd64
     env_file:
-      - .env.${APP_ENV:-development}
+      - ../.env.${APP_ENV:-development}
     ports:
       - "15432:5432"
     volumes:
@@ -44,12 +44,13 @@ services:
   # no-op. `restart: "no"` keeps it from looping forever on a broken schema.
   migrate:
     build:
-      context: .
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
       args:
         APP_ENV: ${APP_ENV:-development}
     command: ["/app/.venv/bin/alembic", "upgrade", "head"]
     env_file:
-      - .env.${APP_ENV:-development}
+      - ../.env.${APP_ENV:-development}
     environment:
       - APP_ENV=${APP_ENV:-development}
     depends_on:
@@ -62,24 +63,25 @@ services:
   # Single API service with dynamic environment
   app:
     build:
-      context: .
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
       args:
         APP_ENV: ${APP_ENV:-development}
     ports:
       - "8000:8000"
     volumes:
-      - ./app:/app/app
-      - ./logs:/app/logs
+      - ../app:/app/app
+      - ../logs:/app/logs
       # stdio MCP manifest directory: drop *.json manifests on the host and
       # sync them via POST /mcp-servers/stdio-sync (see mcp-servers/README.md)
-      - ./mcp-servers:/app/mcp-servers
+      - ../mcp-servers:/app/mcp-servers
       # Skills filesystem store (SKILLS_ROOT=./data/skills): without this bind
       # mount, SKILL.md bodies created at runtime live only in the container
       # layer and are lost on every rebuild while their DB metadata rows
       # survive in the postgres volume (read_global then fails "not found").
-      - ./data:/app/data
+      - ../data:/app/data
     env_file:
-      - .env.${APP_ENV:-development}
+      - ../.env.${APP_ENV:-development}
     environment:
       - APP_ENV=${APP_ENV:-development}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-supersecretkeythatshouldbechangedforproduction}
@@ -104,7 +106,7 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
     networks:
@@ -118,8 +120,8 @@ services:
       - "3000:3000"
     volumes:
       - grafana-storage:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./grafana/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ../grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ../grafana/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
@@ -139,6 +141,19 @@ services:
     networks:
       - monitoring
     restart: always
+
+  # Frontend: Nginx serving Vue SPA + reverse proxy /api to backend
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - app
+    restart: on-failure
+    networks:
+      - monitoring
 
 networks:
   monitoring:

@@ -1,7 +1,8 @@
 .DEFAULT_GOAL := help
 
-DOCKER_COMPOSE ?= docker-compose
+DOCKER_COMPOSE ?= docker compose -f deploy/docker-compose.yml
 ENV            ?= development
+MODE           ?= backend
 VALID_ENVS     := development staging production test
 
 # ---------------------------------------------------------------------------
@@ -118,17 +119,15 @@ test-cov:
 # ---------------------------------------------------------------------------
 docker-build:
 	$(call check_env)
-	@./scripts/build-docker.sh $(ENV)
+	@./scripts/build-docker.sh $(ENV) $(MODE)
 
 docker-up:
 	$(call load_env_file)
-	# --pull never: skip ALL registry access; rely entirely on the local image
-	# cache. The app service is always rebuilt locally via --build.
-	# If a prebuilt image is genuinely missing locally, run `docker pull <image>`
-	# first (e.g. `docker pull pgvector/pgvector:pg17`).
-	# The `migrate` one-shot service runs `alembic upgrade head` before app
-	# starts, so bootstrap never races against a schema-less database.
-	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build --pull never db migrate app
+	@if [ "$(MODE)" = "full" ]; then \
+		APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build --pull never db migrate app frontend; \
+	else \
+		APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build --pull never db migrate app; \
+	fi
 
 docker-down:
 	$(call load_env_file)
@@ -165,10 +164,11 @@ docker-migrate-history:
 # ---------------------------------------------------------------------------
 stack-up:
 	$(call load_env_file)
-	# --pull never: skip ALL registry access; rely entirely on the local image
-	# cache. Manually `docker pull <image>` first if a service image is missing.
-	# `migrate` runs `alembic upgrade head` before the app starts.
-	@APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --pull never db migrate app prometheus grafana cadvisor valkey
+	@if [ "$(MODE)" = "full" ]; then \
+		APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build --pull never db migrate app frontend prometheus grafana cadvisor valkey; \
+	else \
+		APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file .env.$(ENV) up -d --build --pull never db migrate app prometheus grafana cadvisor valkey; \
+	fi
 
 stack-down:
 	$(call load_env_file)
@@ -251,8 +251,8 @@ help:
 	@echo "  test-cov             Run tests with coverage report"
 	@echo ""
 	@echo "Docker (API + DB):"
-	@echo "  docker-build         Build Docker image"
-	@echo "  docker-up            Start API + DB containers"
+	@echo "  docker-build         Build Docker image(s) (MODE=full includes frontend)"
+	@echo "  docker-up            Start API + DB containers (MODE=full includes frontend)"
 	@echo "  docker-down          Stop containers"
 	@echo "  docker-destroy       Stop containers AND remove volumes (destructive)"
 	@echo "  docker-logs          Tail container logs"
@@ -261,7 +261,7 @@ help:
 	@echo "  docker-migrate-history    Show migration history (in container)"
 	@echo ""
 	@echo "Docker (full stack — includes Prometheus + Grafana):"
-	@echo "  stack-up             Start entire stack"
+	@echo "  stack-up             Start entire stack (MODE=full includes frontend)"
 	@echo "  stack-down           Stop entire stack"
 	@echo "  stack-destroy        Stop entire stack AND remove volumes (destructive)"
 	@echo "  stack-logs           Tail all service logs"
@@ -273,6 +273,10 @@ help:
 	@echo "                       the Docker network; host dev should use web-dev)"
 	@echo "  web-build            Type-check + production build"
 	@echo "  web-clean            Remove node_modules, dist and tsbuildinfo caches"
+	@echo ""
+	@echo "Docker MODE parameter (for docker-build, docker-up, stack-up):"
+	@echo "  MODE=backend (default)  Backend only"
+	@echo "  MODE=full               Backend + Frontend"
 	@echo ""
 	@echo "Misc:"
 	@echo "  clean                Remove .venv, __pycache__, .pytest_cache"

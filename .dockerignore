@@ -41,9 +41,10 @@ logs/
 *.log
 
 # Docker
-Dockerfile
+Dockerfile*
+deploy/Dockerfile*
+deploy/docker-compose.yml
 .dockerignore
-docker-compose.yml
 
 # Documentation
 docs/
@@ -57,8 +58,8 @@ README.md
 dist/
 build/
 
-# Frontend (agent-web is built/served separately, not part of the API image)
-agent-web/
+# Frontend node_modules (avoid 300MB+ in build context)
+agent-web/node_modules/
 
 # other
 schema.sql
