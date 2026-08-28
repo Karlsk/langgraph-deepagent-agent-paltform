@@ -277,6 +277,7 @@ class Settings:
             "tools_catalog": ["60 per minute"],
             "subagent_test": ["5 per minute"],
             "skill_generate": ["5 per minute"],
+            "rebuild": ["5 per minute"],
         }
 
         # Update rate limit endpoints from environment variables
@@ -290,6 +291,11 @@ class Settings:
         # Provider connectivity probe configuration
         self.PROVIDER_TEST_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TEST_TIMEOUT_SECONDS", "10"))
         self.PROVIDER_HEALTH_DEGRADED_MS = int(os.getenv("PROVIDER_HEALTH_DEGRADED_MS", "5000"))
+
+        # Chat interaction layer (spec-g4-chat §4.4/§7.2/§8.1)
+        self.CHAT_TRACE_ENABLED = os.getenv("CHAT_TRACE_ENABLED", "true").lower() == "true"
+        self.CHAT_AUTO_APPROVE_MAX_ROUNDS = int(os.getenv("CHAT_AUTO_APPROVE_MAX_ROUNDS", "10"))
+        self.SESSION_NAMING_ENABLED = os.getenv("SESSION_NAMING_ENABLED", "true").lower() == "true"
 
         # Evaluation Configuration
         self.EVALUATION_LLM = os.getenv("EVALUATION_LLM", "gpt-5")

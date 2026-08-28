@@ -7,6 +7,7 @@ CHAT_AUTO_APPROVE_MAX_ROUNDS, SESSION_NAMING_ENABLED.
 
 import pytest
 
+from app.core.config import settings
 from app.models.subagent_trace import SubAgentTrace
 
 pytestmark = pytest.mark.unit
@@ -33,3 +34,24 @@ def test_subagent_trace_columns_on_table_metadata() -> None:
     """Both G4 columns materialise on the table metadata (migration parity)."""
     columns = {column.name for column in SubAgentTrace.__table__.columns}
     assert {"source", "session_id"} <= columns
+
+
+def test_settings_rebuild_rate_limit_key() -> None:
+    """RATE_LIMIT_ENDPOINTS carries the new rebuild key (spec §3.2/§3.4)."""
+    assert "rebuild" in settings.RATE_LIMIT_ENDPOINTS
+    assert settings.RATE_LIMIT_ENDPOINTS["rebuild"] == ["5 per minute"]
+
+
+def test_settings_chat_trace_enabled_defaults_true() -> None:
+    """CHAT_TRACE_ENABLED defaults to True (spec §7.2)."""
+    assert settings.CHAT_TRACE_ENABLED is True
+
+
+def test_settings_chat_auto_approve_max_rounds() -> None:
+    """CHAT_AUTO_APPROVE_MAX_ROUNDS defaults to 10 (spec §4.4)."""
+    assert settings.CHAT_AUTO_APPROVE_MAX_ROUNDS == 10
+
+
+def test_settings_session_naming_enabled_restored() -> None:
+    """SESSION_NAMING_ENABLED restored with the pre-G1 default True (spec §8.1)."""
+    assert settings.SESSION_NAMING_ENABLED is True
