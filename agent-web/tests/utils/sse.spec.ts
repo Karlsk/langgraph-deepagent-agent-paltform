@@ -101,6 +101,19 @@ describe('sseFetch', () => {
     expect(headers.Accept).toBe('text/event-stream')
   })
 
+  it('携带 JSON body 与 Content-Type header', async () => {
+    fetchMock.mockResolvedValue(sseResponse(['data: 1\n\n']))
+    await sseFetch({
+      url: '/api/v1/chat/stream',
+      body: { messages: [{ role: 'user', content: 'hi' }] },
+      onEvent: () => {},
+    })
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(init.body).toBe('{"messages":[{"role":"user","content":"hi"}]}')
+    const headers = init.headers as Record<string, string>
+    expect(headers['Content-Type']).toBe('application/json')
+  })
+
   it('连接 401 时 refresh 成功后用新 token 重试一次', async () => {
     fetchMock
       .mockResolvedValueOnce(sseResponse([], { status: 401 }))

@@ -16,6 +16,8 @@ import { clearAuth, getUserToken } from '@/utils/authStorage'
 export interface SseOptions {
   url: string
   headers?: Record<string, string>
+  /** POST 请求体（JSON 序列化；POST /chat/stream 的 messages 载荷） */
+  body?: unknown
   /** 中断控制（切会话 / 用户点停止 / 组件卸载）。abort 静默结束。 */
   signal?: AbortSignal
   onEvent: (data: string) => void
@@ -27,8 +29,13 @@ function isAbortError(error: unknown): boolean {
 }
 
 /** 组装请求头：Accept + 调用方 headers + 用户 token（未登录不发）。 */
-function buildHeaders(extra: Record<string, string> | undefined): Record<string, string> {
-  const headers: Record<string, string> = { Accept: 'text/event-stream', ...extra }
+function buildHeaders(
+  extra: Record<string, string> | undefined,
+  hasBody: boolean,
+): Record<string, string> {
+  const headers: Record<string, string> = { Accept: 'text/event-stream' }
+  if (hasBody) headers['Content-Type'] = 'application/json'
+  Object.assign(headers, extra)
   const token = getUserToken()
   if (token) headers.Authorization = `Bearer ${token}`
   return headers
@@ -65,20 +72,24 @@ async function redirectToLogin(): Promise<void> {
 
 /** 建立连接；连接建立期 401 → refresh 成功后重试一次，再失败走清空 + 跳 login。 */
 async function connect(options: SseOptions): Promise<Response> {
+  const hasBody = options.body !== undefined
+  const body = hasBody ? JSON.stringify(options.body) : undefined
   let response = await fetch(options.url, {
     method: 'POST',
-    headers: buildHeaders(options.headers),
+    headers: buildHeaders(options.headers, hasBody),
+    body,
     signal: options.signal,
   })
 
   if (response.status === 401) {
     const newToken = await refreshUserToken()
     if (newToken) {
-      const headers = buildHeaders(options.headers)
+      const headers = buildHeaders(options.headers, hasBody)
       headers.Authorization = `Bearer ${newToken}`
       response = await fetch(options.url, {
         method: 'POST',
         headers,
+        body,
         signal: options.signal,
       })
     }
