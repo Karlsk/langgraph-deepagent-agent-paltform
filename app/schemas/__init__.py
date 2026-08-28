@@ -6,7 +6,6 @@ from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
     Message,
-    StreamResponse,
 )
 
 __all__ = [
@@ -15,5 +14,4 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "Message",
-    "StreamResponse",
 ]
