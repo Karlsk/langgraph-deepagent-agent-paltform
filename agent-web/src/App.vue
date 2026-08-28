@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   ChatDotRound,
   Connection,
+  DataBoard,
   Delete,
   Expand,
   Fold,
@@ -105,6 +106,10 @@ async function handleLogout(): Promise<void> {
             <template #title>回收站</template>
           </el-menu-item>
         </el-sub-menu>
+        <el-menu-item index="/bundle">
+          <el-icon><DataBoard /></el-icon>
+          <template #title>配置迁移</template>
+        </el-menu-item>
       </el-menu>
 
       <div class="app-sidebar__footer">

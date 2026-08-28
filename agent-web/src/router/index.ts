@@ -87,6 +87,12 @@ const router = createRouter({
       component: () => import('@/views/provider/ProviderTrashList.vue'),
       meta: { title: '提供商回收站' },
     },
+    {
+      path: '/bundle',
+      name: 'bundle',
+      component: () => import('@/views/bundle/BundleImportExport.vue'),
+      meta: { title: '配置迁移' },
+    },
   ],
 })
 

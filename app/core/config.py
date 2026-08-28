@@ -278,6 +278,7 @@ class Settings:
             "subagent_test": ["5 per minute"],
             "skill_generate": ["5 per minute"],
             "rebuild": ["5 per minute"],
+            "bundle": ["30 per minute"],
         }
 
         # Update rate limit endpoints from environment variables
