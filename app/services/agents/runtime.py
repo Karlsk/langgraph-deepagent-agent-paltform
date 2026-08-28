@@ -662,6 +662,24 @@ class AgentAppRuntime(ABC):
             return None
         return project_interrupt(_first_interrupt_value(state))
 
+    async def rebuild_thread(self, session_id: str, messages: Sequence[BaseMessage]) -> None:
+        """Rehydrate a destroyed thread checkpoint from L2 rows (§6.2).
+
+        Callers (chat_service.rebuild) clear the old thread first, then
+        translate L2 rows into BaseMessages (message rows verbatim, summary
+        rows as HumanMessage; tool_call rows are skipped and counted
+        upstream). Engines without checkpoint write access reject the
+        operation.
+
+        Args:
+            session_id: Target thread id.
+            messages: Pre-assembled message batch to replay.
+
+        Raises:
+            NotImplementedError: When the runtime cannot write checkpoints.
+        """
+        raise NotImplementedError("rebuild_thread requires a checkpoint-backed runtime")
+
 
 # ---------------------------------------------------------------------------
 # deepagents-backed runtime
@@ -796,6 +814,25 @@ class DeepAgentsAppRuntime(AgentAppRuntime):
             logger.warning("clear_history_skipped_no_checkpointer", session_id=session_id)
             raise RuntimeError("cannot clear chat history: no checkpointer attached")
         await self._checkpointer.adelete_thread(session_id)
+
+    @override
+    async def rebuild_thread(self, session_id: str, messages: Sequence[BaseMessage]) -> None:
+        """Replay messages into the thread via ``aupdate_state`` (§6.2).
+
+        Spike conclusion (tests/unit/agents/test_runtime_g4.py): with tools
+        attached (production shape) a bare ``aupdate_state`` raises
+        ``InvalidUpdateError: Ambiguous update`` — the write must name its
+        node (``as_node="model"``). Under that form the ``add_messages``
+        reducer appends, so the whole L2 batch replays in one call, and a
+        subsequent ``ainvoke`` continues on the same thread with full
+        history.
+
+        Args:
+            session_id: Target thread id (same id as the deleted one).
+            messages: Pre-assembled message batch to replay.
+        """
+        config: RunnableConfig = {"configurable": {"thread_id": session_id}}
+        await self._graph.aupdate_state(config, {"messages": list(messages)}, as_node="model")
 
 
 class WorkflowAppRuntime(AgentAppRuntime):

@@ -19,7 +19,7 @@ from typing import Any, Optional, override
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import MemorySaver
@@ -488,3 +488,88 @@ def test_astream_skips_summary_chunk_without_new_compression() -> None:
     for rt in (no_event, unchanged):
         chunks = _collect_from(rt)
         assert not [chunk for chunk in chunks if chunk.type == "summary"]
+
+
+# ---------------------------------------------------------------------------
+# B5 — spike: aupdate_state append semantics + rebuild_thread (§6.2)
+# ---------------------------------------------------------------------------
+
+
+def test_spike_aupdate_state_appends_via_add_messages(
+    mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spike (§6.2 探索项): aupdate_state append semantics on add_messages.
+
+    Conclusion recorded for the rebuild design (verified against a REAL
+    compiled deepagents graph with tools, langgraph 1.2.x):
+    - On an EMPTY thread a bare ``aupdate_state(config, {"messages": ...})``
+      works (default write path), but once the thread HAS a checkpoint the
+      bare call raises ``InvalidUpdateError: Ambiguous update, specify
+      as_node`` (model+tools both write messages) — so rebuild must always
+      pass ``as_node="model"`` (safe in both states).
+    - With ``as_node="model"`` the batch seeds the empty checkpoint and
+      repeat calls APPEND through the ``add_messages`` reducer (prior
+      messages kept, ids auto-generated when absent) — no manual id
+      stitching needed for L2 replay; re-running rebuild after a clear is
+      therefore deterministic (幂等).
+    - After rehydration a normal ``ainvoke`` continues on the same thread:
+      the model receives the replayed history and its reply appends after
+      it (rebuild → 续聊 continuity holds).
+    """
+    model = ScriptedChatModel(responses=[AIMessage(content="ok")])
+    rt = _compile_runtime(model, _make_app(), monkeypatch)
+    config = {"configurable": {"thread_id": "s-spike"}}
+
+    batch = [HumanMessage(content="hello"), AIMessage(content="hi")]
+    asyncio.run(rt._graph.aupdate_state(config, {"messages": batch}))  # empty thread: bare OK
+    state = asyncio.run(rt._graph.aget_state(config))
+    assert [message.content for message in state.values["messages"]] == ["hello", "hi"]
+
+    with pytest.raises(Exception, match="[Aa]mbiguous update"):
+        asyncio.run(rt._graph.aupdate_state(config, {"messages": [HumanMessage(content="x")]}))
+
+    asyncio.run(rt._graph.aupdate_state(config, {"messages": [HumanMessage(content="second turn")]}, as_node="model"))
+    state = asyncio.run(rt._graph.aget_state(config))
+    assert [message.content for message in state.values["messages"]] == ["hello", "hi", "second turn"]
+
+    asyncio.run(rt._graph.ainvoke({"messages": [HumanMessage(content="continue")]}, config))
+    state = asyncio.run(rt._graph.aget_state(config))
+    assert [message.content for message in state.values["messages"]] == [
+        "hello",
+        "hi",
+        "second turn",
+        "continue",
+        "ok",
+    ]
+
+
+def test_rebuild_thread_base_runtime_raises() -> None:
+    """Base/workflow runtimes reject rebuild explicitly (§6.2)."""
+    rt = _ScriptedStateRuntime([])
+    with pytest.raises(NotImplementedError):
+        asyncio.run(rt.rebuild_thread("s-rb", [HumanMessage(content="x")]))
+
+
+def test_rebuild_thread_rehydrates_checkpoint_for_continuity(
+    mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DeepAgents rebuild_thread replays L2 rows; the next turn sees them."""
+    model = ScriptedChatModel(responses=[AIMessage(content="final")])
+    rt = _compile_runtime(model, _make_app(), monkeypatch)
+
+    replayed = [HumanMessage(content="earlier question"), AIMessage(content="earlier answer")]
+    asyncio.run(rt.rebuild_thread("s-rebuild", replayed))
+
+    history = asyncio.run(rt.get_chat_history("s-rebuild"))
+    assert [(message.role, message.content) for message in history] == [
+        ("user", "earlier question"),
+        ("assistant", "earlier answer"),
+    ]
+
+    # Continuity: the next invoke feeds the replayed history to the model.
+    asyncio.run(
+        rt.ainvoke([Message(role="user", content="continue")], session_id="s-rebuild", user_id="u1", username="ann")
+    )
+    seen = " ".join(str(message.content) for message in model.calls[0])
+    assert "earlier question" in seen
+    assert "earlier answer" in seen
