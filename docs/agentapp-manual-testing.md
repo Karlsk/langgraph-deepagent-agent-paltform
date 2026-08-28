@@ -75,8 +75,11 @@ export PASSWORD="Test@1234"   # 满足密码强度要求：>=8 位，含大写/�
 | `LANGFUSE_TRACING_ENABLED` | 可选 | true | 无 Langfuse 账号时建议设 `false` 避免初始化噪音 |
 | `RATE_LIMIT_*` | 可选 | 见下 | 各端点限流；手动测试建议放宽 |
 | `VALKEY_HOST` | 可选 | 空 | 置空即禁用缓存（compose 仍会启动 valkey 容器但不被使用） |
+| `CHAT_TRACE_ENABLED` | 可选 | true | `/chat` 轮轨迹落表开关（关闭后 `GET /chat/traces` 不再新增行，见 8.6） |
+| `CHAT_AUTO_APPROVE_MAX_ROUNDS` | 可选 | 10 | 非流式 `POST /chat` 自动批准工具中断的最大轮数（见 8.1） |
+| `SESSION_NAMING_ENABLED` | 可选 | true | 首轮后会话自动起名（LLM 失败静默回退占位名，见 8.1） |
 
-内置限流默认值（`config.py`）：`chat=30/min`、`chat_stream=20/min`、`messages=50/min`、
+内置限流默认值（`config.py`）：`chat=30/min`、`chat_stream=20/min`、`messages=50/min`、`rebuild=5/min`、
 `register=10/hour`、`login=20/min`、`subagent/skill/agent_app/sessions/mcp_server/provider/model_config/tools_catalog=60/min`、
 `subagent_test=5/min`、`skill_generate=5/min`。均可用同名大写环境变量覆盖，如
 `RATE_LIMIT_CHAT`、`RATE_LIMIT_SUBAGENT_TEST` 等。
@@ -128,6 +131,7 @@ RATE_LIMIT_DEFAULT="10000 per day,5000 per hour"
 RATE_LIMIT_CHAT="100 per minute"
 RATE_LIMIT_CHAT_STREAM="100 per minute"
 RATE_LIMIT_MESSAGES="200 per minute"
+RATE_LIMIT_REBUILD="100 per minute"
 RATE_LIMIT_LOGIN="100 per minute"
 RATE_LIMIT_SUBAGENT_TEST="20 per minute"
 RATE_LIMIT_SKILL_GENERATE="20 per minute"
@@ -1340,8 +1344,11 @@ curl -s "$BASE/messages" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SI
 ### 8.5 灾难重建（POST /rebuild）
 
 ```bash
-# 模拟 L1 checkpoint 丢失：删线程 checkpoint 后重建
-# （手动模拟可直接清空 PG 中 checkpoints 表对应 thread，或删 data/ 下 checkpoint 存储）
+# 模拟 L1 checkpoint 丢失：删线程 checkpoint 后重建（checkpoint 存 PG 表，不在 data/ 文件系统）
+# docker exec -it <db容器> psql -U myuser -d mydb -c \
+#   "DELETE FROM checkpoints WHERE thread_id='<SID>'; \
+#    DELETE FROM checkpoint_blobs WHERE thread_id='<SID>'; \
+#    DELETE FROM checkpoint_writes WHERE thread_id='<SID>';"
 curl -s -X POST "$BASE/rebuild" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SID"
 # → {"rebuilt_messages": N, "skipped_tool_calls": M, "l2_source_lines": L}
 ```
