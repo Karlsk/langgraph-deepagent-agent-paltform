@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -308,3 +309,63 @@ def test_astream_interrupt_tail_chunk_is_typed_projection(
     assert tail.type == "interrupt"
     assert tail.source == "system"
     assert json.loads(tail.content) == {"action_requests": [{"tool": "echo", "args": {"text": "hi"}}]}
+
+
+# ---------------------------------------------------------------------------
+# B3 — ainvoke/astream extra_callbacks (§7.2)
+# ---------------------------------------------------------------------------
+
+
+class RecordingHandler(BaseCallbackHandler):
+    """Callback handler recording chat-model lifecycle events."""
+
+    def __init__(self) -> None:
+        """Initialise the event log."""
+        self.events: list[str] = []
+
+    def on_chat_model_start(self, serialized: dict[str, Any], messages: list[Any], **kwargs: Any) -> None:
+        """Record the model start event."""
+        self.events.append("model_start")
+
+
+def test_ainvoke_accepts_extra_callbacks(mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """extra_callbacks ride along the invoke config and receive model events."""
+    handler = RecordingHandler()
+    model = ScriptedChatModel(responses=[AIMessage(content="ok")])
+    rt = _compile_runtime(model, _make_app(), monkeypatch)
+
+    asyncio.run(
+        rt.ainvoke(
+            [Message(role="user", content="hi")],
+            session_id="s-cb-invoke",
+            user_id="u1",
+            username="ann",
+            extra_callbacks=[handler],
+        )
+    )
+
+    assert handler.events, "callback handler must observe the model call"
+
+
+def test_astream_accepts_extra_callbacks(mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """extra_callbacks ride along the stream config and receive model events."""
+    handler = RecordingHandler()
+    model = ScriptedChatModel(responses=[AIMessage(content="ok")])
+    rt = _compile_runtime(model, _make_app(), monkeypatch)
+
+    async def collect() -> list[Any]:
+        chunks: list[Any] = []
+        async for chunk in rt.astream(
+            [Message(role="user", content="hi")],
+            session_id="s-cb-stream",
+            user_id="u1",
+            username="ann",
+            extra_callbacks=[handler],
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect())
+
+    assert chunks
+    assert handler.events, "callback handler must observe the model call"

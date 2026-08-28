@@ -212,9 +212,26 @@ class AgentAppRuntime(ABC):
     # without dedup every post-compression turn would recount.
     _compression_seen: dict[str, tuple]
 
-    def _build_config(self, session_id: str, user_id: Optional[str], username: Optional[str]) -> RunnableConfig:
-        """Build the RunnableConfig used for every graph operation."""
+    def _build_config(
+        self,
+        session_id: str,
+        user_id: Optional[str],
+        username: Optional[str],
+        extra_callbacks: Optional[Sequence[BaseCallbackHandler]] = None,
+    ) -> RunnableConfig:
+        """Build the RunnableConfig used for every graph operation.
+
+        Args:
+            session_id: Chat session id (checkpoint thread_id).
+            user_id: Calling user id (tracing metadata).
+            username: Display name of the calling user.
+            extra_callbacks: Caller-supplied handlers appended after the
+                Langfuse handler (spec-g4-chat §7.2 — chat rounds pass a
+                ``RunTracer`` here; the Langfuse wiring is untouched).
+        """
         callbacks: list[BaseCallbackHandler] = [langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []
+        if extra_callbacks:
+            callbacks.extend(extra_callbacks)
         return {
             "configurable": {"thread_id": session_id},
             "callbacks": callbacks,
@@ -438,6 +455,7 @@ class AgentAppRuntime(ABC):
         session_id: str,
         user_id: Optional[str] = None,
         username: Optional[str] = None,
+        extra_callbacks: Optional[Sequence[BaseCallbackHandler]] = None,
     ) -> list[Message]:
         """Run one turn and return the assistant reply (or the interrupt text).
 
@@ -447,12 +465,14 @@ class AgentAppRuntime(ABC):
             session_id: Chat session id used as the checkpoint thread_id.
             user_id: Calling user id (memory partition + tracing metadata).
             username: Display name of the calling user.
+            extra_callbacks: Optional handlers appended to the config
+                callbacks (spec-g4-chat §7.2, e.g. a chat-round RunTracer).
 
         Returns:
             The response messages; an interrupted run returns a single
             assistant Message carrying the interrupt value.
         """
-        config = self._build_config(session_id, user_id, username)
+        config = self._build_config(session_id, user_id, username, extra_callbacks)
         try:
             graph_input = await self._prepare_input(messages, config)
             started = time.perf_counter()
@@ -484,6 +504,7 @@ class AgentAppRuntime(ABC):
         session_id: str,
         user_id: Optional[str] = None,
         username: Optional[str] = None,
+        extra_callbacks: Optional[Sequence[BaseCallbackHandler]] = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Stream one turn as StreamChunks.
 
@@ -496,11 +517,13 @@ class AgentAppRuntime(ABC):
             session_id: Chat session id used as the checkpoint thread_id.
             user_id: Calling user id (memory partition + tracing metadata).
             username: Display name of the calling user.
+            extra_callbacks: Optional handlers appended to the config
+                callbacks (spec-g4-chat §7.2, e.g. a chat-round RunTracer).
 
         Yields:
             StreamChunk objects in arrival order.
         """
-        config = self._build_config(session_id, user_id, username)
+        config = self._build_config(session_id, user_id, username, extra_callbacks)
 
         async def _generate() -> AsyncGenerator[StreamChunk, None]:
             started = time.perf_counter()
