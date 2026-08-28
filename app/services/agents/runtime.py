@@ -106,6 +106,7 @@ async def _append_context_rows(path: Path, user_content: str, assistant_content:
     if rows:
         await context_store.append_rows(path, rows)
 
+
 # Strong references to fire-and-forget memory write-back tasks (prevents GC
 # before completion); done callbacks remove entries and log failures.
 _pending_tasks: set[asyncio.Task[Any]] = set()
@@ -121,13 +122,52 @@ class StreamChunk:
     """One streamed content fragment with its origin.
 
     Attributes:
-        content: Text fragment produced by the graph.
+        content: Text fragment produced by the graph (message body, tool
+            output, interrupt projection JSON or summary text).
         source: Origin tag — a subagent name, ``"coordinator"`` for the main
             agent, or ``"system"`` for runtime-generated chunks (interrupts).
+        type: Frame kind (spec-g4-chat §4.1): ``message`` (default) |
+            ``tool_call`` | ``interrupt`` | ``summary``.
+        name: Tool name for ``tool_call`` chunks.
     """
 
     content: str
     source: Optional[str] = None
+    type: str = "message"
+    name: Optional[str] = None
+
+
+def project_interrupt(value: Any) -> Optional[dict[str, Any]]:
+    """Project a raw HITL interrupt value onto the stable G4 contract.
+
+    The langchain ``HumanInTheLoopMiddleware`` interrupt value carries
+    ``action_requests`` items keyed ``name``/``args`` (plus internal fields
+    like ``description`` and a sibling ``review_configs`` list). The G4
+    contract (spec-g4-chat §4.2) keeps only ``tool`` + ``args`` per item so
+    the frontend approval UI never depends on middleware internals.
+
+    Args:
+        value: Raw interrupt value from the checkpoint state.
+
+    Returns:
+        ``{"action_requests": [{"tool": ..., "args": ...}, ...]}`` or None
+        when the value cannot be projected (non-dict, no usable list).
+    """
+    if not isinstance(value, dict):
+        return None
+    requests = value.get("action_requests")
+    if not isinstance(requests, list) or not requests:
+        return None
+    projected: list[dict[str, Any]] = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        tool = item.get("name") or item.get("tool")
+        if not tool:
+            continue
+        args = item.get("args")
+        projected.append({"tool": str(tool), "args": args if isinstance(args, dict) else {}})
+    return {"action_requests": projected} if projected else None
 
 
 def _first_interrupt_value(state: StateSnapshot, default: Any = None) -> Any:
@@ -318,9 +358,7 @@ class AgentAppRuntime(ABC):
             )
             return
 
-        user_message = next(
-            (message for message in reversed(list(messages)) if message.role == "user"), None
-        )
+        user_message = next((message for message in reversed(list(messages)) if message.role == "user"), None)
         assistant_text = next(
             (
                 extract_text_content(message.content)
@@ -426,9 +464,7 @@ class AgentAppRuntime(ABC):
 
             response_messages = cast(list[BaseMessage], response["messages"])
             self._fire_memory_add(response_messages, user_id, config)
-            self._fire_context_record(
-                messages, response_messages, session_id=session_id, user_id=user_id
-            )
+            self._fire_context_record(messages, response_messages, session_id=session_id, user_id=user_id)
             self._observe_compression(response, session_id=session_id)
             return self._process_messages(response_messages)
         except GraphInterrupt:
@@ -482,9 +518,7 @@ class AgentAppRuntime(ABC):
                 if state.values and "messages" in state.values:
                     final_messages = cast(list[BaseMessage], state.values["messages"])
                     self._fire_memory_add(final_messages, user_id, config)
-                    self._fire_context_record(
-                        messages, final_messages, session_id=session_id, user_id=user_id
-                    )
+                    self._fire_context_record(messages, final_messages, session_id=session_id, user_id=user_id)
                 self._observe_compression(state.values, session_id=session_id)
             except GraphInterrupt:
                 llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
@@ -518,6 +552,22 @@ class AgentAppRuntime(ABC):
         """
         await self._clear(session_id)
         logger.info("agent_app_history_cleared", session_id=session_id)
+
+    async def get_pending_interrupt(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Probe a thread for a paused interrupt (spec-g4-chat §4.4).
+
+        Args:
+            session_id: Chat session id (checkpoint thread_id).
+
+        Returns:
+            The §4.2 projection when the thread is paused on a HITL
+            interrupt, else None (live/unknown threads).
+        """
+        config: RunnableConfig = {"configurable": {"thread_id": session_id}}
+        state = await self._get_state(config)
+        if not state.next:
+            return None
+        return project_interrupt(_first_interrupt_value(state))
 
 
 # ---------------------------------------------------------------------------
@@ -1007,5 +1057,7 @@ async def get_runtime(session: Session, app_id: int, *, user_id: int) -> AgentAp
     # the cache keeps one runtime per user per app.
     for stale_key in [key for key in _runtime_cache if key[0] == app_id and key[1] == user_id and key != cache_key]:
         del _runtime_cache[stale_key]
-    logger.info("agent_app_runtime_ready", app_name=app_cfg.name, app_id=app_cfg.id, user_id=user_id, engine=app_cfg.engine)
+    logger.info(
+        "agent_app_runtime_ready", app_name=app_cfg.name, app_id=app_cfg.id, user_id=user_id, engine=app_cfg.engine
+    )
     return runtime_obj
