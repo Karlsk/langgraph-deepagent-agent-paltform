@@ -154,6 +154,7 @@ class _FakeRuntime:
         astream_error: Exception | None = None,
         astream_delay: float = 0.0,
         invoke_error: Exception | None = None,
+        history: list[Message] | None = None,
     ) -> None:
         self.replies = replies or [[Message(role="assistant", content="ok")]]
         self.pending_after = pending_after or [None]
@@ -161,9 +162,13 @@ class _FakeRuntime:
         self.astream_error = astream_error
         self.astream_delay = astream_delay
         self.invoke_error = invoke_error
+        self.history = history or []
         self.ainvoke_calls: list[list[Message]] = []
         self.astream_calls: list[list[Message]] = []
         self.rebuild_calls: list[tuple[str, list[Any]]] = []
+
+    async def get_chat_history(self, session_id: str) -> list[Message]:
+        return list(self.history)
 
     async def ainvoke(
         self,
@@ -257,8 +262,22 @@ def _collect(frames: list[str]) -> list[str]:
 async def test_chat_single_turn_success(
     db: DBSession, session_row: SessionRow, naming_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plain turn: reply passthrough, trace row landed, naming hook fired."""
-    _install_runtime(monkeypatch, _FakeRuntime(replies=[[Message(role="assistant", content="你好")]]))
+    """Plain turn: assistant-only reply projection, trace row landed, naming hook fired.
+
+    The real runtime returns the FULL turn messages (user echo + assistant
+    segments); ``ChatResponse.messages`` carries assistant replies only (§4.5).
+    """
+    _install_runtime(
+        monkeypatch,
+        _FakeRuntime(
+            replies=[
+                [
+                    Message(role="user", content="hi"),
+                    Message(role="assistant", content="你好"),
+                ]
+            ]
+        ),
+    )
 
     result = await chat_service.chat(db, session_row, [Message(role="user", content="hi")], user_id="7", username="u7")
 
@@ -283,6 +302,35 @@ async def test_chat_single_turn_success(
 
 
 @_sync
+async def test_chat_drops_prior_turn_history_in_reply(
+    db: DBSession, session_row: SessionRow, naming_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multi-turn replies keep only this turn's new assistant messages.
+
+    ainvoke carries the FULL thread projection (prior turns included);
+    ``ChatResponse.messages`` keeps only THIS turn's new assistant replies
+    (§4.5) so the frontend never double-renders history.
+    """
+    prior = [
+        Message(role="user", content="q1"),
+        Message(role="assistant", content="r1"),
+    ]
+    _install_runtime(
+        monkeypatch,
+        _FakeRuntime(
+            history=prior,
+            replies=[[*prior, Message(role="user", content="q2"), Message(role="assistant", content="r2")]],
+        ),
+    )
+
+    result = await chat_service.chat(
+        db, session_row, [Message(role="user", content="q2")], user_id="7", username="u7"
+    )
+
+    assert [m.content for m in result.messages] == ["r2"]
+
+
+@_sync
 async def test_chat_auto_approve_resumes_until_complete(
     db: DBSession, session_row: SessionRow, naming_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -292,7 +340,10 @@ async def test_chat_auto_approve_resumes_until_complete(
         _FakeRuntime(
             replies=[
                 [Message(role="assistant", content="需要写文件")],
-                [Message(role="assistant", content="文件已写入")],
+                [
+                    Message(role="user", content='{"decisions": ...}'),
+                    Message(role="assistant", content="文件已写入"),
+                ],
             ],
             pending_after=[_interrupt_projection(), None],
         ),

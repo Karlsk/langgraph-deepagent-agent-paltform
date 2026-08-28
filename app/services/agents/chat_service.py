@@ -174,6 +174,28 @@ def _finish_round_trace(
 # ---------------------------------------------------------------------------
 
 
+def _new_assistant(reply: list[Message], pre_history: list[Message]) -> list[Message]:
+    """Project THIS turn's new assistant replies from the full thread reply.
+
+    ``ainvoke`` returns the whole projected thread (prior turns included,
+    §4.5); the prefix aligned with the turn-start history is dropped so the
+    frontend never double-renders earlier turns. A mid-turn compression
+    rewrites the projection (history collapses into a summary message) so the
+    prefix no longer matches — degrade to the trailing assistant reply,
+    which after compression is exactly the turn's final answer.
+
+    Args:
+        reply: Full projected thread returned by ``ainvoke``.
+        pre_history: Projected thread history captured before the invoke.
+
+    Returns:
+        The assistant Messages produced during this turn.
+    """
+    if reply[: len(pre_history)] == pre_history:
+        return [m for m in reply[len(pre_history) :] if m.role == "assistant"]
+    return [m for m in reply if m.role == "assistant"][-1:]
+
+
 async def chat(
     db: DBSession,
     target: Session,
@@ -206,6 +228,7 @@ async def chat(
     accumulated: list[Message] = []
     interrupt: Optional[InterruptPayload] = None
     try:
+        pre_history = await rt.get_chat_history(target.id)
         reply = await rt.ainvoke(
             messages,
             session_id=target.id,
@@ -215,7 +238,7 @@ async def chat(
         )
         pending = await rt.get_pending_interrupt(target.id)
         if pending is None:
-            accumulated.extend(reply)
+            accumulated.extend(_new_assistant(reply, pre_history))
         rounds = 0
         while pending is not None:
             rounds += 1
@@ -229,6 +252,7 @@ async def chat(
                 break
             decisions = [{"type": "approve"} for _ in pending.get("action_requests", [])]
             resume = Message(role="user", content=json.dumps({"decisions": decisions}))
+            pre_history = await rt.get_chat_history(target.id)
             reply = await rt.ainvoke(
                 [resume],
                 session_id=target.id,
@@ -238,7 +262,7 @@ async def chat(
             )
             pending = await rt.get_pending_interrupt(target.id)
             if pending is None:
-                accumulated.extend(reply)
+                accumulated.extend(_new_assistant(reply, pre_history))
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         _finish_round_trace(
