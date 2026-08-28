@@ -110,6 +110,20 @@ def _normalize_tool_output(output: Any) -> str:
     return _truncate(str(output))
 
 
+def _agent_from_metadata(metadata: dict[str, Any] | None) -> str:
+    """Extract the owning agent name from callback metadata (§7.2).
+
+    deepagents stamps the subagent config name as ``lc_agent_name`` in the
+    run metadata (spec-g4-chat 议题 5 验证); coordinator runs carry no such
+    key, so the fallback distinguishes main-agent from subagent events.
+    """
+    if isinstance(metadata, dict):
+        name = metadata.get("lc_agent_name")
+        if name:
+            return str(name)
+    return "coordinator"
+
+
 class RunTracer(BaseCallbackHandler):
     """In-memory collector of the structured trace event stream.
 
@@ -171,7 +185,9 @@ class RunTracer(BaseCallbackHandler):
     ) -> None:
         """Record one LLM request: the full input message list and model id."""
         flattened = [_serialize_message(message) for batch in messages for message in batch]
-        self._pending[run_id] = self._start_event("llm_call", model=self.model_name, input_messages=flattened)
+        self._pending[run_id] = self._start_event(
+            "llm_call", model=self.model_name, input_messages=flattened, agent=_agent_from_metadata(metadata)
+        )
 
     @override
     def on_llm_end(
@@ -239,7 +255,10 @@ class RunTracer(BaseCallbackHandler):
         """Record one tool invocation start: tool name and input arguments."""
         tool_name = str(serialized.get("name") or kwargs.get("name") or "unknown")
         self._pending[run_id] = self._start_event(
-            "tool_call", tool=tool_name, arguments=_normalize_tool_arguments(inputs, input_str)
+            "tool_call",
+            tool=tool_name,
+            arguments=_normalize_tool_arguments(inputs, input_str),
+            agent=_agent_from_metadata(metadata),
         )
 
     @override

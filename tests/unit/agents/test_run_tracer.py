@@ -227,3 +227,45 @@ def test_orphan_end_events_are_ignored() -> None:
     tracer.on_tool_end("x", run_id=_run_id())
     tracer.on_tool_error(RuntimeError("x"), run_id=_run_id())
     assert tracer.events == []
+
+
+# ---------------------------------------------------------------------------
+# G4 §7.2 — agent field on llm_call / tool_call events
+# ---------------------------------------------------------------------------
+
+
+def test_llm_call_event_carries_agent_from_metadata() -> None:
+    """llm_call events tag the subagent via metadata lc_agent_name (§7.2)."""
+    tracer = RunTracer(model_name="m")
+    tracer.on_chat_model_start(
+        {},
+        [[HumanMessage(content="go")]],
+        run_id=_run_id(),
+        metadata={"lc_agent_name": "researcher"},
+    )
+    assert tracer.events[0]["agent"] == "researcher"
+
+
+def test_tool_call_event_carries_agent_from_metadata() -> None:
+    """tool_call events tag the subagent via metadata lc_agent_name (§7.2)."""
+    tracer = RunTracer(model_name="m")
+    tracer.on_tool_start(
+        {"name": "echo"},
+        '{"text": "hi"}',
+        run_id=_run_id(),
+        metadata={"lc_agent_name": "researcher"},
+    )
+    assert tracer.events[0]["agent"] == "researcher"
+
+
+def test_agent_defaults_to_coordinator_without_metadata() -> None:
+    """Missing/empty lc_agent_name falls back to coordinator (main agent)."""
+    tracer = RunTracer(model_name="m")
+    tracer.on_chat_model_start({}, [[HumanMessage(content="go")]], run_id=_run_id())
+    tracer.on_tool_start(
+        {"name": "echo"},
+        "x",
+        run_id=_run_id(),
+        metadata={"lc_agent_name": ""},
+    )
+    assert [event["agent"] for event in tracer.events] == ["coordinator", "coordinator"]
