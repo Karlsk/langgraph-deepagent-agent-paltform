@@ -31,9 +31,11 @@ vi.mock('@/utils/sse', () => ({
 
 const fetchMessagesMock = vi.fn()
 const rebuildSessionMock = vi.fn()
+const fetchChatTracesMock = vi.fn()
 vi.mock('@/api/chat', () => ({
   fetchMessages: (...args: unknown[]) => fetchMessagesMock(...args),
   rebuildSession: (...args: unknown[]) => rebuildSessionMock(...args),
+  fetchChatTraces: (...args: unknown[]) => fetchChatTracesMock(...args),
 }))
 
 const pushMock = vi.fn()
@@ -82,10 +84,30 @@ const ElButtonStub = defineComponent({
   },
 })
 
+const ElDrawerStub = defineComponent({
+  name: 'ElDrawer',
+  props: { modelValue: Boolean, title: String },
+  setup(props, { slots }) {
+    return () =>
+      props.modelValue
+        ? h('div', { class: 'el-drawer-stub' }, slots.default?.())
+        : null
+  },
+})
+
+const ElTagStub = defineComponent({
+  name: 'ElTag',
+  props: { type: String, size: String },
+  setup(props, { slots }) {
+    return () =>
+      h('span', { class: 'el-tag-stub', 'data-type': props.type ?? '' }, slots.default?.())
+  },
+})
+
 function mountView() {
   return mount(ChatSessionView, {
     global: {
-      stubs: { ElButton: ElButtonStub },
+      stubs: { ElButton: ElButtonStub, ElDrawer: ElDrawerStub, ElTag: ElTagStub },
     },
   })
 }
@@ -109,6 +131,7 @@ beforeEach(() => {
   sseFetchMock.mockImplementation(async () => {})
   elMessageBoxMock.confirm.mockReset()
   elMessageBoxMock.confirm.mockResolvedValue(undefined)
+  fetchChatTracesMock.mockResolvedValue([])
   fetchMessagesMock.mockResolvedValue({
     messages: [
       { type: 'message', seq: 1, ts: 't1', role: 'user', content: '你好' },
@@ -252,5 +275,17 @@ describe('ChatSessionView', () => {
       expect.objectContaining({ type: 'success', message: '已重建会话状态' }),
     )
     expect(fetchMessagesMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('顶栏「运行轨迹」打开抽屉并拉取 traces', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    expect(fetchChatTracesMock).not.toHaveBeenCalled()
+
+    await findButton(wrapper, '运行轨迹').trigger('click')
+    await flushPromises()
+
+    expect(fetchChatTracesMock).toHaveBeenCalledWith('s-1')
+    expect(wrapper.find('.el-drawer-stub').exists()).toBe(true)
   })
 })

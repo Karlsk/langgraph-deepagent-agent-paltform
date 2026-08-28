@@ -19,6 +19,7 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useChatStream } from '@/composables/useChatStream'
 import ChatHilCard from '@/views/chat/ChatHilCard.vue'
 import ChatMessageList from '@/views/chat/ChatMessageList.vue'
+import ChatTraceDrawer from '@/views/chat/ChatTraceDrawer.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -88,6 +89,12 @@ onMounted(() => {
 onUnmounted(() => {
   stop()
 })
+
+// ---------------------------------------------------------------------------
+// 运行轨迹抽屉（§9.4）
+// ---------------------------------------------------------------------------
+
+const traceDrawerVisible = ref(false)
 </script>
 
 <template>
@@ -101,6 +108,7 @@ onUnmounted(() => {
       </div>
       <div class="page-view__actions">
         <el-button @click="router.push({ name: 'chat' })">返回列表</el-button>
+        <el-button @click="traceDrawerVisible = true">运行轨迹</el-button>
         <el-button @click="handleRebuild">重建会话</el-button>
       </div>
     </header>
@@ -141,6 +149,8 @@ onUnmounted(() => {
         </el-button>
       </div>
     </section>
+
+    <ChatTraceDrawer v-model="traceDrawerVisible" :session-id="sessionId" />
   </div>
 </template>
 
