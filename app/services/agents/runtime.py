@@ -188,6 +188,33 @@ def _first_interrupt_value(state: StateSnapshot, default: Any = None) -> Any:
     return default
 
 
+def _compression_fingerprint(state_values: Optional[Mapping[str, Any]]) -> Optional[tuple[Any, ...]]:
+    """Fingerprint the latest ``_summarization_event`` in state values.
+
+    ``SummarizationMiddleware`` records its latest compression event under
+    the private ``_summarization_event`` state key where it persists across
+    turns; the (cutoff_index, summary text, file_path) tuple identifies a
+    distinct event.
+
+    Args:
+        state_values: Raw state values mapping (may be None / non-mapping).
+
+    Returns:
+        The fingerprint tuple, or None when no event is present.
+    """
+    if not isinstance(state_values, Mapping):
+        return None
+    event = state_values.get("_summarization_event")
+    if not isinstance(event, dict):
+        return None
+    summary_message = event.get("summary_message")
+    return (
+        event.get("cutoff_index"),
+        str(getattr(summary_message, "content", summary_message))[:128],
+        event.get("file_path"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Abstract base runtime (template methods for cross-cutting semantics)
 # ---------------------------------------------------------------------------
@@ -419,13 +446,8 @@ class AgentAppRuntime(ABC):
         event = state_values.get("_summarization_event")
         if not isinstance(event, dict):
             return
-        summary_message = event.get("summary_message")
-        fingerprint = (
-            event.get("cutoff_index"),
-            str(getattr(summary_message, "content", summary_message))[:128],
-            event.get("file_path"),
-        )
-        if self._compression_seen.get(session_id) == fingerprint:
+        fingerprint = _compression_fingerprint(state_values)
+        if fingerprint is None or self._compression_seen.get(session_id) == fingerprint:
             return
         self._compression_seen[session_id] = fingerprint
         logger.info(
@@ -528,6 +550,8 @@ class AgentAppRuntime(ABC):
         async def _generate() -> AsyncGenerator[StreamChunk, None]:
             started = time.perf_counter()
             try:
+                before_state = await self._get_state(config)
+                before_fingerprint = _compression_fingerprint(before_state.values)
                 graph_input = await self._prepare_input(messages, config)
                 async for chunk in self._stream(graph_input, config):
                     yield chunk
@@ -544,6 +568,9 @@ class AgentAppRuntime(ABC):
                     yield self._interrupt_tail_chunk(interrupt_value)
                     return
 
+                after_fingerprint = _compression_fingerprint(state.values)
+                if after_fingerprint is not None and after_fingerprint != before_fingerprint:
+                    yield self._summary_chunk(state.values)
                 if state.values and "messages" in state.values:
                     final_messages = cast(list[BaseMessage], state.values["messages"])
                     self._fire_memory_add(final_messages, user_id, config)
@@ -578,6 +605,25 @@ class AgentAppRuntime(ABC):
         projection = project_interrupt(interrupt_value)
         payload = json.dumps(projection) if projection is not None else str(interrupt_value)
         return StreamChunk(content=payload, source="system", type="interrupt")
+
+    def _summary_chunk(self, state_values: Mapping[str, Any]) -> StreamChunk:
+        """Build the typed summary chunk (spec-g4-chat §4.1).
+
+        Emitted only when the turn-end ``_summarization_event`` fingerprint
+        differs from the turn-start one, i.e. the compression happened during
+        THIS turn; the payload is the summary text (same source as the L2
+        summary row).
+
+        Args:
+            state_values: Final state values carrying the event.
+
+        Returns:
+            A ``type="summary"`` / ``source="system"`` StreamChunk.
+        """
+        event = state_values.get("_summarization_event")
+        summary_message = event.get("summary_message") if isinstance(event, dict) else None
+        text = str(getattr(summary_message, "content", summary_message) or "")
+        return StreamChunk(content=text, source="system", type="summary")
 
     async def get_chat_history(self, session_id: str) -> list[Message]:
         """Return the user/assistant history of one thread.

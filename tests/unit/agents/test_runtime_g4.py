@@ -14,7 +14,7 @@ import json
 import uuid
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, override
 
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
@@ -23,6 +23,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import StateSnapshot
 
 from app.core.config import settings
 from app.models.agent_assets import AgentApp
@@ -369,3 +370,121 @@ def test_astream_accepts_extra_callbacks(mock_memory: dict[str, Any], monkeypatc
 
     assert chunks
     assert handler.events, "callback handler must observe the model call"
+
+
+# ---------------------------------------------------------------------------
+# B4 — turn-end summary detection (§4.1 summary frame, §4.3 compression)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(values: dict[str, Any]) -> StateSnapshot:
+    """Build an empty-progress snapshot carrying the given state values."""
+    return StateSnapshot(
+        values=values,
+        next=(),
+        config={"configurable": {"thread_id": "s"}},
+        tasks=(),
+        interrupts=(),
+        metadata=None,
+        created_at=None,
+        parent_config=None,
+    )
+
+
+class _ScriptedStateRuntime(runtime.AgentAppRuntime):
+    """Template-level runtime replaying scripted state snapshots.
+
+    ``_get_state`` pops snapshots in order and keeps serving the last one —
+    this exercises the ``astream`` template logic (summary detection, hook
+    wiring) without compiling a real graph.
+    """
+
+    def __init__(self, snapshots: list[StateSnapshot]) -> None:
+        """Store the scripted snapshot sequence."""
+        self.snapshots = list(snapshots)
+        self.app_id: Optional[int] = None
+        self._compression_seen: dict[str, tuple] = {}
+
+    @override
+    async def _get_state(self, config: Any) -> StateSnapshot:
+        """Serve the next scripted snapshot (last one repeats)."""
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+    @override
+    async def _run(self, graph_input: Any, config: Any) -> dict[str, Any]:
+        """Unused by astream; return an empty final state."""
+        return {}
+
+    @override
+    async def _stream(self, graph_input: Any, config: Any) -> Any:
+        """Yield one plain message chunk."""
+        yield runtime.StreamChunk(content="reply", source="coordinator")
+
+    @override
+    async def _history(self, config: Any) -> list[BaseMessage]:
+        """No history for scripted runtimes."""
+        return []
+
+    @override
+    async def _clear(self, session_id: str) -> None:
+        """No checkpoints to clear."""
+        return None
+
+
+def _summary_event_state(text: str = "Summary of earlier turns") -> dict[str, Any]:
+    """State values carrying a fresh _summarization_event."""
+    return {
+        "messages": [],
+        "_summarization_event": {
+            "cutoff_index": 4,
+            "summary_message": type("S", (), {"content": text})(),
+            "file_path": "data/summaries/x.json",
+        },
+    }
+
+
+def _collect_from(rt: Any) -> list[Any]:
+    """Drain one scripted astream turn synchronously."""
+
+    async def collect() -> list[Any]:
+        chunks: list[Any] = []
+        async for chunk in rt.astream(
+            [Message(role="user", content="hi")], session_id="s-summary", user_id=None, username=None
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    return asyncio.run(collect())
+
+
+def test_astream_emits_summary_chunk_when_compression_occurred() -> None:
+    """A fresh turn-end _summarization_event yields a typed summary chunk."""
+    rt = _ScriptedStateRuntime(
+        [
+            _snapshot({"messages": []}),  # turn-start probe (no event yet)
+            _snapshot({"messages": []}),  # _prepare_input resume check
+            _snapshot(_summary_event_state()),  # turn end: compression happened
+        ]
+    )
+
+    chunks = _collect_from(rt)
+
+    summary_frames = [chunk for chunk in chunks if chunk.type == "summary"]
+    assert len(summary_frames) == 1
+    assert summary_frames[0].source == "system"
+    assert summary_frames[0].content == "Summary of earlier turns"
+    # Summary rides after the message chunk, before caller-added done frames.
+    assert chunks[-1].type == "summary"
+
+
+def test_astream_skips_summary_chunk_without_new_compression() -> None:
+    """No event, or an unchanged fingerprint, emits no summary chunk."""
+    same_state = _summary_event_state("Stable summary")
+    no_event = _ScriptedStateRuntime([_snapshot({"messages": []})] * 3)
+    unchanged = _ScriptedStateRuntime([_snapshot(same_state)] * 3)
+
+    for rt in (no_event, unchanged):
+        chunks = _collect_from(rt)
+        assert not [chunk for chunk in chunks if chunk.type == "summary"]
