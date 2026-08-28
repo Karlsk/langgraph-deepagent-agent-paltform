@@ -30,3 +30,92 @@ export interface PageResult<T> {
   page: number
   pageSize: number
 }
+
+// ---------------------------------------------------------------------------
+// Chat 交互域镜像类型（G4 spec-g4-chat §9.6，与 app/schemas/chat.py 对齐）
+// ---------------------------------------------------------------------------
+
+/** 聊天消息（对应后端 Message；SSE 审批复用消息通道） */
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system'
+  content: string
+}
+
+/** interrupt 投影中的单个待审批动作（§4.2 稳定契约：仅 tool + args） */
+export interface ActionRequest {
+  tool: string
+  args: Record<string, unknown>
+}
+
+/** interrupt 投影载荷（SSE interrupt 帧与响应共用，§4.2/§4.5） */
+export interface InterruptPayload {
+  action_requests: ActionRequest[]
+}
+
+/** SSE 帧模型（对应后端 StreamEvent；单 schema 可选字段，exclude_none 序列化） */
+export interface StreamEvent {
+  type: 'message' | 'tool_call' | 'interrupt' | 'summary' | 'error' | 'done'
+  /** message 帧：正文分片；tool_call 帧：工具输出 */
+  content?: string
+  /** 来源标签：subagent 名 / coordinator / system */
+  source?: string
+  /** tool_call 帧：工具名 */
+  name?: string
+  /** interrupt 帧：待审批动作列表 */
+  action_requests?: ActionRequest[]
+  /** summary 帧：压缩摘要文本 */
+  summary_text?: string
+  /** error 帧：错误文本 */
+  message?: string
+  /** done 帧：本轮消息计数 */
+  message_count?: number
+  /** done 帧：本轮是否发生压缩 */
+  compressed?: boolean
+  /** done 帧：线程是否停在中断态 */
+  interrupted?: boolean
+}
+
+/** L2 历史行投影（GET /messages；G3 §4.1.1 行类型） */
+export interface HistoryItem {
+  type: 'message' | 'tool_call' | 'summary'
+  seq: number
+  ts: string
+  /** message 行：user | assistant */
+  role?: string | null
+  /** message / summary 行文本 */
+  content?: string | null
+  /** tool_call 行：工具名 */
+  name?: string | null
+  /** tool_call 行：结果摘要 */
+  summary?: string | null
+}
+
+/** GET /messages 响应载荷（历史 + pending 中断拉齐，§5.3/§6.1） */
+export interface MessagesResponse {
+  messages: HistoryItem[]
+  pending_interrupt: InterruptPayload | null
+}
+
+/** 非流式 POST /chat 响应载荷（§4.5；interrupt 仅超限非空） */
+export interface ChatResponseData {
+  messages: ChatMessage[]
+  interrupt: InterruptPayload | null
+}
+
+/** POST /rebuild 结果计数（§6.2） */
+export interface RebuildResult {
+  rebuilt_messages: number
+  skipped_tool_calls: number
+  l2_source_lines: number
+}
+
+/** GET /chat/traces 行投影（§7.3；events 每项含 agent 字段） */
+export interface ChatTraceItem {
+  id: number
+  status: string
+  turns: number
+  duration_seconds: number
+  error: string | null
+  created_at: string
+  events: Record<string, unknown>[]
+}
