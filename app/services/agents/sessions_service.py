@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlmodel import Session as DBSession
-from sqlmodel import col, func, select
+from sqlmodel import col, func, select, update
 
 from app.core.logging import logger
 from app.models.session import Session
@@ -111,6 +111,18 @@ async def rename_session(session: DBSession, session_id: str, new_name: str) -> 
     session.commit()
     session.refresh(row)
     return row
+
+
+async def claim_session_name(session: DBSession, session_id: str, placeholder: str) -> bool:
+    """Atomically claim an unnamed session row (G4 §8.1).
+
+    ``UPDATE ... WHERE name = ''`` in one round-trip — concurrent callers
+    race safely: exactly one receives rowcount == 1 and wins the claim.
+    """
+    stmt = update(Session).where(col(Session.id) == session_id, col(Session.name) == "").values(name=placeholder)
+    result = session.exec(stmt)
+    session.commit()
+    return (result.rowcount or 0) == 1
 
 
 async def delete_session_cascade(session: DBSession, target: Session) -> CascadeResult:
