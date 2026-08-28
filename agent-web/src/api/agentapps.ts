@@ -63,6 +63,8 @@ export interface AgentAppCreatePayload {
   model?: string | null
   skill_names?: string[]
   subagent_names?: string[]
+  /** 工具审批开关：key=工具名，value=true 表示该工具需人工审批 */
+  interrupt_on?: Record<string, boolean>
 }
 
 /**
@@ -80,6 +82,8 @@ export interface AgentAppPatchPayload {
   model?: string | null
   skill_names?: string[]
   subagent_names?: string[]
+  /** 工具审批开关：key=工具名，value=true 表示该工具需人工审批 */
+  interrupt_on?: Record<string, boolean>
 }
 
 /** 把 PageQuery 透传为后端查询参数（page/pageSize/keyword） */

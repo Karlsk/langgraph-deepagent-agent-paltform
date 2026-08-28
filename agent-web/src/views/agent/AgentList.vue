@@ -209,6 +209,8 @@ interface AgentAppFormShape {
   skill_names: string[]
   /** 绑定的子代理配置名；语义同 skill_names */
   subagent_names: string[]
+  /** 需人工审批的工具名列表（提交时转为 Record<string, boolean>） */
+  interrupt_on: string[]
 }
 
 /** WebAgentFormDialog.open() 不传 data 时为 {}，字段 optional */
@@ -243,6 +245,7 @@ function handleEdit(row: AgentAppRow): void {
     model: row.model ?? '',
     skill_names: [...row.skill_names],
     subagent_names: [...row.subagent_names],
+    interrupt_on: Object.keys(row.interrupt_on ?? {}),
   } satisfies AgentAppFormShape)
 }
 
@@ -265,6 +268,11 @@ function buildPayload(form: SubmitFormShape): {
   const systemPrompt = form.system_prompt ?? ''
   const skillNames = Array.isArray(form.skill_names) ? [...form.skill_names] : []
   const subagentNames = Array.isArray(form.subagent_names) ? [...form.subagent_names] : []
+  const interruptOnList = Array.isArray(form.interrupt_on) ? form.interrupt_on : []
+  const interruptOn: Record<string, boolean> = interruptOnList.reduce((acc, name) => {
+    acc[name] = true
+    return acc
+  }, {} as Record<string, boolean>)
 
   const create: AgentAppCreatePayload = {
     name,
@@ -273,6 +281,7 @@ function buildPayload(form: SubmitFormShape): {
     model: modelValue,
     skill_names: skillNames,
     subagent_names: subagentNames,
+    interrupt_on: interruptOn,
   }
   const patch: AgentAppPatchPayload = {
     system_prompt: systemPrompt,
@@ -280,6 +289,7 @@ function buildPayload(form: SubmitFormShape): {
     model: modelValue,
     skill_names: skillNames,
     subagent_names: subagentNames,
+    interrupt_on: interruptOn,
   }
   return { create, patch }
 }
@@ -552,6 +562,36 @@ function bindingsText(row: AgentAppRow): string {
             />
           </el-select>
         </el-form-item>
+        <el-form-item label="审批工具" prop="interrupt_on">
+          <el-select
+            v-model="form.interrupt_on"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            clearable
+            :loading="optionsLoading"
+            no-data-text="暂无可用工具（请先在 MCP 管理页启用 server 或配置 builtin）"
+            placeholder="留空表示工具直接执行无需审批"
+            style="width: 100%"
+          >
+            <el-option-group
+              v-for="group in (['builtin', 'mcp'] as const)"
+              :key="group"
+              :label="group === 'builtin' ? '内置工具' : 'MCP 工具'"
+            >
+              <el-option
+                v-for="option in toolOptions.filter((item) => item.group === group)"
+                :key="option.value"
+                :label="option.label"
+                :value="option.value"
+              />
+            </el-option-group>
+          </el-select>
+          <div class="agent-form-helptext">
+            选中的工具执行前需人工审批（HIL）；留空则所有工具自动执行。
+          </div>
+        </el-form-item>
       </template>
     </WebAgentFormDialog>
   </div>
@@ -581,6 +621,12 @@ function bindingsText(row: AgentAppRow): string {
   color: var(--color-warning-600);
   line-height: 1.4;
   margin-bottom: 12px;
+}
+.agent-form-helptext {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  line-height: 1.4;
+  margin-top: 4px;
 }
 /* el-select option 自定义渲染：左侧 ref、右侧 provider */
 .agent-model-option__ref {
