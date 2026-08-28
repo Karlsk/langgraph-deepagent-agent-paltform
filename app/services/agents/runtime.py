@@ -44,6 +44,7 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
+    ToolMessage,
     convert_to_openai_messages,
 )
 from langchain_core.runnables.config import RunnableConfig
@@ -509,12 +510,17 @@ class AgentAppRuntime(ABC):
                     yield chunk
 
                 llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
-                interrupt_value = await self._pending_interrupt_value(config)
-                if interrupt_value is not None:
-                    yield StreamChunk(content=interrupt_value, source="system")
+                state = await self._get_state(config)
+                if state.next:
+                    interrupt_value = _first_interrupt_value(state, default=_INTERRUPT_FALLBACK_TEXT)
+                    logger.info(
+                        "graph_interrupted",
+                        session_id=config.get("configurable", {}).get("thread_id"),
+                        interrupt_value=str(interrupt_value),
+                    )
+                    yield self._interrupt_tail_chunk(interrupt_value)
                     return
 
-                state = await self._get_state(config)
                 if state.values and "messages" in state.values:
                     final_messages = cast(list[BaseMessage], state.values["messages"])
                     self._fire_memory_add(final_messages, user_id, config)
@@ -525,12 +531,30 @@ class AgentAppRuntime(ABC):
                 state = await self._get_state(config)
                 interrupt_value = _first_interrupt_value(state, default=_INTERRUPT_FALLBACK_TEXT)
                 logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
-                yield StreamChunk(content=str(interrupt_value), source="system")
+                yield self._interrupt_tail_chunk(interrupt_value)
             except Exception as e:
                 logger.exception("agent_app_stream_failed", error=str(e), session_id=session_id)
                 raise
 
         return _generate()
+
+    def _interrupt_tail_chunk(self, interrupt_value: Any) -> StreamChunk:
+        """Build the typed interrupt tail chunk (spec-g4-chat §4.1).
+
+        The payload is the §4.2 projection serialised to JSON, fixing the
+        pre-G4 ``str()`` defect where the raw middleware dict (with internal
+        fields) leaked into the stream; unprojectable values keep the plain
+        text form so the frontend still sees a non-empty frame.
+
+        Args:
+            interrupt_value: Raw interrupt value from the checkpoint.
+
+        Returns:
+            A ``type="interrupt"`` / ``source="system"`` StreamChunk.
+        """
+        projection = project_interrupt(interrupt_value)
+        payload = json.dumps(projection) if projection is not None else str(interrupt_value)
+        return StreamChunk(content=payload, source="system", type="interrupt")
 
     async def get_chat_history(self, session_id: str) -> list[Message]:
         """Return the user/assistant history of one thread.
@@ -646,19 +670,28 @@ class DeepAgentsAppRuntime(AgentAppRuntime):
 
     @override
     async def _stream(self, graph_input: Any, config: RunnableConfig) -> AsyncGenerator[StreamChunk, None]:
-        """Yield message-mode chunks tagged with their source agent.
+        """Yield message/tool_call chunks tagged with their source agent.
 
         Uses ``astream(stream_mode="messages", subgraphs=True)``: chunk shape
         is ``(namespace, (message, metadata))``; ``metadata["lc_agent_name"]``
         carries the subagent config name, empty namespace means coordinator.
-        While streaming, per-subagent first/last chunk timestamps are tracked
-        and observed on ``subagent_task_duration_seconds`` once the stream
-        ends (coordinator/system/empty sources are never timed).
+        AIMessages stream as ``message`` chunks; ToolMessages surface as
+        ``tool_call`` chunks (name + output text, spec-g4-chat §4.1) so the
+        frontend can render collapsible tool panels. While streaming,
+        per-subagent first/last chunk timestamps are tracked and observed
+        on ``subagent_task_duration_seconds`` once the stream ends
+        (coordinator/system/empty sources are never timed).
         """
         timings: dict[str, tuple[float, float]] = {}
         async for chunk in self._graph.astream(graph_input, config, stream_mode="messages", subgraphs=True):
             namespace, payload = chunk
             message, metadata = cast(tuple[BaseMessage, dict[str, Any]], payload)
+            if isinstance(message, ToolMessage):
+                text = extract_text_content(message.content)
+                if text and message.name:
+                    source = str(metadata.get("lc_agent_name")) if namespace else "coordinator"
+                    yield StreamChunk(content=text, source=source, type="tool_call", name=message.name)
+                continue
             if not isinstance(message, (AIMessage, AIMessageChunk)):
                 continue
             text = extract_text_content(message.content)

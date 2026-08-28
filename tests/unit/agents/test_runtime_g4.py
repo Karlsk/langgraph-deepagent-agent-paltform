@@ -10,6 +10,7 @@ frames, ``extra_callbacks`` and the turn-end summary detection.
 """
 
 import asyncio
+import json
 import uuid
 from collections.abc import Generator
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.core.config import settings
@@ -248,3 +249,62 @@ def test_get_pending_interrupt_none_when_thread_live(
 
     assert asyncio.run(rt.get_pending_interrupt("s-live")) is None
     assert asyncio.run(rt.get_pending_interrupt("s-unknown")) is None
+
+
+# ---------------------------------------------------------------------------
+# B2 — tool_call stream frames + typed interrupt tail chunk (§4.1)
+# ---------------------------------------------------------------------------
+
+
+@tool
+def echo(text: str) -> str:
+    """Echo the given text back."""
+    return f"echo: {text}"
+
+
+def _collect_chunks(rt: Any, session_id: str) -> list[Any]:
+    """Drain one astream turn synchronously and return the chunks."""
+
+    async def collect() -> list[Any]:
+        chunks: list[Any] = []
+        async for chunk in rt.astream(
+            [Message(role="user", content="call echo")], session_id=session_id, user_id="u1", username="ann"
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    return asyncio.run(collect())
+
+
+def test_stream_emits_tool_call_frame_for_tool_message(
+    mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An executed tool surfaces as a typed tool_call chunk (name+content)."""
+    monkeypatch.setattr(assembly, "builtin_tools", [echo])
+    model = ScriptedChatModel(responses=[_echo_call_message(), AIMessage(content="done")])
+    rt = _compile_runtime(model, _make_app(), monkeypatch)
+
+    chunks = _collect_chunks(rt, "s-toolcall")
+
+    tool_frames = [chunk for chunk in chunks if chunk.type == "tool_call"]
+    assert len(tool_frames) == 1
+    assert tool_frames[0].name == "echo"
+    assert tool_frames[0].content == "echo: hi"
+    assert tool_frames[0].source == "coordinator"
+    message_frames = [chunk for chunk in chunks if chunk.type == "message"]
+    assert "".join(frame.content for frame in message_frames) == "done"
+
+
+def test_astream_interrupt_tail_chunk_is_typed_projection(
+    mock_memory: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The interrupt tail chunk is typed and carries the §4.2 projection JSON."""
+    model = ScriptedChatModel(responses=[_echo_call_message()])
+    rt = _compile_runtime(model, _make_app(interrupt_on={"echo": True}), monkeypatch)
+
+    chunks = _collect_chunks(rt, "s-interrupt")
+
+    tail = chunks[-1]
+    assert tail.type == "interrupt"
+    assert tail.source == "system"
+    assert json.loads(tail.content) == {"action_requests": [{"tool": "echo", "args": {"text": "hi"}}]}
