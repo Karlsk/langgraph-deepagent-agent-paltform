@@ -985,6 +985,9 @@ curl -s -X POST "$BASE/apps" \
 **预期**：HTTP 201 且 `code=201`，信封 `data` 为 `AgentAppRead`：记下 `data.id`（后续记为 `$APP_ID`），
 `data.status="draft"`、`data.engine="deepagents"`、`data.version=1`、`data.published_hash=null`。
 
+> 必填字段仅 `name` 与 `system_prompt`（缺 `system_prompt` 返 422 `Field required`）；
+> `allowed_tools`/`skill_names`/`subagent_names` 可选。
+
 > 可额外传 `"model": "proxy/m3"`（`provider/model` 引用，见 5.5 节）指定专用模型配置；
 > 不传则用 `default/default`。
 
