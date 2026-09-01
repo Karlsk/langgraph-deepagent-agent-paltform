@@ -408,7 +408,8 @@ def import_bundle(
                 db.flush()  # get provider.id for model configs
 
                 # Import associated model configs
-                assert provider.id is not None, "Provider ID should be set after flush"
+                if provider.id is None:
+                    raise ValueError("Provider ID should be set after flush")
                 for mc in item.get("models", []):
                     model = ModelConfig(
                         provider_id=provider.id,

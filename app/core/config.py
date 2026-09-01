@@ -161,8 +161,19 @@ class Settings:
         self.DEFAULT_AGENT_CONTEXT_SIZE = int(os.getenv("DEFAULT_AGENT_CONTEXT_SIZE", "128000"))
 
         # Long term memory Configuration
-        self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", "gpt-5-nano")
+        # Fact-extraction LLM follows DEFAULT_LLM_MODEL so it always matches the
+        # configured gateway (OpenAI-specific model names break non-OpenAI endpoints).
+        self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", self.DEFAULT_LLM_MODEL)
         self.LONG_TERM_MEMORY_EMBEDDER_MODEL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_MODEL", "text-embedding-3-small")
+        # Independent embedder endpoint: many chat gateways have no usable
+        # /embeddings. Empty values fall back to OPENAI_BASE_URL / OPENAI_API_KEY
+        # inside mem0 (see mem0 embeddings/openai.py).
+        self.LONG_TERM_MEMORY_EMBEDDER_BASE_URL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_BASE_URL", "")
+        self.LONG_TERM_MEMORY_EMBEDDER_API_KEY = os.getenv("LONG_TERM_MEMORY_EMBEDDER_API_KEY", "")
+        # Must match the embedder model's real dimensions (mem0 always sends
+        # this as the `dimensions` parameter); changing it requires rebuilding
+        # the pgvector collection (collection dims are fixed at creation time).
+        self.LONG_TERM_MEMORY_EMBEDDER_DIMS = int(os.getenv("LONG_TERM_MEMORY_EMBEDDER_DIMS", "1536"))
         self.LONG_TERM_MEMORY_COLLECTION_NAME = os.getenv("LONG_TERM_MEMORY_COLLECTION_NAME", "longterm_memory")
         # JWT Configuration
         self.JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
@@ -183,17 +194,14 @@ class Settings:
         elif _skills_root_env:
             self.DATA_ROOT = str(Path(_skills_root_env).parent)
             logging.getLogger(__name__).warning(
-                "SKILLS_ROOT env is deprecated (G2 v3): set DATA_ROOT instead; "
-                "DATA_ROOT fell back to its parent: %s",
+                "SKILLS_ROOT env is deprecated (G2 v3): set DATA_ROOT instead; DATA_ROOT fell back to its parent: %s",
                 self.DATA_ROOT,
             )
         else:
             self.DATA_ROOT = "./data"
         # Legacy on-disk layout detection (spec §10.2): old {SKILLS_ROOT}/global
         # data that has not been migrated to {DATA_ROOT}/global/skills yet.
-        if (Path(self.SKILLS_ROOT) / "global").is_dir() and not (
-            Path(self.DATA_ROOT) / "global"
-        ).is_dir():
+        if (Path(self.SKILLS_ROOT) / "global").is_dir() and not (Path(self.DATA_ROOT) / "global").is_dir():
             logging.getLogger(__name__).warning(
                 "skills_root_legacy_detected: legacy skills at %s/global; run "
                 "scripts/migrate_workspace.py --apply to migrate to %s/global/skills",

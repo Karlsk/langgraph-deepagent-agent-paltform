@@ -38,7 +38,14 @@ class MemoryService:
                     },
                     "embedder": {
                         "provider": "openai",
-                        "config": {"model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL},
+                        "config": {
+                            "model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL,
+                            # Empty strings normalize to None so mem0 falls back
+                            # to OPENAI_BASE_URL / OPENAI_API_KEY.
+                            "openai_base_url": settings.LONG_TERM_MEMORY_EMBEDDER_BASE_URL or None,
+                            "api_key": settings.LONG_TERM_MEMORY_EMBEDDER_API_KEY or None,
+                            "embedding_dims": settings.LONG_TERM_MEMORY_EMBEDDER_DIMS,
+                        },
                     },
                 }
             )

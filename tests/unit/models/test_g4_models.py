@@ -7,7 +7,7 @@ CHAT_AUTO_APPROVE_MAX_ROUNDS, SESSION_NAMING_ENABLED.
 
 import pytest
 
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.models.subagent_trace import SubAgentTrace
 
 pytestmark = pytest.mark.unit
@@ -36,10 +36,16 @@ def test_subagent_trace_columns_on_table_metadata() -> None:
     assert {"source", "session_id"} <= columns
 
 
-def test_settings_rebuild_rate_limit_key() -> None:
-    """RATE_LIMIT_ENDPOINTS carries the new rebuild key (spec §3.2/§3.4)."""
-    assert "rebuild" in settings.RATE_LIMIT_ENDPOINTS
-    assert settings.RATE_LIMIT_ENDPOINTS["rebuild"] == ["5 per minute"]
+def test_settings_rebuild_rate_limit_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RATE_LIMIT_ENDPOINTS carries the new rebuild key (spec §3.2/§3.4).
+
+    Rebuilds Settings against a clean env so the default is asserted even when
+    a local env file (e.g. .env.development) overrides RATE_LIMIT_REBUILD.
+    """
+    monkeypatch.delenv("RATE_LIMIT_REBUILD", raising=False)
+    fresh = Settings()
+    assert "rebuild" in fresh.RATE_LIMIT_ENDPOINTS
+    assert fresh.RATE_LIMIT_ENDPOINTS["rebuild"] == ["5 per minute"]
 
 
 def test_settings_chat_trace_enabled_defaults_true() -> None:
