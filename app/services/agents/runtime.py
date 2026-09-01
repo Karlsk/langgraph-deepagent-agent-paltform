@@ -34,7 +34,7 @@ import json
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional, cast, override
@@ -95,15 +95,53 @@ def _coerce_numeric_user_id(user_id: Optional[str]) -> Optional[int]:
         return None
 
 
-async def _append_context_rows(path: Path, user_content: str, assistant_content: str) -> None:
-    """Append one turn (user + assistant rows) to the L2 JSONL file."""
+@dataclass
+class SubagentSegment:
+    """One contiguous subagent turn collected from the stream.
+
+    A segment spans a text span plus the tool calls that immediately
+    follow it; a tool call closes the text span so the next message
+    chunk from the same source starts a new segment (mirrors the
+    frontend card granularity: one card per LLM turn).
+    """
+
+    source: str
+    text: str
+    tool_calls: list[tuple[str, str]] = field(default_factory=list)
+
+
+async def _append_context_rows(
+    path: Path,
+    user_content: str,
+    assistant_content: str,
+    subagent_segments: Sequence[SubagentSegment] = (),
+) -> None:
+    """Append one turn (user + subagent + assistant rows) to the L2 JSONL file.
+
+    Subagent segments are written as display-only rows carrying ``source``
+    (the subagent name): one assistant row per non-empty text span followed
+    by one ``tool_call`` row per collected tool call; rebuild skips them so
+    the checkpoint context stays clean.
+    """
     seq = await context_store.next_seq(path)
     ts = _utc_now_iso()
     rows: list[dict[str, Any]] = []
     if user_content:
         rows.append({"seq": seq, "ts": ts, "type": "message", "role": "user", "content": user_content})
+        seq += 1
+    for segment in subagent_segments:
+        if segment.text:
+            rows.append(
+                {"seq": seq, "ts": ts, "type": "message", "role": "assistant", "content": segment.text, "source": segment.source}
+            )
+            seq += 1
+        for name, output in segment.tool_calls:
+            rows.append(
+                {"seq": seq, "ts": ts, "type": "tool_call", "name": name, "content": output, "source": segment.source}
+            )
+            seq += 1
     if assistant_content:
-        rows.append({"seq": seq + 1, "ts": ts, "type": "message", "role": "assistant", "content": assistant_content})
+        rows.append({"seq": seq, "ts": ts, "type": "message", "role": "assistant", "content": assistant_content})
     if rows:
         await context_store.append_rows(path, rows)
 
@@ -136,6 +174,51 @@ class StreamChunk:
     source: Optional[str] = None
     type: str = "message"
     name: Optional[str] = None
+
+
+class _SubagentSegmentAccumulator:
+    """Relay stream chunks while collecting subagent segments.
+
+    Subagent ``message`` chunks are grouped into per-turn segments in
+    first-seen order (consecutive same-source chunks merge while the
+    segment has no tool calls); subagent ``tool_call`` chunks attach to
+    the trailing same-source segment and close its text span so the next
+    message chunk opens a new segment. Coordinator / system chunks only
+    pass through.
+    """
+
+    def __init__(self, upstream: AsyncGenerator[StreamChunk, None]) -> None:
+        self._raw: list[SubagentSegment] = []
+        self.generator = self._relay(upstream)
+
+    async def _relay(self, upstream: AsyncGenerator[StreamChunk, None]) -> AsyncGenerator[StreamChunk, None]:
+        async for chunk in upstream:
+            source = chunk.source
+            if source and source not in ("coordinator", "system"):
+                last = self._raw[-1] if self._raw and self._raw[-1].source == source else None
+                if chunk.type == "message":
+                    if last is not None and not last.tool_calls:
+                        last.text += chunk.content
+                    else:
+                        self._raw.append(SubagentSegment(source=source, text=chunk.content))
+                elif chunk.type == "tool_call":
+                    if last is not None:
+                        last.tool_calls.append((chunk.name or "", chunk.content))
+                    else:
+                        self._raw.append(
+                            SubagentSegment(source=source, text="", tool_calls=[(chunk.name or "", chunk.content)])
+                        )
+            yield chunk
+
+    @property
+    def segments(self) -> list[SubagentSegment]:
+        """Collected per-turn segments in first-seen order."""
+        return self._raw
+
+
+def _accumulate_stream_segments(upstream: AsyncGenerator[StreamChunk, None]) -> _SubagentSegmentAccumulator:
+    """Wrap a stream so subagent message segments are collected on the fly."""
+    return _SubagentSegmentAccumulator(upstream)
 
 
 def project_interrupt(value: Any) -> Optional[dict[str, Any]]:
@@ -381,16 +464,18 @@ class AgentAppRuntime(ABC):
         *,
         session_id: str,
         user_id: Optional[str],
+        subagent_segments: Sequence[SubagentSegment] = (),
     ) -> None:
         """Fire-and-forget L2 context record write (G3 §4.1.2, success paths).
 
-        Records the turn's user input (from the invoke arguments) and the
-        assistant's final reply (last AIMessage of the response state) into
-        the session JSONL file. Like ``_fire_memory_add`` the task is anchored
-        in ``_pending_tasks`` and its failure is logged, never raised — a
-        broken L2 write must not block the response. Runtimes without an
-        ``app_id`` or with a non-numeric ``user_id`` cannot address the L2
-        path and skip the write.
+        Records the turn's user input (from the invoke arguments), the
+        streamed subagent message segments (display-only rows carrying
+        ``source``) and the assistant's final reply (last AIMessage of the
+        response state) into the session JSONL file. Like ``_fire_memory_add``
+        the task is anchored in ``_pending_tasks`` and its failure is logged,
+        never raised — a broken L2 write must not block the response. Runtimes
+        without an ``app_id`` or with a non-numeric ``user_id`` cannot address
+        the L2 path and skip the write.
         """
         app_id = self.app_id
         numeric_user_id = _coerce_numeric_user_id(user_id)
@@ -414,7 +499,9 @@ class AgentAppRuntime(ABC):
         )
         user_content = str(user_message.content) if user_message is not None else ""
         path = context_store.session_file_path(app_id, numeric_user_id, session_id)
-        task = asyncio.create_task(_append_context_rows(path, user_content, str(assistant_text)))
+        task = asyncio.create_task(
+            _append_context_rows(path, user_content, str(assistant_text), subagent_segments)
+        )
         _pending_tasks.add(task)
 
         def _on_record_done(done: asyncio.Task[Any]) -> None:
@@ -553,7 +640,8 @@ class AgentAppRuntime(ABC):
                 before_state = await self._get_state(config)
                 before_fingerprint = _compression_fingerprint(before_state.values)
                 graph_input = await self._prepare_input(messages, config)
-                async for chunk in self._stream(graph_input, config):
+                subagent_segments = _accumulate_stream_segments(self._stream(graph_input, config))
+                async for chunk in subagent_segments.generator:
                     yield chunk
 
                 llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)
@@ -574,7 +662,13 @@ class AgentAppRuntime(ABC):
                 if state.values and "messages" in state.values:
                     final_messages = cast(list[BaseMessage], state.values["messages"])
                     self._fire_memory_add(final_messages, user_id, config)
-                    self._fire_context_record(messages, final_messages, session_id=session_id, user_id=user_id)
+                    self._fire_context_record(
+                        messages,
+                        final_messages,
+                        session_id=session_id,
+                        user_id=user_id,
+                        subagent_segments=subagent_segments.segments,
+                    )
                 self._observe_compression(state.values, session_id=session_id)
             except GraphInterrupt:
                 llm_inference_duration_seconds.labels(model=self._model_label()).observe(time.perf_counter() - started)

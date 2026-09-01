@@ -19,6 +19,7 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useChatStream } from '@/composables/useChatStream'
 import ChatHilCard from '@/views/chat/ChatHilCard.vue'
 import ChatMessageList from '@/views/chat/ChatMessageList.vue'
+import ChatSubAgentRunDrawer from '@/views/chat/ChatSubAgentRunDrawer.vue'
 import ChatTraceDrawer from '@/views/chat/ChatTraceDrawer.vue'
 
 const route = useRoute()
@@ -95,6 +96,27 @@ onUnmounted(() => {
 // ---------------------------------------------------------------------------
 
 const traceDrawerVisible = ref(false)
+
+// ---------------------------------------------------------------------------
+// 子智能体执行卡片详情抽屉（按索引引用视图模型，流式期间内容实时跟随）
+// ---------------------------------------------------------------------------
+
+const selectedRunIndex = ref<number | null>(null)
+
+const selectedRun = computed(() => {
+  const index = selectedRunIndex.value
+  if (index === null) return null
+  const item = items.value[index]
+  return item?.kind === 'subagent_run' ? item : null
+})
+
+function handleOpenRun(index: number): void {
+  selectedRunIndex.value = index
+}
+
+function handleRunDrawerUpdate(visible: boolean): void {
+  if (!visible) selectedRunIndex.value = null
+}
 </script>
 
 <template>
@@ -115,7 +137,7 @@ const traceDrawerVisible = ref(false)
 
     <section class="content-card page-view__body chat-session__body">
       <div class="chat-session__stream">
-        <ChatMessageList :items="items" :streaming="streaming" />
+        <ChatMessageList :items="items" :streaming="streaming" @open-run="handleOpenRun" />
         <ChatHilCard
           v-if="pendingInterrupt !== null"
           :interrupt="pendingInterrupt"
@@ -151,6 +173,13 @@ const traceDrawerVisible = ref(false)
     </section>
 
     <ChatTraceDrawer v-model="traceDrawerVisible" :session-id="sessionId" />
+    <ChatSubAgentRunDrawer
+      :model-value="selectedRun !== null"
+      :source="selectedRun?.source ?? null"
+      :content="selectedRun?.content ?? ''"
+      :tool-calls="selectedRun?.toolCalls ?? []"
+      @update:model-value="handleRunDrawerUpdate"
+    />
   </div>
 </template>
 

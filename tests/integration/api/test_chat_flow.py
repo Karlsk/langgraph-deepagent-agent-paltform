@@ -372,7 +372,12 @@ def test_rebuild_restores_history_for_continued_chat(
     rebuilt = client.post(f"{API}/rebuild", headers=headers)
     assert rebuilt.status_code == 200, rebuilt.text
     counts = rebuilt.json()["data"]
-    assert counts == {"rebuilt_messages": 4, "skipped_tool_calls": 0, "l2_source_lines": 4}
+    assert counts == {
+        "rebuilt_messages": 4,
+        "skipped_tool_calls": 0,
+        "skipped_subagent_messages": 0,
+        "l2_source_lines": 4,
+    }
 
     # Continuation: the scripted model's next call must see the re-injected history.
     third = client.post(f"{API}/chat", json=_messages_payload("q3"), headers=headers)

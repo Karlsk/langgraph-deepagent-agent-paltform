@@ -1353,14 +1353,15 @@ curl -s "$BASE/messages" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SI
 #    DELETE FROM checkpoint_blobs WHERE thread_id='<SID>'; \
 #    DELETE FROM checkpoint_writes WHERE thread_id='<SID>';"
 curl -s -X POST "$BASE/rebuild" -H "Authorization: Bearer $TOKEN" -H "X-Session-Id: $SID"
-# → {"rebuilt_messages": N, "skipped_tool_calls": M, "l2_source_lines": L}
+# → {"rebuilt_messages": N, "skipped_tool_calls": M, "skipped_subagent_messages": S, "l2_source_lines": L}
 ```
 
 **预期与验证点**：
 - 重建后继续对话：模型仍能引用重建前的历史（连贯性）；`GET /messages` 不变（L2 是源）。
 - 边界：L2 无可读行返 **422**；中断未决返 **409**（先处理审批）。
 - `tool_call` 行无法重灌（tool_call_id 配对不可恢复），计入 `skipped_tool_calls`；
-  `summary` 行以 HumanMessage 形式回灌。前端入口：会话页顶栏「重建」按钮（确认弹窗）。
+  `summary` 行以 HumanMessage 形式回灌。带 `source` 的 subagent 展示行不重灌，计入 `skipped_subagent_messages`。
+  前端入口：会话页顶栏「重建」按钮（确认弹窗）。
 
 ### 8.6 运行轨迹（GET /chat/traces）
 

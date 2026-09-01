@@ -3,11 +3,12 @@
  * 运行轨迹抽屉（G4 spec-g4-chat §9.4）：
  * 聊天页顶栏「运行轨迹」入口 → el-drawer 右滑出；
  * `GET /chat/traces`（created_at 倒序由后端保证）渲染行摘要（状态 /
- * 轮次 / 耗时 / 时间），点击行展开完整事件流——每事件类型徽标 + agent
- * 字段标签（B6 补齐，区分 coordinator / subagent 名）+ 事件 JSON。
+ * 轮次 / 耗时 / 时间），点击行展开事件流——逐事件折叠（默认全收起，
+ * 头部仅显摘要：类型徽标 + agent 标签 + 标题 + 耗时 + 状态），
+ * 点击展开查看分类型关键字段。
  *
- * 渲染复用模式非复用组件：事件展开列表参照 SubAgentTraceDetailDialog
- * 的折叠实现（expanded 集合 + toggle），不直接引组件（Dialog 形态不符）。
+ * 渲染复用模式非复用组件：事件折叠实现参照 SubAgentTraceDetailDialog
+ * （expanded 集合 + toggle），不直接引组件（Dialog 形态不符）。
  */
 import { ref, watch } from 'vue'
 
@@ -61,6 +62,27 @@ function isExpanded(id: number): boolean {
   return expandedIds.value.includes(id)
 }
 
+/** 展开的事件键集合（`${traceId}:${seq}`，默认全折叠） */
+const expandedEvents = ref<string[]>([])
+
+function eventKey(traceId: number, event: Record<string, unknown>): string {
+  return `${traceId}:${String(event.seq)}`
+}
+
+function toggleEvent(traceId: number, event: Record<string, unknown>): void {
+  const key = eventKey(traceId, event)
+  const at = expandedEvents.value.indexOf(key)
+  if (at >= 0) {
+    expandedEvents.value.splice(at, 1)
+  } else {
+    expandedEvents.value.push(key)
+  }
+}
+
+function isEventExpanded(traceId: number, event: Record<string, unknown>): boolean {
+  return expandedEvents.value.includes(eventKey(traceId, event))
+}
+
 // ---------------------------------------------------------------------------
 // 事件流渲染辅助（events 为后端原始 JSON，防御性提取）
 // ---------------------------------------------------------------------------
@@ -89,6 +111,37 @@ function jsonText(value: unknown): string {
   if (value === null || value === undefined) return ''
   if (typeof value === 'string') return value
   return JSON.stringify(value, null, 2)
+}
+
+/** 消息 content 可能是字符串或内容块数组，统一转为可展示文本 */
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (content === null || content === undefined) return ''
+  return JSON.stringify(content, null, 2)
+}
+
+function asMessages(event: Record<string, unknown>): Array<{ type?: string; content?: unknown }> {
+  const raw = event.input_messages
+  return Array.isArray(raw) ? (raw as Array<{ type?: string; content?: unknown }>) : []
+}
+
+function asToolCalls(event: Record<string, unknown>): Array<{ name?: string; args?: unknown }> {
+  const raw = event.tool_calls
+  return Array.isArray(raw) ? (raw as Array<{ name?: string; args?: unknown }>) : []
+}
+
+/** token 用量（缺失记 0，与后端采集语义一致） */
+function tokenUsage(event: Record<string, unknown>): { input: number; output: number } {
+  const raw = event.token_usage
+  if (typeof raw !== 'object' || raw === null) return { input: 0, output: 0 }
+  const usage = raw as { input_tokens?: number; output_tokens?: number }
+  return { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0 }
+}
+
+function durationLabel(value: unknown): string {
+  if (typeof value !== 'number') return ''
+  if (value < 1) return `${Math.round(value * 1000)}ms`
+  return `${value.toFixed(2)}s`
 }
 
 /** created_at 展示：截到秒（后端 ISO 8601 带时区） */
@@ -133,13 +186,64 @@ function close(): void {
               v-for="event in trace.events"
               :key="String(event.seq)"
               class="chat-trace-drawer__event"
+              :class="{ 'chat-trace-drawer__event--error': event.status === 'error' }"
             >
-              <div class="chat-trace-drawer__event-head">
+              <button
+                type="button"
+                class="chat-trace-drawer__event-head"
+                @click="toggleEvent(trace.id, event)"
+              >
+                <span class="chat-trace-drawer__event-seq">#{{ event.seq }}</span>
                 <span class="chat-trace-drawer__badge">{{ eventBadge(event) }}</span>
                 <span class="chat-trace-drawer__agent">{{ eventAgent(event) }}</span>
                 <span class="chat-trace-drawer__event-title">{{ eventTitle(event) }}</span>
+                <span v-if="durationLabel(event.duration_seconds) !== ''" class="chat-trace-drawer__metric">
+                  {{ durationLabel(event.duration_seconds) }}
+                </span>
+                <span
+                  class="chat-trace-drawer__event-status"
+                  :class="event.status === 'error' ? 'chat-trace-drawer__event-status--error' : ''"
+                >
+                  {{ event.status === 'error' ? '失败' : '成功' }}
+                </span>
+                <span class="chat-trace-drawer__toggle">
+                  {{ isEventExpanded(trace.id, event) ? '收起' : '展开' }}
+                </span>
+              </button>
+              <div v-if="isEventExpanded(trace.id, event)" class="chat-trace-drawer__event-body">
+                <template v-if="event.type === 'llm_call'">
+                  <div class="chat-trace-drawer__field-label">
+                    token：{{ tokenUsage(event).input }} in / {{ tokenUsage(event).output }} out
+                  </div>
+                  <div class="chat-trace-drawer__field-label">输入消息（{{ asMessages(event).length }}）</div>
+                  <div
+                    v-for="(message, index) in asMessages(event)"
+                    :key="index"
+                    class="chat-trace-drawer__message"
+                  >
+                    <span class="chat-trace-drawer__message-type">{{ message.type ?? 'unknown' }}</span>
+                    <pre class="chat-trace-drawer__event-json">{{ messageText(message.content) }}</pre>
+                  </div>
+                  <div class="chat-trace-drawer__field-label">输出</div>
+                  <pre class="chat-trace-drawer__event-json">{{ messageText(event.output_text) }}</pre>
+                  <template v-if="asToolCalls(event).length > 0">
+                    <div class="chat-trace-drawer__field-label">发起的工具调用</div>
+                    <pre class="chat-trace-drawer__event-json">{{ jsonText(asToolCalls(event)) }}</pre>
+                  </template>
+                </template>
+                <template v-else-if="event.type === 'tool_call'">
+                  <div class="chat-trace-drawer__field-label">参数</div>
+                  <pre class="chat-trace-drawer__event-json">{{ jsonText(event.arguments) }}</pre>
+                  <div class="chat-trace-drawer__field-label">返回值</div>
+                  <pre class="chat-trace-drawer__event-json">{{ jsonText(event.output) }}</pre>
+                </template>
+                <template v-else>
+                  <div class="chat-trace-drawer__field-label">
+                    status：{{ event.status }} · 轮次：{{ event.turns }}
+                  </div>
+                </template>
+                <pre v-if="event.error" class="chat-trace-drawer__event-error">{{ event.error }}</pre>
               </div>
-              <pre class="chat-trace-drawer__event-json">{{ jsonText(event) }}</pre>
             </li>
           </ul>
           <p v-if="trace.error" class="chat-trace-drawer__error">{{ trace.error }}</p>
@@ -221,10 +325,78 @@ function close(): void {
   padding: 6px 8px;
 }
 
+.chat-trace-drawer__event--error {
+  border-color: var(--color-danger, #ef4444);
+}
+
 .chat-trace-drawer__event-head {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+
+.chat-trace-drawer__event-seq {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  font-family: var(--app-font-mono, monospace);
+  white-space: nowrap;
+}
+
+.chat-trace-drawer__event-status {
+  font-size: 12px;
+  color: var(--color-success, #22c55e);
+  white-space: nowrap;
+}
+
+.chat-trace-drawer__event-status--error {
+  color: var(--color-danger, #ef4444);
+}
+
+.chat-trace-drawer__event-body {
+  margin-top: 6px;
+  border-top: 1px dashed var(--color-border-default);
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-trace-drawer__field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  letter-spacing: 0.04em;
+}
+
+.chat-trace-drawer__message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-trace-drawer__message-type {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+}
+
+.chat-trace-drawer__event-error {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: var(--color-danger-soft, #fef2f2);
+  color: var(--color-danger, #ef4444);
+  border-radius: var(--radius-sm, 6px);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .chat-trace-drawer__badge {

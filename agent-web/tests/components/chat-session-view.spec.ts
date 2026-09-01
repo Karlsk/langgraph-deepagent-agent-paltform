@@ -288,4 +288,30 @@ describe('ChatSessionView', () => {
     expect(fetchChatTracesMock).toHaveBeenCalledWith('s-1')
     expect(wrapper.find('.el-drawer-stub').exists()).toBe(true)
   })
+
+  it('点击子智能体执行卡片打开执行详情抽屉展示收集内容', async () => {
+    fetchMessagesMock.mockResolvedValue({
+      messages: [
+        { type: 'message', seq: 1, ts: 't1', role: 'user', content: '你好' },
+        {
+          type: 'message',
+          seq: 2,
+          ts: 't2',
+          role: 'assistant',
+          content: '研究中…',
+          source: 'researcher',
+        },
+      ],
+      pending_interrupt: null,
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.find('.chat-subagent-run-drawer').exists()).toBe(false)
+
+    await wrapper.get('.chat-message-list__run').trigger('click')
+    const runDrawer = wrapper.find('.chat-subagent-run-drawer')
+    expect(runDrawer.exists()).toBe(true)
+    expect(runDrawer.text()).toContain('研究中…')
+  })
 })

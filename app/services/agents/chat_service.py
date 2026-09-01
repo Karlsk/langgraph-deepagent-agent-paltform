@@ -459,6 +459,7 @@ async def get_history(db: DBSession, target: Session, *, user_id: int) -> Messag
                 content=row.get("content"),
                 name=row.get("name"),
                 summary=row.get("summary"),
+                source=row.get("source"),
             )
         )
 
@@ -488,7 +489,9 @@ async def rebuild(db: DBSession, target: Session, *, user_id: int) -> RebuildRes
     thread paused on an interrupt → ``InterruptPendingError`` (API 409).
     Message rows re-inject verbatim (user→Human, assistant→AI), summary
     rows re-inject as HumanMessage, tool_call rows are skipped (their
-    tool_call_id pairing cannot be restored) and counted.
+    tool_call_id pairing cannot be restored) and counted, and display-only
+    subagent rows (non-null ``source``) are skipped to keep the checkpoint
+    context clean.
     """
     if target.agent_app_id is None:
         raise ChatServiceError("session has no bound agent app")
@@ -503,11 +506,16 @@ async def rebuild(db: DBSession, target: Session, *, user_id: int) -> RebuildRes
 
     rebuilt: list[BaseMessage] = []
     skipped_tool_calls = 0
+    skipped_subagent_messages = 0
     for row in rows:
         row_type = row.get("type")
         content = str(row.get("content") or "")
         if row_type == "tool_call":
             skipped_tool_calls += 1
+            continue
+        if row.get("source"):
+            # Display-only subagent row: never re-inject (§6.2).
+            skipped_subagent_messages += 1
             continue
         if row_type == "summary":
             # SummarizationMiddleware's summary_message shape (§6.2)
@@ -522,6 +530,7 @@ async def rebuild(db: DBSession, target: Session, *, user_id: int) -> RebuildRes
     return RebuildResult(
         rebuilt_messages=len(rebuilt),
         skipped_tool_calls=skipped_tool_calls,
+        skipped_subagent_messages=skipped_subagent_messages,
         l2_source_lines=len(rows),
     )
 

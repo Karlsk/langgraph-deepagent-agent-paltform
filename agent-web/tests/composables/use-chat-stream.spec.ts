@@ -2,9 +2,10 @@
  * src/composables/useChatStream.ts 帧分发状态机测试（G4 spec-g4-chat §9.1/§9.3）。
  *
  * mock `@/utils/sse` 与 `@/api/chat`：覆盖 message 帧同 source 归并 /
- * subagent 切块、tool_call / summary / interrupt / error / done 帧分发、
+ * subagent 切块、subagent tool_call 挂卡并 closed 拆轮、coordinator
+ * tool_call 平铺、summary / interrupt / error / done 帧分发、
  * decisions JSON 胶囊投影与 X-Session-Id 透传、abort 停止、loadHistory
- * 的 L2 行投影 + pending 恢复。
+ * 的 L2 行投影（与实时帧同 reducer）+ pending 恢复。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
@@ -52,7 +53,7 @@ beforeEach(() => {
 })
 
 describe('useChatStream 帧分发', () => {
-  it('message 帧同 source 归并、subagent 切换开新块', async () => {
+  it('message 帧同 source 归并；subagent 消息归入执行卡片', async () => {
     const { items, send } = useChatStream(ref('s-1'))
     sseFetchMock.mockImplementation(async () => {})
     const sending = send('你好')
@@ -67,8 +68,59 @@ describe('useChatStream 帧分发', () => {
     expect(items.value).toEqual([
       { kind: 'message', role: 'user', content: '你好' },
       { kind: 'message', role: 'assistant', content: '部分一部分二', source: null },
-      { kind: 'message', role: 'assistant', content: '子代理说', source: 'writer' },
+      { kind: 'subagent_run', source: 'writer', content: '子代理说', running: false, toolCalls: [], closed: false },
     ])
+  })
+
+  it('subagent 连续块归并同卡；切换开新卡并收尾旧卡', async () => {
+    const { items, send } = useChatStream(ref('s-1'))
+    sseFetchMock.mockImplementation(async () => {})
+    const sending = send('hi')
+    await replayFrames([
+      { type: 'message', content: '研究', source: 'researcher' },
+      { type: 'message', content: '中…', source: 'researcher' },
+      { type: 'message', content: '写码', source: 'coder' },
+      { type: 'message', content: '总结', source: 'coordinator' },
+      { type: 'done', message_count: 4 },
+    ])
+    await sending
+
+    expect(items.value).toEqual([
+      { kind: 'message', role: 'user', content: 'hi' },
+      { kind: 'subagent_run', source: 'researcher', content: '研究中…', running: false, toolCalls: [], closed: false },
+      { kind: 'subagent_run', source: 'coder', content: '写码', running: false, toolCalls: [], closed: false },
+      { kind: 'message', role: 'assistant', content: '总结', source: null },
+    ])
+  })
+
+  it('流式期间卡片保持 running，coordinator 块到达即收尾', async () => {
+    const { items, send } = useChatStream(ref('s-1'))
+    sseFetchMock.mockImplementation(async () => {})
+    const sending = send('hi')
+    await replayFrames([
+      { type: 'message', content: '子代理', source: 'writer' },
+    ])
+    expect(items.value.at(-1)).toEqual({
+      kind: 'subagent_run',
+      source: 'writer',
+      content: '子代理',
+      running: true,
+      toolCalls: [],
+      closed: false,
+    })
+    await replayFrames([
+      { type: 'message', content: '主回复', source: 'coordinator' },
+      { type: 'done' },
+    ])
+    await sending
+    expect(items.value[1]).toEqual({
+      kind: 'subagent_run',
+      source: 'writer',
+      content: '子代理',
+      running: false,
+      toolCalls: [],
+      closed: false,
+    })
   })
 
   it('tool_call / summary / interrupt / error 帧各归其位', async () => {
@@ -76,7 +128,7 @@ describe('useChatStream 帧分发', () => {
     const sending = send('hi')
     await replayFrames([
       { type: 'message', content: '正文', source: 'coordinator' },
-      { type: 'tool_call', name: 'echo', content: 'echo out', source: 'writer' },
+      { type: 'tool_call', name: 'echo', content: 'echo out' },
       { type: 'summary', summary_text: '已压缩' },
       { type: 'interrupt', action_requests: [{ tool: 'write_file', args: { path: 'a' } }] },
       { type: 'done', interrupted: true },
@@ -87,6 +139,31 @@ describe('useChatStream 帧分发', () => {
     expect(items.value[3]).toEqual({ kind: 'summary', content: '已压缩' })
     expect(pendingInterrupt.value?.action_requests[0].tool).toBe('write_file')
     expect(errorMessage.value).toBeNull()
+  })
+
+  it('subagent tool_call 挂入当前卡并 closed，随后同 source 文本开新卡', async () => {
+    const { items, send } = useChatStream(ref('s-1'))
+    const sending = send('hi')
+    await replayFrames([
+      { type: 'message', content: '思考', source: 'writer' },
+      { type: 'tool_call', name: 'echo', content: 'echo out', source: 'writer' },
+      { type: 'message', content: '继续', source: 'writer' },
+      { type: 'done' },
+    ])
+    await sending
+
+    expect(items.value).toEqual([
+      { kind: 'message', role: 'user', content: 'hi' },
+      {
+        kind: 'subagent_run',
+        source: 'writer',
+        content: '思考',
+        running: false,
+        toolCalls: [{ name: 'echo', content: 'echo out' }],
+        closed: true,
+      },
+      { kind: 'subagent_run', source: 'writer', content: '继续', running: false, toolCalls: [], closed: false },
+    ])
   })
 
   it('error 帧写入 errorMessage 且 done 后退出 streaming', async () => {
@@ -175,5 +252,60 @@ describe('useChatStream 帧分发', () => {
     ])
     expect(pendingInterrupt.value?.action_requests[0].tool).toBe('write_file')
     expect(fetchMessagesMock).toHaveBeenCalledWith('s-1')
+  })
+
+  it('loadHistory 将连续同 source 的 assistant 行归并为执行卡片', async () => {
+    fetchMessagesMock.mockResolvedValue({
+      messages: [
+        { type: 'message', seq: 1, ts: 't1', role: 'user', content: '你好' },
+        {
+          type: 'message',
+          seq: 2,
+          ts: 't2',
+          role: 'assistant',
+          content: '研究中…',
+          source: 'researcher',
+        },
+        { type: 'message', seq: 3, ts: 't3', role: 'assistant', content: '完成' },
+      ],
+      pending_interrupt: null,
+    })
+    const { items, loadHistory } = useChatStream(ref('s-1'))
+    await loadHistory()
+
+    expect(items.value).toEqual([
+      { kind: 'message', role: 'user', content: '你好' },
+      { kind: 'subagent_run', source: 'researcher', content: '研究中…', running: false, toolCalls: [], closed: false },
+      { kind: 'message', role: 'assistant', content: '完成' },
+    ])
+  })
+
+  it('loadHistory 带 source 的 tool_call 行挂卡，且与实时帧拆分一致', async () => {
+    fetchMessagesMock.mockResolvedValue({
+      messages: [
+        { type: 'message', seq: 1, ts: 't1', role: 'user', content: '你好' },
+        { type: 'message', seq: 2, ts: 't2', role: 'assistant', content: '思考', source: 'writer' },
+        { type: 'tool_call', seq: 3, ts: 't3', name: 'echo', content: 'echo out', source: 'writer' },
+        { type: 'message', seq: 4, ts: 't4', role: 'assistant', content: '继续', source: 'writer' },
+        { type: 'message', seq: 5, ts: 't5', role: 'assistant', content: '完成' },
+      ],
+      pending_interrupt: null,
+    })
+    const { items, loadHistory } = useChatStream(ref('s-1'))
+    await loadHistory()
+
+    expect(items.value).toEqual([
+      { kind: 'message', role: 'user', content: '你好' },
+      {
+        kind: 'subagent_run',
+        source: 'writer',
+        content: '思考',
+        running: false,
+        toolCalls: [{ name: 'echo', content: 'echo out' }],
+        closed: true,
+      },
+      { kind: 'subagent_run', source: 'writer', content: '继续', running: false, toolCalls: [], closed: false },
+      { kind: 'message', role: 'assistant', content: '完成' },
+    ])
   })
 })

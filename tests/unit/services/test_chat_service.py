@@ -663,6 +663,37 @@ async def test_get_history_without_pending(
     assert len(result.messages) == 4
 
 
+@_sync
+async def test_get_history_projects_subagent_source(
+    db: DBSession, session_row: SessionRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Display-only subagent rows surface their ``source`` for card rendering."""
+    from app.services.agents import sessions_service
+
+    rows = [
+        {"seq": 1, "ts": "2026-01-01T00:00:00+00:00", "type": "message", "role": "user", "content": "hi"},
+        {
+            "seq": 2,
+            "ts": "2026-01-01T00:00:01+00:00",
+            "type": "message",
+            "role": "assistant",
+            "content": "研究中…",
+            "source": "researcher",
+        },
+        {"seq": 3, "ts": "2026-01-01T00:00:02+00:00", "type": "message", "role": "assistant", "content": "完成"},
+    ]
+
+    async def fake_read(target: SessionRow) -> list[dict[str, Any]]:
+        return rows
+
+    monkeypatch.setattr(sessions_service, "read_or_rebuild_l2", fake_read)
+    _install_runtime(monkeypatch, _FakeRuntime(pending_after=[None]))
+
+    result = await chat_service.get_history(db, session_row, user_id=7)
+
+    assert [item.source for item in result.messages] == [None, "researcher", None]
+
+
 # ---------------------------------------------------------------------------
 # D4: rebuild() disaster recovery (§6.2)
 # ---------------------------------------------------------------------------
@@ -720,7 +751,49 @@ async def test_rebuild_rehydrates_checkpoint(
     assert rebuilt_messages[2].content == "完成"
     assert result.rebuilt_messages == 3
     assert result.skipped_tool_calls == 1
+    assert result.skipped_subagent_messages == 0
     assert result.l2_source_lines == 4
+
+
+@_sync
+async def test_rebuild_skips_display_only_subagent_rows(
+    db: DBSession,
+    session_row: SessionRow,
+    deleted_checkpoints: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows carrying ``source`` are never re-injected (checkpoint stays clean)."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from app.services.agents import sessions_service
+
+    rows = [
+        {"seq": 1, "ts": "2026-01-01T00:00:00+00:00", "type": "message", "role": "user", "content": "hi"},
+        {
+            "seq": 2,
+            "ts": "2026-01-01T00:00:01+00:00",
+            "type": "message",
+            "role": "assistant",
+            "content": "研究中…",
+            "source": "researcher",
+        },
+        {"seq": 3, "ts": "2026-01-01T00:00:02+00:00", "type": "message", "role": "assistant", "content": "完成"},
+    ]
+
+    async def fake_read(target: SessionRow) -> list[dict[str, Any]]:
+        return rows
+
+    monkeypatch.setattr(sessions_service, "read_or_rebuild_l2", fake_read)
+    fake = _install_runtime(monkeypatch, _FakeRuntime())
+
+    result = await chat_service.rebuild(db, session_row, user_id=7)
+
+    _, rebuilt_messages = fake.rebuild_calls[0]
+    assert [type(m) for m in rebuilt_messages] == [HumanMessage, AIMessage]
+    assert [m.content for m in rebuilt_messages] == ["hi", "完成"]
+    assert result.rebuilt_messages == 2
+    assert result.skipped_subagent_messages == 1
+    assert result.l2_source_lines == 3
 
 
 # ---------------------------------------------------------------------------

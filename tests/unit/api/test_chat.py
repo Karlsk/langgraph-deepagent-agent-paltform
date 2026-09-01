@@ -318,13 +318,20 @@ def test_post_rebuild_success_envelope(
 ) -> None:
     """Rebuild outcome lands in the envelope."""
     _install_chat_service(
-        monkeypatch, "rebuild", RebuildResult(rebuilt_messages=3, skipped_tool_calls=1, l2_source_lines=4)
+        monkeypatch,
+        "rebuild",
+        RebuildResult(rebuilt_messages=3, skipped_tool_calls=1, skipped_subagent_messages=2, l2_source_lines=6),
     )
 
     response = client.post("/rebuild", headers={"X-Session-Id": session_row.id})
 
     assert response.status_code == 200
-    assert response.json()["data"] == {"rebuilt_messages": 3, "skipped_tool_calls": 1, "l2_source_lines": 4}
+    assert response.json()["data"] == {
+        "rebuilt_messages": 3,
+        "skipped_tool_calls": 1,
+        "skipped_subagent_messages": 2,
+        "l2_source_lines": 6,
+    }
 
 
 def test_post_rebuild_empty_history_422(

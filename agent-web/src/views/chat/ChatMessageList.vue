@@ -2,9 +2,10 @@
 /**
  * 聊天消息流渲染（G4 spec-g4-chat §9.3 P0 清单）：
  * 纯展示组件，消费 useChatStream 的 ChatViewItem 视图模型——
- * - message：user 右对齐 / assistant 左对齐；subagent source 胶囊标签
- *   （coordinator 归一为 null 不显示）；streaming 时末尾 assistant 气泡
- *   挂闪烁光标
+ * - message：user 右对齐 / assistant 左对齐；streaming 时末尾 assistant
+ *   气泡挂闪烁光标（subagent 消息已改由卡片承载，不再内联）
+ * - subagent_run：子智能体执行卡片（名称 + 运行态 + 工具计数 + 内容摘要），
+ *   整卡可点，emit('open-run', index) 由页面层开抽屉展示完整内容
  * - tool_call：折叠面板（工具名 + 摘要，点击展开完整输出）
  * - summary：「上下文已压缩」灰色细条（§4.3 轮末推送消费端）
  * - decision：历史审批胶囊（已批准 / 已拒绝 N 个操作）
@@ -20,6 +21,19 @@ defineProps<{
   /** 流式进行中：末尾 assistant 气泡显示闪烁光标 */
   streaming?: boolean
 }>()
+
+defineEmits<{
+  /** 点击子智能体执行卡片（携带 items 索引） */
+  'open-run': [index: number]
+}>()
+
+/** run 卡片摘要：首 80 字符截断 + 总字数（空白压缩成单行预览） */
+function runSummary(content: string): string {
+  const text = content.replace(/\s+/g, ' ').trim()
+  if (text.length === 0) return '（暂无内容）'
+  if (text.length <= 80) return text
+  return `${text.slice(0, 80)}…（共 ${content.length} 字）`
+}
 
 /** tool_call 展开项集合（按 items 索引，默认全折叠） */
 const expandedIndexes = ref<number[]>([])
@@ -50,12 +64,6 @@ function isExpanded(index: number): boolean {
           : 'chat-message-list__row--assistant'"
       >
         <div class="chat-message-list__bubble">
-          <span
-            v-if="item.role === 'assistant' && item.source"
-            class="chat-message-list__source"
-          >
-            {{ item.source }}
-          </span>
           <span class="chat-message-list__text">{{ item.content }}</span>
           <span
             v-if="streaming && item.role === 'assistant' && index === items.length - 1"
@@ -63,6 +71,24 @@ function isExpanded(index: number): boolean {
             aria-hidden="true"
           />
         </div>
+      </div>
+
+      <!-- 子智能体执行卡片：点击查看完整执行内容 -->
+      <div v-else-if="item.kind === 'subagent_run'" class="chat-message-list__row chat-message-list__row--assistant">
+        <button type="button" class="chat-message-list__run" @click="$emit('open-run', index)">
+          <span class="chat-message-list__run-badge">{{ item.source }}</span>
+          <span
+            v-if="item.running && streaming"
+            class="chat-message-list__run-status chat-message-list__run-status--running"
+          >
+            执行中…
+          </span>
+          <span v-if="item.toolCalls.length > 0" class="chat-message-list__run-tools">
+            {{ item.toolCalls.length }} 次工具调用
+          </span>
+          <span class="chat-message-list__run-summary">{{ runSummary(item.content) }}</span>
+          <span class="chat-message-list__run-toggle">查看详情</span>
+        </button>
       </div>
 
       <!-- tool_call 折叠面板 -->
@@ -130,11 +156,59 @@ function isExpanded(index: number): boolean {
   border-color: transparent;
 }
 
-.chat-message-list__source {
+.chat-message-list__run {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: 78%;
+  padding: 8px 12px;
+  border: 1px dashed var(--color-border-default);
+  border-radius: var(--radius-md, 8px);
+  background: var(--color-bg-subtle, #f8f9fb);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+
+.chat-message-list__run:hover {
+  border-color: var(--color-primary, #3b82f6);
+}
+
+.chat-message-list__run-badge {
   font-size: 12px;
   padding: 1px 8px;
   border-radius: 999px;
-  background: var(--color-bg-secondary, #f2f4f7);
+  background: var(--color-primary-soft, #eef4ff);
+  color: var(--color-primary, #3b82f6);
+  white-space: nowrap;
+}
+
+.chat-message-list__run-status--running {
+  font-size: 12px;
+  color: var(--color-primary, #3b82f6);
+  white-space: nowrap;
+  animation: chat-message-list-blink 1.2s steps(2) infinite;
+}
+
+.chat-message-list__run-tools {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.chat-message-list__run-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.chat-message-list__run-toggle {
+  font-size: 12px;
   color: var(--color-text-secondary);
   white-space: nowrap;
 }

@@ -164,6 +164,8 @@ class HistoryItem(BaseModel):
         content: message / summary row text.
         name: tool_call rows: tool name.
         summary: tool_call rows: outcome summary.
+        source: assistant message rows produced by a subagent carry the
+            subagent name (display-only row; coordinator rows omit it).
     """
 
     type: Literal["message", "tool_call", "summary"] = Field(..., description="L2 row type")
@@ -173,6 +175,7 @@ class HistoryItem(BaseModel):
     content: Optional[str] = Field(default=None, description="message / summary row text")
     name: Optional[str] = Field(default=None, description="tool_call rows: tool name")
     summary: Optional[str] = Field(default=None, description="tool_call rows: outcome summary")
+    source: Optional[str] = Field(default=None, description="subagent name for display-only assistant rows")
 
 
 class MessagesResponse(BaseResponse):
@@ -197,11 +200,16 @@ class RebuildResult(BaseModel):
         rebuilt_messages: Rows actually re-injected (message + summary).
         skipped_tool_calls: tool_call rows skipped (tool_call_id pairing
             cannot be restored).
+        skipped_subagent_messages: display-only subagent rows (non-null
+            ``source``) skipped to keep the checkpoint context clean.
         l2_source_lines: Total L2 rows read as the rebuild source.
     """
 
     rebuilt_messages: int = Field(..., description="Rows re-injected into the checkpoint (message + summary)")
     skipped_tool_calls: int = Field(..., description="tool_call rows skipped during re-injection")
+    skipped_subagent_messages: int = Field(
+        ..., description="display-only subagent rows skipped during re-injection"
+    )
     l2_source_lines: int = Field(..., description="Total L2 rows read as the rebuild source")
 
 

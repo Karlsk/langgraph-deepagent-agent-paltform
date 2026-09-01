@@ -88,6 +88,8 @@ export interface HistoryItem {
   name?: string | null
   /** tool_call 行：结果摘要 */
   summary?: string | null
+  /** assistant 行：subagent 名（展示专用行，卡片化渲染；coordinator 行为空） */
+  source?: string | null
 }
 
 /** GET /messages 响应载荷（历史 + pending 中断拉齐，§5.3/§6.1） */
@@ -106,6 +108,8 @@ export interface ChatResponseData {
 export interface RebuildResult {
   rebuilt_messages: number
   skipped_tool_calls: number
+  /** 带 source 的 subagent 展示行（不重灌） */
+  skipped_subagent_messages: number
   l2_source_lines: number
 }
 

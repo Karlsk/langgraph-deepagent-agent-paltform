@@ -2,8 +2,8 @@
 /**
  * ChatMessageList 消息流渲染测试（G4 spec-g4-chat §9.3 P0 清单）：
  * 纯展示组件（零 Element Plus 依赖、零 API 调用），覆盖气泡对齐修饰、
- * source 胶囊（coordinator 不显示）、streaming 光标、tool_call 折叠展开、
- * summary 细条、decisions 胶囊。
+ * subagent_run 执行卡片（名称 / 运行态 / 摘要 / 点击 emit）、streaming 光标、
+ * tool_call 折叠展开、summary 细条、decisions 胶囊。
  */
 import { describe, expect, it } from 'vitest'
 import { mount } from '@vue/test-utils'
@@ -25,16 +25,65 @@ describe('ChatMessageList', () => {
     expect(rows[0].text()).toContain('你好')
   })
 
-  it('subagent source 渲染胶囊，coordinator（null）不渲染', () => {
+  it('subagent_run 渲染执行卡片：名称徽标 + 摘要 + 查看详情', () => {
     const items: ChatViewItem[] = [
-      { kind: 'message', role: 'assistant', content: '正文', source: null },
-      { kind: 'message', role: 'assistant', content: '子代理输出', source: 'writer' },
+      { kind: 'subagent_run', source: 'writer', content: '子代理输出内容', running: false, toolCalls: [], closed: false },
     ]
     const wrapper = mount(ChatMessageList, { props: { items } })
 
-    const badges = wrapper.findAll('.chat-message-list__source')
-    expect(badges).toHaveLength(1)
-    expect(badges[0].text()).toBe('writer')
+    const card = wrapper.get('.chat-message-list__run')
+    expect(card.text()).toContain('writer')
+    expect(card.text()).toContain('子代理输出内容')
+    expect(card.text()).toContain('查看详情')
+    expect(wrapper.find('.chat-message-list__run-status--running').exists()).toBe(false)
+    expect(wrapper.find('.chat-message-list__run-tools').exists()).toBe(false)
+  })
+
+  it('subagent_run 带工具调用时显示计数徽标', () => {
+    const items: ChatViewItem[] = [
+      {
+        kind: 'subagent_run',
+        source: 'writer',
+        content: '正文',
+        running: false,
+        toolCalls: [
+          { name: 'a', content: 'out1' },
+          { name: 'b', content: 'out2' },
+        ],
+        closed: true,
+      },
+    ]
+    const wrapper = mount(ChatMessageList, { props: { items } })
+
+    expect(wrapper.get('.chat-message-list__run-tools').text()).toContain('2 次工具调用')
+  })
+
+  it('subagent_run 长内容摘要截断并带总字数', () => {
+    const content = '长'.repeat(120)
+    const items: ChatViewItem[] = [
+      { kind: 'subagent_run', source: 'writer', content, running: false, toolCalls: [], closed: false },
+    ]
+    const wrapper = mount(ChatMessageList, { props: { items } })
+
+    const summary = wrapper.get('.chat-message-list__run-summary').text()
+    expect(summary).toContain('…')
+    expect(summary).toContain('共 120 字')
+  })
+
+  it('running 卡片仅流式中显示「执行中…」；点击整卡 emit open-run 索引', async () => {
+    const items: ChatViewItem[] = [
+      { kind: 'message', role: 'user', content: 'q' },
+      { kind: 'subagent_run', source: 'writer', content: '部分', running: true, toolCalls: [], closed: false },
+    ]
+
+    const live = mount(ChatMessageList, { props: { items, streaming: true } })
+    expect(live.find('.chat-message-list__run-status--running').exists()).toBe(true)
+
+    const idle = mount(ChatMessageList, { props: { items, streaming: false } })
+    expect(idle.find('.chat-message-list__run-status--running').exists()).toBe(false)
+
+    await live.get('.chat-message-list__run').trigger('click')
+    expect(live.emitted('open-run')).toEqual([[1]])
   })
 
   it('streaming 时光标只挂在末尾 assistant 气泡', () => {

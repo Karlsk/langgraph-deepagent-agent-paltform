@@ -127,6 +127,15 @@ class TestHistoryItem:
         item = HistoryItem(type="summary", seq=3, ts="2026-08-27T00:00:02Z", content="condensed")
         assert item.type == "summary"
 
+    def test_subagent_source_row(self) -> None:
+        """Display-only assistant rows carry the subagent name; others default None."""
+        item = HistoryItem(
+            type="message", seq=2, ts="t", role="assistant", content="研究中…", source="researcher"
+        )
+        assert item.source == "researcher"
+        plain = HistoryItem(type="message", seq=1, ts="t", role="assistant", content="done")
+        assert plain.source is None
+
     def test_type_is_constrained(self) -> None:
         """An unknown L2 row type is rejected."""
         with pytest.raises(ValidationError):
@@ -156,12 +165,15 @@ class TestMessagesResponse:
 class TestRebuildResult:
     """RebuildResult reports the rebuild outcome counts (§6.2)."""
 
-    def test_holds_three_counters(self) -> None:
-        """RebuildResult exposes the three outcome counters."""
-        result = RebuildResult(rebuilt_messages=7, skipped_tool_calls=3, l2_source_lines=10)
+    def test_holds_four_counters(self) -> None:
+        """RebuildResult exposes the four outcome counters."""
+        result = RebuildResult(
+            rebuilt_messages=7, skipped_tool_calls=3, skipped_subagent_messages=2, l2_source_lines=12
+        )
         assert result.rebuilt_messages == 7
         assert result.skipped_tool_calls == 3
-        assert result.l2_source_lines == 10
+        assert result.skipped_subagent_messages == 2
+        assert result.l2_source_lines == 12
 
 
 class TestChatTraceItem:

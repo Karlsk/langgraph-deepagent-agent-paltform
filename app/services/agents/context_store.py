@@ -8,9 +8,13 @@ user workspace::
 
 Row schema (§4.1.1): ``seq`` (monotonic, 1-based), ``ts`` (ISO8601 UTC),
 ``type`` (message | tool_call | summary), plus per-type fields
-(``role``/``content``/``name``/``summary``) and a reserved ``metadata``
-object. Callers (runtime hooks, sessions_service) own row construction and
-seq allocation via :func:`next_seq`; this module only persists bytes.
+(``role``/``content``/``name``/``summary``/``source``) and a reserved
+``metadata`` object. Assistant message rows may carry ``source`` (the
+subagent name) marking a display-only row that rebuild skips; tool_call
+rows may likewise carry ``source`` when the call was made by a subagent
+(display-only, attached to the subagent run card on the frontend). Callers
+(runtime hooks, sessions_service) own row construction and seq allocation
+via :func:`next_seq`; this module only persists bytes.
 
 Write strategy: append under a process-wide per-file ``asyncio.Lock``;
 full rewrites (L1 self-heal) go through tmp + rename so readers never see

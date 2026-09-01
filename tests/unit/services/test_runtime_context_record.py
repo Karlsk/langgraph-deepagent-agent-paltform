@@ -207,6 +207,93 @@ def test_context_record_failure_never_blocks_ainvoke(
     assert result[-1].content == "still fine"  # failure did not propagate
 
 
+# ---------------------------------------------------------------------------
+# Subagent segment accumulation + display-only L2 rows
+# ---------------------------------------------------------------------------
+
+
+async def _chunks(chunks: list[runtime.StreamChunk]) -> Any:
+    for chunk in chunks:
+        yield chunk
+
+
+def test_segment_accumulator_groups_subagent_messages() -> None:
+    """Per-turn segments: a tool call closes the span; coordinator passes."""
+
+    async def run() -> list[runtime.SubagentSegment]:
+        accumulator = runtime._accumulate_stream_segments(  # noqa: SLF001 — unit test targets the helper
+            _chunks(
+                [
+                    runtime.StreamChunk(content="主回复", source="coordinator"),
+                    runtime.StreamChunk(content="研究", source="researcher"),
+                    runtime.StreamChunk(content="中…", source="researcher"),
+                    runtime.StreamChunk(content="out1", source="researcher", type="tool_call", name="search"),
+                    runtime.StreamChunk(content="再研究", source="researcher"),
+                    runtime.StreamChunk(content="代码", source="coder"),
+                    runtime.StreamChunk(content="{}", source="system", type="interrupt"),
+                    runtime.StreamChunk(content="收尾", source="coordinator"),
+                ]
+            )
+        )
+        relayed = [chunk async for chunk in accumulator.generator]
+        assert len(relayed) == 8  # every chunk passes through untouched
+        return accumulator.segments
+
+    segments = asyncio.run(run())
+    assert [(s.source, s.text, s.tool_calls) for s in segments] == [
+        ("researcher", "研究中…", [("search", "out1")]),
+        ("researcher", "再研究", []),
+        ("coder", "代码", []),
+    ]
+
+
+def test_segment_accumulator_tool_call_opens_segment_without_text() -> None:
+    """A tool call before any message chunk still lands in its own segment."""
+
+    async def run() -> list[runtime.SubagentSegment]:
+        accumulator = runtime._accumulate_stream_segments(  # noqa: SLF001 — unit test targets the helper
+            _chunks(
+                [
+                    runtime.StreamChunk(content="hit", source="coder", type="tool_call", name="run"),
+                    runtime.StreamChunk(content="正文", source="coder"),
+                ]
+            )
+        )
+        _ = [chunk async for chunk in accumulator.generator]
+        return accumulator.segments
+
+    segments = asyncio.run(run())
+    assert [(s.source, s.text, s.tool_calls) for s in segments] == [
+        ("coder", "", [("run", "hit")]),
+        ("coder", "正文", []),
+    ]
+
+
+def test_append_context_rows_writes_subagent_rows_between_user_and_assistant(tmp_path: Path) -> None:
+    """L2 turn rows: user -> per-segment message/tool_call rows (source) -> assistant."""
+    path = tmp_path / "sessions" / "sess.jsonl"
+
+    asyncio.run(
+        runtime._append_context_rows(  # noqa: SLF001 — unit test targets the helper
+            path,
+            "hi",
+            "final answer",
+            [
+                runtime.SubagentSegment(source="researcher", text="研究中…", tool_calls=[("search", "out1")]),
+                runtime.SubagentSegment(source="coder", text="", tool_calls=[("run", "hit")]),
+            ],
+        )
+    )
+
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    assert [row["type"] for row in rows] == ["message", "message", "tool_call", "tool_call", "message"]
+    assert [row.get("source") for row in rows] == [None, "researcher", "researcher", "coder", None]
+    assert rows[2]["name"] == "search" and rows[2]["content"] == "out1"
+    assert rows[3]["name"] == "run" and rows[3]["content"] == "hit"  # empty text writes no message row
+    assert rows[0]["content"] == "hi" and rows[-1]["content"] == "final answer"
+    assert [row["seq"] for row in rows] == [1, 2, 3, 4, 5]
+
+
 class _RecordingSaver:
     """Minimal checkpointer double recording adelete_thread calls."""
 
