@@ -19,6 +19,8 @@ ENV APP_ENV=${APP_ENV} \
 # To fall back to the official source, build with:
 #   --build-arg DEBIAN_MIRROR_URL=http://deb.debian.org
 ARG DEBIAN_MIRROR_URL=https://mirrors.aliyun.com
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
 RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR_URL}/debian|g; s|http://deb.debian.org/debian-security|${DEBIAN_MIRROR_URL}/debian-security|g" \
     /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y \
@@ -28,9 +30,20 @@ RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR_URL}/debian|g; s|http
     && pip install uv \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pip config set global.index-url "${PIP_INDEX_URL}" \
+    && pip config set global.timeout 60 \
+    && pip config set global.retries 10 \
+    && pip install --disable-pip-version-check --no-cache-dir uv
+
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG PYPI_FILES_MIRROR=https://mirrors.aliyun.com/pypi/packages
+ENV UV_DEFAULT_INDEX="${PIP_INDEX_URL}" \
+    UV_HTTP_TIMEOUT=120 \
+    UV_CONCURRENT_DOWNLOADS=4
 # Install locked dependencies first (cached unless pyproject.toml / uv.lock change)
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project
+RUN sed -i "s|https://files.pythonhosted.org/packages|${PYPI_FILES_MIRROR}|g" uv.lock \
+    && uv sync --frozen --no-install-project
 
 # Copy the application and install the project itself against the locked deps
 COPY . .
