@@ -490,6 +490,71 @@ def build_parser() -> argparse.ArgumentParser: ...   # 子命令 run：--dir/--w
 def main(argv: list[str] | None = None) -> int: ...  # 成功 0 / 失败 1；信封 print 输出（T201 豁免点）
 ```
 
+**修订说明【画布编排契约扩展，2026-09-07】**（`ApiResponse` 签名不变，`metadata` 语义扩展）：
+
+- `metadata` 基线四键不变：`{workflow_id, run_id, duration_ms, node_count}`（与 `api.py` 现状一致）。
+- 新增**可选第五键** `execution_logs: list[dict]`：仅 `POST /api/v1/workflows/{workflow_id}/execute` **成功响应**携带，序列化自 `RunResult.execution_logs`（每条 `ExecutionLog.model_dump(mode="json")`），egress 前经 `logging_conf.redact` 二次脱敏（H6/S15）。
+- 404 / 500 失败信封 `data=null`，`metadata` 不出现（向后兼容：老客户端忽略新键即可）。
+- 投影位置：改动集中在 `api.py` egress（`execute_workflow` 成功分支 `metadata` 构造追加 `execution_logs`）；引擎内核零改动。
+- 详细目标形态与约束见 `docs/workflow-api-and-trace.md` §7.1（方案 A）。
+
+### 4.13 `app/workflow/api.py` — 画布编排管理端点（AD-10，2026-09-07 新增）
+
+> 以下签名属 **api.py 层**（入口集成，AD-10 composition-root exception），非引擎内核。
+> 全部端点沿用宿主统一信封 `{code, message, data}`、`get_registry(request)` DI、structlog、slowapi 限流；
+> 写端点须鉴权（S19）。详细请求/响应形态见 `docs/workflow-frontend-spec.md` §4.2。
+
+```python
+# --- 投影辅助（api.py 内部，与既有 _project_to_host_envelope 风格一致） ---
+
+def _workflow_summary(registry: WorkflowRegistry, wf_id: str) -> dict[str, Any]:
+    """单条列表投影：{workflow_id, node_count, entry_point, description?}。"""
+
+def _definition_to_json(definition: WorkflowDefinition) -> dict[str, Any]:
+    """查定义投影：WorkflowDefinition → JSON dict（剔除 execution_history 运行期字段，保留 ui_layout 注解）。"""
+
+def _definition_to_yaml_text(definition: WorkflowDefinition) -> str:
+    """查定义投影：WorkflowDefinition → yaml_text 字符串（yaml.safe_dump，供只读预览）。"""
+
+# --- 端点签名（FastAPI router 层） ---
+
+@router.get("/workflows")
+async def list_workflows(request: Request) -> JSONResponse:
+    """列表：读 registry.list_workflows() + get_registry_stats()，不引入新存储（H4）。
+    成功 data: list[dict]，每条 = _workflow_summary(registry, wf_id)。"""
+
+@router.get("/workflows/{workflow_id}")
+async def get_workflow(request: Request, workflow_id: str, format: Literal["json", "yaml"] = "json") -> JSONResponse:
+    """查定义：format=json → _definition_to_json(definition)；format=yaml → {"yaml_text": ...}。
+    不存在 → 404（WorkflowNotFoundError → 宿主信封）。"""
+
+@router.put("/workflows/{workflow_id}")
+async def save_workflow(request: Request, workflow_id: str, body: dict[str, Any]) -> JSONResponse:
+    """全量保存注册（S13 原子替换）：
+    body → parse_definition(body)（WorkflowDefinition.model_validate）
+         → 节点类型白名单校验（S18：type ∈ {llm, http}，拒 python → 422）
+         → register_workflow(definition, default_edges=body.get("default_edges"))
+         → yaml.safe_dump 落盘 user 目录（S17：文件名白名单 ^[A-Za-z0-9_-]{1,64}$）
+         → 成功 data: {"yaml_text": ..., "workflow_id": ...}。
+    构建期校验失败 → 422（message 携脱敏原因，H6）；未授权 → 403（S19）。"""
+
+@router.delete("/workflows/{workflow_id}")
+async def delete_workflow(request: Request, workflow_id: str) -> JSONResponse:
+    """删除：delete_workflow(workflow_id)（唯一删除入口，C6/H7：四表同步）
+         → 同步删 YAML 文件（S17）。
+    不存在 → 404；未授权 → 403（S19）。
+    成功 data: null。"""
+```
+
+**约束**：
+
+- **引擎内核零改动**：`registry.py` / `nodes/*` / `graph_builder.py` / `models.py` 不修改（AD-02 引擎自包含红线不变）。
+- **限流 / DI / 信封**：沿用现状 execute 端点范式（slowapi、`get_registry`、宿主统一信封，AD-10）。
+- **写端点鉴权**（S19）：`PUT` / `DELETE` 须 `Depends(get_current_user)` + 管理员角色校验；现状 execute 端点无鉴权，需后端补齐策略。
+- **节点类型白名单**（S18）：`PUT` 服务端二次校验 `node.type ∈ {llm, http}`，拒绝 `python`（S15 RCE）及未知类型。
+- **YAML 落盘**（S17）：用户定义目录 `app/workflow/config/user/`（与只读 `examples/` 分离）；`PUT` 全量覆盖写 + 原子替换；文件名白名单校验 `^[A-Za-z0-9_-]{1,64}$`（防路径穿越）；`build_registry` 启动扫描 `examples/` + `user/`（S16 fail-fast）。
+- **前端契约期望**：`docs/workflow-frontend-spec.md` §4.2 声明的端点路径、请求/响应形态、错误码须与本契约一致。
+
 ## 5. 异常族契约
 
 **单点定义于 `app/workflow/models.py`**；其它模块与文档只引用，**不得各自另行定义**：
@@ -540,6 +605,9 @@ class HTTPNodeError(WorkflowEngineError):
 | S14 | extra 策略三分 | WorkflowDefinition=`ignore`；节点配置（LLMConfig/HTTPNodeConfig）=`forbid`；动态状态模型=`allow`（02 §3.3）。【EXP-G8 决策，2026-07-30】动态模型 `allow` 仅为模型自身宽容校验；运行期 state 仅支持声明键（含预声明的 `{node_name}_result`），未声明键被 langgraph 静默丢弃（见 `api-exploration-1x.md` G8 行） |
 | S15 | 日志形态 | structlog；事件名 lowercase_with_underscores；kwargs 传参禁 f-string；`logger.exception()` 留 traceback；ExecutionLog/日志只记摘要（消息条数、method/url、配置摘要），**不含密钥与完整 state**（H6）【AD-02】 |
 | S16 | YAML 安全 | 全引擎只允许 `yaml.safe_load`（D6） |
+| S17 | YAML 落盘持久化（2026-09-07 新增） | 用户定义目录 `app/workflow/config/user/`（与只读 `examples/` 分离）；`PUT` 全量覆盖写 + 原子替换（对齐 S13 原子替换语义）；文件名 `workflow_id` 白名单校验 `^[A-Za-z0-9_-]{1,64}$`（防路径穿越）；`build_registry` 启动扫描 `examples/` + `user/`（S16 fail-fast 不变）；`DELETE` 同步删除对应 YAML 文件。落盘失败 → 500（message 携脱敏原因，H6） |
+| S18 | 节点类型 API 白名单（2026-09-07 新增） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http}`（`NodeType` 枚举内置集，C8）；拒绝 `python`（S15 非沙箱 RCE，经 HTTP 注册等价远程代码执行）及未知类型；校验失败 → HTTP 422（S6 构建期校验），`message` 携脱敏原因（H6）。前端画布 palette 仅 `llm`/`http`（`docs/workflow-frontend-spec.md` §5.1），但**安全边界在后端** |
+| S19 | 写端点鉴权（2026-09-07 新增） | `PUT` / `DELETE` 写端点须 `Depends(get_current_user)` + **管理员角色**校验；未授权 → HTTP 403。现状 `execute` 端点无鉴权（仅 slowapi 限流），本期不改动；写端点鉴权策略由后端联动任务补齐（前端按角色禁用写按钮，`docs/workflow-frontend-spec.md` §5.4） |
 
 ## 7. 探索先行规则（R-EXP）
 
@@ -648,6 +716,12 @@ grep -rni "dispatcher\|triage\|subgraph" app/workflow/
 3. **禁止**：先改代码后补契约；只改 CONTRACT 不同步 spec；口头变更。
 4. **EXP 触发的变更**：探索实测与假设不符时，按本流程变更；备选方案须给出 2-3 个并附影响面对比（R-EXP 第 5 条）。
 5. 规划文档（00-03）为历史论证，不回改；冲突以本文件 AD 条目为准。
+
+### 变更记录
+
+| 日期 | 变更内容 | 影响章节 | 生效 spec | 备注 |
+| --- | --- | --- | --- | --- |
+| 2026-09-07 | 画布编排契约扩展：§4.12 `metadata` 新增可选第五键 `execution_logs`（execute 成功响应内嵌轨迹，脱敏后）；新增 §4.13 画布管理端点签名（GET 列表 / GET 查定义 / PUT 全量保存 / DELETE 删除）；§6 新增 S17（YAML 落盘持久化）、S18（节点类型 API 白名单）、S19（写端点鉴权） | §4.12 / §4.13 / §6（S17-S19） | `docs/changelog/workflow-canvas-orchestration/spec-01-contract-change.md` 及下游 spec-02..04、16..20 | 纯契约变更，提交 `docs:`；引擎内核零改动；详细设计见 `docs/workflow-frontend-spec.md` §4-5 与 `docs/workflow-api-and-trace.md` §7.1 |
 
 ## 12. 每 Phase 交付自检表
 

@@ -15,7 +15,7 @@
 
 ## 3. 契约变更清单
 
-1. **§4.12 `ApiResponse.metadata` 语义扩展**：四键 `{workflow_id, success, node_count, execution_time_ms}` + 可选第五键 `execution_logs: list[dict]`（仅成功响应、脱敏后）。
+1. **§4.12 `ApiResponse.metadata` 语义扩展**：基线四键 `{workflow_id, run_id, duration_ms, node_count}` + 可选第五键 `execution_logs: list[dict]`（仅成功响应、脱敏后）。
 2. **新增端点契约签名**（api.py 层，AD-10）：
    - `GET /api/v1/workflows -> list[WorkflowSummary]`
    - `GET /api/v1/workflows/{id}?format=json|yaml -> dict | {yaml_text}`

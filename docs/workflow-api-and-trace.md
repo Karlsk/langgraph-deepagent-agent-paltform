@@ -119,7 +119,7 @@ HTTP 出口把内部 `ApiResponse`（CONTRACT §4.12）投影为宿主统一信�
 | 未知 workflow_id | 404 | 404 | 脱敏错误摘要 | `null` |
 | 执行失败 | 500 | 500 | 脱敏错误摘要 | `null` |
 
-`metadata` 恒含四键：`workflow_id` / `run_id` / `duration_ms` / `node_count`。
+`metadata` 基线四键：`workflow_id` / `run_id` / `duration_ms` / `node_count`；成功响应**可选第五键** `execution_logs: list[dict]`（CONTRACT §4.12 修订，仅 `POST .../execute` 200 携带，egress 经 `redact` 脱敏，§7.1 方案 A）。
 
 > `response_model=HostApiResponse[dict[str, Any]]` 与 `responses={404,500}` **仅用于 OpenAPI 文档化**：
 > 端点返回 `JSONResponse` 实例，FastAPI 跳过序列化，wire 形态完全由 `_project_to_host_envelope` 决定，
