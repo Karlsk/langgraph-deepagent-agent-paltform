@@ -26,8 +26,8 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.schemas.base import ApiResponse as HostApiResponse
 from app.workflow.cli import ApiResponse
-from app.workflow.logging_conf import redact_processor
-from app.workflow.models import WorkflowDefinition, WorkflowNotFoundError
+from app.workflow.logging_conf import redact, redact_processor
+from app.workflow.models import ExecutionLog, WorkflowDefinition, WorkflowNotFoundError
 from app.workflow.registry import WorkflowRegistry
 
 logger = structlog.get_logger(__name__)
@@ -100,6 +100,11 @@ def _definition_to_json(definition: WorkflowDefinition) -> dict[str, Any]:
 def _definition_to_yaml_text(definition: WorkflowDefinition) -> str:
     """CONTRACT §4.13 frozen: YAML text via yaml.safe_dump for read-only preview."""
     return yaml_safe_dump(_definition_view(definition), allow_unicode=True, sort_keys=False)
+
+
+def _serialize_execution_logs(logs: list[ExecutionLog]) -> list[dict[str, Any]]:
+    """Serialize execution logs with redaction (H6) and truncation (max_len=500)."""
+    return [redact(log.model_dump(mode="json"), max_len=500) for log in logs]
 
 
 @router.get(
@@ -242,6 +247,7 @@ async def execute_workflow(
             "run_id": result.run_id,
             "duration_ms": result.duration_ms,
             "node_count": len(definition.nodes) if definition else 0,
+            "execution_logs": _serialize_execution_logs(result.execution_logs),
         },
     )
     return _project_to_host_envelope(response, 200)

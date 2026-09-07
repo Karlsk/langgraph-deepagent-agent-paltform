@@ -79,6 +79,54 @@ state_schema:
     description: user input
 """
 
+_REDACT_DEMO_YAML = """
+workflow_id: secret_demo
+entry_point: leaky
+nodes:
+  - name: leaky
+    type: echo
+    config:
+      output:
+        api_key: sk-live-leak-999
+        result: ok
+edges:
+  - source: leaky
+    target: END
+state_schema:
+  input:
+    type: str
+    description: user input
+  api_key:
+    type: str
+    description: leaked key
+  result:
+    type: str
+    description: result
+"""
+
+_LONG_VALUE: str = "x" * 600
+
+_LONG_YAML = f"""
+workflow_id: long_demo
+entry_point: verbose
+nodes:
+  - name: verbose
+    type: echo
+    config:
+      output:
+        blob: "{_LONG_VALUE}"
+edges:
+  - source: verbose
+    target: END
+state_schema:
+  input:
+    type: str
+    description: user input
+  blob:
+    type: str
+    description: long output
+"""
+
 
 @pytest.fixture()
 def client(tmp_path: Path) -> Generator[TestClient, None, None]:
@@ -306,3 +354,89 @@ def test_api_module_uses_only_safe_yaml() -> None:
 def test_host_processor_chain_contains_redact() -> None:
     """AD-02 v2: host composition root registers redact_processor globally."""
     assert redact_processor in get_structlog_processors()
+
+
+def test_execute_embeds_execution_logs(client: TestClient) -> None:
+    """spec-04: successful execute embeds execution_logs in metadata with all 7 fields."""
+    response = client.post("/workflows/echo_demo/execute", json={"input": "hi"})
+    assert response.status_code == 200
+    metadata = response.json()["data"]["metadata"]
+    logs = metadata.get("execution_logs")
+    assert logs is not None, "execution_logs must be present in success metadata"
+    assert len(logs) == 1
+    log_entry = logs[0]
+    for field in ("node_name", "node_type", "timestamp", "input_data", "output_data", "execution_time_ms", "error"):
+        assert field in log_entry, f"execution log missing required field: {field}"
+    assert isinstance(log_entry["timestamp"], str)
+    assert log_entry["node_name"] == "greet"
+
+
+def test_execute_logs_redact_secrets(tmp_path: Path) -> None:
+    """H6: execution_logs redact secret-looking keys (api_key -> ***REDACTED***)."""
+    (tmp_path / "secret_demo.yaml").write_text(_REDACT_DEMO_YAML, encoding="utf-8")
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.state.workflow_registry = build_registry(tmp_path)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        response = test_client.post("/workflows/secret_demo/execute", json={"input": "hi"})
+    assert response.status_code == 200
+    logs = response.json()["data"]["metadata"]["execution_logs"]
+    assert len(logs) == 1
+    output_data = logs[0]["output_data"]
+    assert output_data["api_key"] == "***REDACTED***"
+    assert "sk-live-leak-999" not in str(logs)
+    assert output_data["result"] == "ok"
+
+
+def test_execute_logs_truncate_long_values(tmp_path: Path) -> None:
+    """spec-04: string values > 500 chars in execution_logs are truncated (max_len=500)."""
+    (tmp_path / "long_demo.yaml").write_text(_LONG_YAML, encoding="utf-8")
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.state.workflow_registry = build_registry(tmp_path)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        response = test_client.post("/workflows/long_demo/execute", json={"input": "hi"})
+    assert response.status_code == 200
+    logs = response.json()["data"]["metadata"]["execution_logs"]
+    blob = logs[0]["output_data"]["blob"]
+    assert len(blob) < len(_LONG_VALUE)
+    assert blob.endswith("...(truncated)")
+
+
+def test_execute_failure_no_execution_logs(client: TestClient) -> None:
+    """spec-04: failed execution envelope has data=null, no execution_logs exposed."""
+    register_node_type("fail_leak", _FailNode)
+    app_state = client.app.state
+    fail_path = Path(app_state.workflow_directory) / "fail_demo.yaml"
+    fail_path.write_text(_FAIL_YAML, encoding="utf-8")
+    app_state.workflow_registry = build_registry(app_state.workflow_directory)
+    response = client.post("/workflows/fail_demo/execute", json={})
+    assert response.status_code == 500
+    assert response.json()["data"] is None
+
+
+def test_serialize_execution_logs_unit() -> None:
+    """spec-04 REFACTOR: _serialize_execution_logs produces redacted JSON-ready dicts."""
+    from datetime import datetime
+
+    from app.workflow.models import ExecutionLog
+
+    logs = [
+        ExecutionLog(
+            node_name="n1",
+            node_type="echo",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0),
+            input_data={"token": "abc123"},
+            output_data={"result": "ok"},
+            execution_time_ms=10.0,
+        ),
+    ]
+    serialized = workflow_api._serialize_execution_logs(logs)
+    assert len(serialized) == 1
+    assert serialized[0]["node_name"] == "n1"
+    assert serialized[0]["input_data"]["token"] == "***REDACTED***"  # noqa: S105 — dict key, not a secret
+    assert serialized[0]["timestamp"] == "2026-01-01T12:00:00"
