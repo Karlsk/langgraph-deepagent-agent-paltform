@@ -24,6 +24,35 @@ from tests.unit.workflow.test_cli import _ECHO_YAML, _FAIL_YAML, _FailNode
 
 pytestmark = pytest.mark.unit
 
+_SECOND_YAML = """
+workflow_id: alpha_workflow
+description: "second workflow for list testing"
+entry_point: step_one
+nodes:
+  - name: step_one
+    type: echo
+    config:
+      output:
+        result: step one done
+  - name: step_two
+    type: echo
+    config:
+      output:
+        result: step two done
+edges:
+  - source: step_one
+    target: step_two
+  - source: step_two
+    target: END
+state_schema:
+  input:
+    type: str
+    description: user input
+  result:
+    type: str
+    description: intermediate result
+"""
+
 
 @pytest.fixture()
 def client(tmp_path: Path) -> Generator[TestClient, None, None]:
@@ -92,13 +121,87 @@ def test_api_missing_registry_injection_returns_500(tmp_path: Path) -> None:
     assert "workflow_registry" in response.json()["message"]
 
 
-def test_api_projection_non_dict_output_wrapped_as_result() -> None:
-    """Egress mapping locks the non-dict branch: data = {"result": output, "metadata": {...}}."""
+def test_api_projection_non_list_non_dict_output_wrapped_as_result() -> None:
+    """Egress mapping locks the non-dict/non-list branch: data = {"result": output, "metadata": {...}}."""
     metadata = {"workflow_id": "demo", "run_id": "r", "duration_ms": 1.0, "node_count": 1}
-    response = workflow_api.ApiResponse(success=True, data=["plain", "list"], metadata=metadata)
+    response = workflow_api.ApiResponse(success=True, data="plain string", metadata=metadata)
     content = workflow_api._host_envelope_content(response, 200)
-    assert content == {"code": 200, "message": "success", "data": {"result": ["plain", "list"], "metadata": metadata}}
+    assert content == {"code": 200, "message": "success", "data": {"result": "plain string", "metadata": metadata}}
     assert workflow_api._project_to_host_envelope(response, 200).status_code == 200
+
+
+def test_api_projection_list_output_passes_through() -> None:
+    """CONTRACT §4.13: list data passes through as ``data`` directly (no result/metadata wrapping)."""
+    response = workflow_api.ApiResponse(success=True, data=[{"workflow_id": "a"}, {"workflow_id": "b"}])
+    content = workflow_api._host_envelope_content(response, 200)
+    assert content == {"code": 200, "message": "success", "data": [{"workflow_id": "a"}, {"workflow_id": "b"}]}
+
+
+def test_list_workflows_empty(tmp_path: Path) -> None:
+    """Empty registry returns data=[], code=200."""
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.state.workflow_registry = build_registry(tmp_path)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        response = test_client.get("/workflows")
+    assert response.status_code == 200
+    envelope = response.json()
+    assert envelope["code"] == 200
+    assert envelope["message"] == "success"
+    assert envelope["data"] == []
+
+
+def test_list_workflows_returns_summaries_sorted(tmp_path: Path) -> None:
+    """Two registered workflows: returns 2 summaries sorted by workflow_id ascending."""
+    (tmp_path / "echo_demo.yaml").write_text(_ECHO_YAML, encoding="utf-8")
+    (tmp_path / "alpha_workflow.yaml").write_text(_SECOND_YAML, encoding="utf-8")
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.state.workflow_registry = build_registry(tmp_path)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        response = test_client.get("/workflows")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) == 2
+    assert data[0]["workflow_id"] == "alpha_workflow"
+    assert data[0]["node_count"] == 2
+    assert data[0]["entry_point"] == "step_one"
+    assert data[1]["workflow_id"] == "echo_demo"
+    assert data[1]["node_count"] == 1
+    assert data[1]["entry_point"] == "greet"
+
+
+def test_list_workflows_reflects_registry_changes(tmp_path: Path) -> None:
+    """H4: no module-level cache; consecutive calls reflect registry changes in real time."""
+    (tmp_path / "echo_demo.yaml").write_text(_ECHO_YAML, encoding="utf-8")
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.state.workflow_registry = build_registry(tmp_path)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        first = test_client.get("/workflows").json()["data"]
+        assert len(first) == 1
+        (tmp_path / "alpha_workflow.yaml").write_text(_SECOND_YAML, encoding="utf-8")
+        app.state.workflow_registry = build_registry(tmp_path)
+        second = test_client.get("/workflows").json()["data"]
+        assert len(second) == 2
+
+
+def test_list_workflows_missing_registry_returns_500(tmp_path: Path) -> None:
+    """H4/G7: list endpoint also requires host-injected registry."""
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        response = test_client.get("/workflows")
+    assert response.status_code == 500
+    assert "workflow_registry" in response.json()["message"]
 
 
 def test_host_processor_chain_contains_redact() -> None:

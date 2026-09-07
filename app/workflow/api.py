@@ -60,6 +60,8 @@ def _host_envelope_content(response: ApiResponse, status_code: int) -> dict[str,
         data: Any
         if isinstance(response.data, dict):
             data = {**response.data, "metadata": response.metadata}
+        elif isinstance(response.data, list):
+            data = response.data
         else:
             data = {"result": response.data, "metadata": response.metadata}
         return {"code": status_code, "message": "success", "data": data}
@@ -72,6 +74,45 @@ def _project_to_host_envelope(response: ApiResponse, status_code: int) -> JSONRe
     The CLI stdout keeps the untouched §4.12 envelope (regression line, test_cli.py).
     """
     return JSONResponse(status_code=status_code, content=_host_envelope_content(response, status_code))
+
+
+def _workflow_summary(registry: WorkflowRegistry, wf_id: str) -> dict[str, Any]:
+    """Build a workflow summary dict (CONTRACT §4.13)."""
+    definition = registry.get_workflow_definition(wf_id)
+    return {
+        "workflow_id": wf_id,
+        "node_count": len(definition.nodes) if definition else 0,
+        "entry_point": definition.entry_point if definition else "",
+    }
+
+
+@router.get(
+    "/workflows",
+    response_model=HostApiResponse[list[dict[str, Any]]],
+    responses={
+        500: {
+            "model": HostApiResponse[None],
+            "description": "Missing registry injection: envelope with code=500, data=null",
+        },
+    },
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_list"][0])
+async def list_workflows(request: Request) -> JSONResponse:
+    """List all registered workflows as summaries (CONTRACT §4.13).
+
+    Args:
+        request: FastAPI request object required by the slowapi limiter and registry lookup.
+
+    Returns:
+        JSONResponse carrying the host unified envelope with ``data`` as a list of summaries.
+    """
+    try:
+        registry = get_registry(request)
+    except RuntimeError as exc:
+        logger.exception("api_workflow_registry_missing")
+        return _project_to_host_envelope(ApiResponse(success=False, error=str(exc)), 500)
+    summaries = [_workflow_summary(registry, wf_id) for wf_id in registry.list_workflows()]
+    return _project_to_host_envelope(ApiResponse(success=True, data=summaries), 200)
 
 
 @router.post(
