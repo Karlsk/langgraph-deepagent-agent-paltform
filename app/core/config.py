@@ -275,6 +275,7 @@ class Settings:
             "health": ["20 per minute"],
             "workflows_execute": ["20 per minute"],
             "workflows_list": ["20 per minute"],
+            "workflows_detail": ["20 per minute"],
             "subagent": ["60 per minute"],
             "skill": ["60 per minute"],
             "agent_app": ["60 per minute"],

@@ -14,19 +14,20 @@ no module-level cache or mutable globals.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+from yaml import safe_dump as yaml_safe_dump
 
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.schemas.base import ApiResponse as HostApiResponse
 from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact_processor
-from app.workflow.models import WorkflowNotFoundError
+from app.workflow.models import WorkflowDefinition, WorkflowNotFoundError
 from app.workflow.registry import WorkflowRegistry
 
 logger = structlog.get_logger(__name__)
@@ -86,6 +87,21 @@ def _workflow_summary(registry: WorkflowRegistry, wf_id: str) -> dict[str, Any]:
     }
 
 
+def _definition_view(definition: WorkflowDefinition) -> dict[str, Any]:
+    """Shared projection: exclude execution_history, both formats consume this dict."""
+    return definition.model_dump(mode="json", exclude={"execution_history"})
+
+
+def _definition_to_json(definition: WorkflowDefinition) -> dict[str, Any]:
+    """CONTRACT §4.13 frozen: JSON projection (delegates to _definition_view)."""
+    return _definition_view(definition)
+
+
+def _definition_to_yaml_text(definition: WorkflowDefinition) -> str:
+    """CONTRACT §4.13 frozen: YAML text via yaml.safe_dump for read-only preview."""
+    return yaml_safe_dump(_definition_view(definition), allow_unicode=True, sort_keys=False)
+
+
 @router.get(
     "/workflows",
     response_model=HostApiResponse[list[dict[str, Any]]],
@@ -113,6 +129,58 @@ async def list_workflows(request: Request) -> JSONResponse:
         return _project_to_host_envelope(ApiResponse(success=False, error=str(exc)), 500)
     summaries = [_workflow_summary(registry, wf_id) for wf_id in registry.list_workflows()]
     return _project_to_host_envelope(ApiResponse(success=True, data=summaries), 200)
+
+
+@router.get(
+    "/workflows/{workflow_id}",
+    response_model=HostApiResponse[dict[str, Any]],
+    responses={
+        404: {
+            "model": HostApiResponse[None],
+            "description": "Unknown workflow_id: envelope with code=404, data=null",
+        },
+        500: {
+            "model": HostApiResponse[None],
+            "description": "Missing registry injection: envelope with code=500, data=null",
+        },
+    },
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_detail"][0])
+async def get_workflow(
+    request: Request,
+    workflow_id: str,
+    format: Literal["json", "yaml"] = "json",
+) -> JSONResponse:
+    """Return a single workflow definition (CONTRACT §4.13).
+
+    Args:
+        request: FastAPI request (limiter + registry lookup).
+        workflow_id: Registered workflow to inspect.
+        format: ``"json"`` (default) or ``"yaml"`` for read-only preview.
+
+    Returns:
+        JSONResponse carrying the host unified envelope.
+    """
+    try:
+        registry = get_registry(request)
+    except RuntimeError as exc:
+        logger.exception("api_workflow_registry_missing")
+        return _project_to_host_envelope(ApiResponse(success=False, error=str(exc)), 500)
+
+    definition = registry.get_workflow_definition(workflow_id)
+    if definition is None:
+        logger.warning("api_workflow_definition_not_found", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(f"workflow not found: {workflow_id}")),
+            404,
+        )
+
+    if format == "yaml":
+        data: dict[str, Any] = {"yaml_text": _definition_to_yaml_text(definition)}
+    else:
+        data = _definition_to_json(definition)
+
+    return _project_to_host_envelope(ApiResponse(success=True, data=data), 200)
 
 
 @router.post(
