@@ -4,6 +4,7 @@
  */
 import type { Node, Edge } from '@vue-flow/core'
 import type { WorkflowDefinitionDTO, NodeDTO, EdgeDTO } from '@/api/workflow'
+import { isValidS7Condition } from '@/utils/s7Condition'
 
 export interface GraphValidationError {
   field: string
@@ -15,9 +16,6 @@ export interface GraphValidationError {
 const VALID_NODE_TYPES = new Set(['llm', 'http'])
 const END_NODE_ID = 'END'
 const GRID_SPACING = 200
-
-const S7_EQUALITY_RE = /^[a-zA-Z_][a-zA-Z0-9_.]*\s*==\s*'[^']*'$/
-const S7_TRUTHY_RE = /^[a-zA-Z_][a-zA-Z0-9_.]*$/
 
 function defaultPosition(index: number): { x: number; y: number } {
   const col = index % 4
@@ -144,8 +142,4 @@ export function validateGraph(def: WorkflowDefinitionDTO): GraphValidationError[
   }
 
   return errors
-}
-
-function isValidS7Condition(condition: string): boolean {
-  return S7_EQUALITY_RE.test(condition.trim()) || S7_TRUTHY_RE.test(condition.trim())
 }
