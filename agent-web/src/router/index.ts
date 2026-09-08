@@ -93,6 +93,24 @@ const router = createRouter({
       component: () => import('@/views/bundle/BundleImportExport.vue'),
       meta: { title: '配置迁移' },
     },
+    {
+      path: '/workflow',
+      name: 'workflow',
+      component: () => import('@/views/workflow/WorkflowListView.vue'),
+      meta: { title: '工作流管理' },
+    },
+    {
+      path: '/workflow/new/design',
+      name: 'workflow-new-design',
+      component: () => import('@/views/workflow/WorkflowDesignerView.vue'),
+      meta: { title: '新建工作流', designer: true },
+    },
+    {
+      path: '/workflow/:workflowId/design',
+      name: 'workflow-design',
+      component: () => import('@/views/workflow/WorkflowDesignerView.vue'),
+      meta: { title: '编辑工作流', designer: true },
+    },
   ],
 })
 

@@ -19,7 +19,7 @@ vi.mock('vue-router', async (importOriginal) => {
 import router from '@/router'
 
 describe('控制台导航路由', () => {
-  it('暴露登录页与五大业务导航页面', () => {
+  it('暴露登录页与业务导航页面（含 workflow 列表 / 设计器）', () => {
     const routes = router
       .getRoutes()
       .filter((route) => route.name !== undefined)
@@ -29,6 +29,7 @@ describe('控制台导航路由', () => {
     expect(routes).toEqual([
       { name: 'agent', path: '/agent' },
       { name: 'agentapp', path: '/agentapp' },
+      { name: 'bundle', path: '/bundle' },
       { name: 'chat', path: '/chat' },
       { name: 'chatSession', path: '/chat/:sessionId' },
       { name: 'llm', path: '/llm' },
@@ -38,6 +39,9 @@ describe('控制台导航路由', () => {
       { name: 'register', path: '/register' },
       { name: 'skill', path: '/skill' },
       { name: 'subagent', path: '/subagent' },
+      { name: 'workflow', path: '/workflow' },
+      { name: 'workflow-design', path: '/workflow/:workflowId/design' },
+      { name: 'workflow-new-design', path: '/workflow/new/design' },
     ])
   })
 
@@ -51,6 +55,24 @@ describe('控制台导航路由', () => {
     await router.push('/llm/trash')
     expect(router.currentRoute.value.name).toBe('llm-trash')
     expect(router.currentRoute.value.meta.title).toBe('提供商回收站')
+  })
+  it('工作流设计器路由 /workflow/:workflowId/design 受认证守卫保护', { timeout: 15_000 }, async () => {
+    hasUserTokenMock.mockReturnValue(false)
+    await router.push('/workflow/demo/design')
+    expect(router.currentRoute.value.name).toBe('login')
+    expect(router.currentRoute.value.query.redirect).toBe('/workflow/demo/design')
+
+    hasUserTokenMock.mockReturnValue(true)
+    await router.push('/workflow/demo/design')
+    expect(router.currentRoute.value.name).toBe('workflow-design')
+    expect(router.currentRoute.value.meta.title).toBe('编辑工作流')
+  })
+
+  it('新建工作流设计器 /workflow/new/design 匹配 new 路由而非 :workflowId 参数', { timeout: 15_000 }, async () => {
+    hasUserTokenMock.mockReturnValue(true)
+    await router.push('/workflow/new/design')
+    expect(router.currentRoute.value.name).toBe('workflow-new-design')
+    expect(router.currentRoute.value.meta.title).toBe('新建工作流')
   })
 })
 

@@ -14,6 +14,7 @@ import {
   Platform,
   Pointer,
   Setting,
+  SetUp,
   User,
 } from '@element-plus/icons-vue'
 
@@ -78,6 +79,10 @@ async function handleLogout(): Promise<void> {
         <el-menu-item index="/agentapp">
           <el-icon><Platform /></el-icon>
           <template #title>AgentApp 总览</template>
+        </el-menu-item>
+        <el-menu-item index="/workflow">
+          <el-icon><SetUp /></el-icon>
+          <template #title>工作流管理</template>
         </el-menu-item>
         <el-menu-item index="/agent">
           <el-icon><User /></el-icon>
