@@ -21,7 +21,10 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
   http: {
     url: '',
     method: 'POST',
+    body_template: '',
     response_path: null,
+    mock_enabled: false,
+    mock_responses: {},
     timeout: 30.0,
     max_retries: 0,
     retry_base_delay: 1.0,
