@@ -74,6 +74,16 @@
   --el-text-color-regular: var(--color-text-secondary);
   --el-text-color-secondary: var(--color-text-tertiary);
 
+  /* ---------------------------------------------------------------- */
+  /* 画布语义 token（spec-08；复用 A-palette，不引入新色值）                */
+  /* ---------------------------------------------------------------- */
+  --color-node-llm: var(--color-primary-500);
+  --color-node-http: var(--color-accent-500);
+  --color-node-python: var(--color-danger-600);
+  --color-edge-default: var(--color-border-default);
+  --color-edge-conditional: var(--color-warning-600);
+  --color-canvas-bg: var(--color-bg-canvas);
+
   --app-font-display: 'Sora', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
     'Microsoft YaHei', sans-serif;
 }

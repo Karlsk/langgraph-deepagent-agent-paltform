@@ -42,6 +42,15 @@ describe('design tokens', () => {
     expect(stylesheet).toContain('--color-bg-canvas: #f8f8fc;')
   })
 
+  it('defines canvas semantic tokens referencing the A-palette', () => {
+    expect(stylesheet).toContain('--color-node-llm: var(--color-primary-500);')
+    expect(stylesheet).toContain('--color-node-http: var(--color-accent-500);')
+    expect(stylesheet).toContain('--color-node-python: var(--color-danger-600);')
+    expect(stylesheet).toContain('--color-edge-default: var(--color-border-default);')
+    expect(stylesheet).toContain('--color-edge-conditional: var(--color-warning-600);')
+    expect(stylesheet).toContain('--color-canvas-bg: var(--color-bg-canvas);')
+  })
+
   it('defines motion tokens and honors reduced-motion preferences', () => {
     expect(stylesheet).toContain('--duration-fast: 120ms;')
     expect(stylesheet).toContain('--ease-standard: cubic-bezier(.2, .8, .2, 1);')

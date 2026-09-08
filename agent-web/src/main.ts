@@ -6,6 +6,8 @@ import 'element-plus/dist/index.css'
 import App from './App.vue'
 import router from './router'
 import './styles/index.css'
+import '@vue-flow/core/dist/style.css'
+import '@vue-flow/core/dist/theme-default.css'
 
 const app = createApp(App)
 
