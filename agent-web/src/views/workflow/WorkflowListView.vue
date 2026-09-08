@@ -101,6 +101,7 @@ function handleDelete(row: WorkflowSummary): void {
       v-if="executeWorkflowId"
       v-model="executeDialogVisible"
       :workflow-id="executeWorkflowId"
+      @executed="() => tableRef?.refresh()"
     />
   </div>
 </template>
