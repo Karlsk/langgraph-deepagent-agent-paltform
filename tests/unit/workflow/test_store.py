@@ -224,6 +224,57 @@ state_schema:
         assert registry.has_workflow("only_example")
         assert not registry.has_workflow("nonexistent")
 
+    def test_build_registry_corrupted_yaml_fails_fast(self, tmp_path: Path) -> None:
+        """S16: corrupted YAML in user_dir triggers fail-fast ValueError."""
+        from app.workflow.cli import build_registry
+
+        examples_dir = tmp_path / "examples"
+        user_dir = tmp_path / "user"
+        examples_dir.mkdir()
+        user_dir.mkdir()
+
+        examples_yaml = """
+workflow_id: valid_example
+entry_point: n1
+nodes:
+  - name: n1
+    type: echo
+    config:
+      output:
+        result: ok
+edges:
+  - source: n1
+    target: END
+state_schema:
+  input:
+    type: str
+    description: input
+"""
+        (examples_dir / "example.yaml").write_text(examples_yaml, encoding="utf-8")
+
+        corrupted_yaml = """
+workflow_id: corrupted
+entry_point: c1
+nodes:
+  - name: c1
+    type: echo
+    config:
+      output:
+        result: ok
+edges:
+  - source: c1
+    target: END
+state_schema:
+  input:
+    type: str
+    description: input
+invalid_yaml_content: [unclosed
+"""
+        (user_dir / "corrupted.yaml").write_text(corrupted_yaml, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Failed to parse YAML file .*corrupted.yaml"):
+            build_registry(examples_dir, user_dir=user_dir)
+
 
 class TestStoreUsesOnlySafeYaml:
     def test_no_unsafe_yaml_calls(self) -> None:
