@@ -268,8 +268,8 @@ onMounted(async () => {
 
 .designer-field-errors {
   padding: 4px 16px;
-  border-bottom: 1px solid var(--color-danger-200);
-  background: var(--color-danger-50);
+  border-bottom: 1px solid var(--el-color-danger-light-7);
+  background: var(--el-color-danger-light-9);
 }
 
 .designer-field-errors__item {
