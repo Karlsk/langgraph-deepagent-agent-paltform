@@ -168,10 +168,12 @@ vi.mock('@/api/workflow', () => ({
 vi.mock('vue-router', () => ({
   useRoute: () => routeState,
   useRouter: () => ({ push: mockRouterPush }),
+  onBeforeRouteLeave: vi.fn(),
 }))
 
 vi.mock('element-plus', () => ({
   ElMessage: mockElMessage,
+  ElMessageBox: { confirm: vi.fn() },
 }))
 
 vi.mock('@/views/workflow/canvas/WorkflowCanvas.vue', () => ({

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onMounted, onBeforeUnmount, computed } from 'vue'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
 import { useWorkflowDesigner } from '@/composables/useWorkflowDesigner'
 import { useWorkflowCapabilities } from '@/composables/useWorkflowCapabilities'
 import WorkflowCanvas from '@/views/workflow/canvas/WorkflowCanvas.vue'
@@ -31,6 +32,9 @@ const {
   handleUpdateSchema,
   handleUpdateNodes,
   handleUpdateEdges,
+  fieldErrors,
+  isSaving,
+  save,
   loadWorkflow,
 } = useWorkflowDesigner()
 
@@ -47,6 +51,37 @@ function onWorkflowIdInput(event: Event) {
   const value = (event.target as HTMLInputElement).value
   meta.value = { ...meta.value, workflow_id: value }
 }
+
+async function onSave() {
+  await save()
+  if (!isDirty.value && isNewMode.value && meta.value.workflow_id) {
+    await router.replace({
+      name: 'workflow-design',
+      params: { workflowId: meta.value.workflow_id },
+    })
+  }
+}
+
+onBeforeRouteLeave(async () => {
+  if (!isDirty.value) return true
+  try {
+    await ElMessageBox.confirm('有未保存的修改，确定要离开吗？', '未保存提示', {
+      confirmButtonText: '确定离开',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+    return true
+  } catch {
+    return false
+  }
+})
+
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (isDirty.value) e.preventDefault()
+}
+
+onMounted(() => window.addEventListener('beforeunload', onBeforeUnload))
+onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload))
 
 onMounted(async () => {
   await refreshCapabilities()
@@ -95,12 +130,18 @@ onMounted(async () => {
           v-if="canEdit"
           data-testid="save-button"
           class="designer-toolbar__btn"
-          disabled
-          title="保存流程由 spec-21 实现"
+          :disabled="isSaving"
+          @click="onSave"
         >
-          保存
+          {{ isSaving ? '保存中...' : '保存' }}
         </button>
         <span v-if="isDirty" class="designer-toolbar__dirty">未保存</span>
+      </div>
+    </div>
+
+    <div v-if="fieldErrors.length" data-testid="field-errors" class="designer-field-errors">
+      <div v-for="(err, i) in fieldErrors" :key="i" class="designer-field-errors__item">
+        {{ err.message }}
       </div>
     </div>
 
@@ -223,5 +264,17 @@ onMounted(async () => {
   display: flex;
   flex: 1;
   overflow: hidden;
+}
+
+.designer-field-errors {
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--color-danger-200);
+  background: var(--color-danger-50);
+}
+
+.designer-field-errors__item {
+  font-size: 12px;
+  color: var(--color-danger-600);
+  line-height: 1.4;
 }
 </style>

@@ -1,11 +1,12 @@
 import { ref, computed, shallowRef, type Ref, type ComputedRef, type ShallowRef } from 'vue'
 import type { Node, Edge } from '@vue-flow/core'
 import type { WorkflowDefinitionDTO, StateFieldDTO } from '@/api/workflow'
-import { getWorkflow } from '@/api/workflow'
-import { definitionToGraph } from '@/composables/useWorkflowGraph'
+import { getWorkflow, saveWorkflow } from '@/api/workflow'
+import { definitionToGraph, graphToDefinition, validateGraph } from '@/composables/useWorkflowGraph'
 import { nextNodeName, DEFAULT_CONFIGS } from '@/views/workflow/canvas/nodeCatalog'
 import { deriveStateChannels } from '@/utils/s7Condition'
-import { notifyError } from '@/utils/notify'
+import { notifyError, notifySuccess } from '@/utils/notify'
+import { toFieldErrors, type FieldError } from '@/utils/workflowErrors'
 
 export interface WorkflowDesignerState {
   nodes: ShallowRef<Node[]>
@@ -33,6 +34,9 @@ export interface WorkflowDesignerState {
   handleUpdateSchema: (schema: Record<string, StateFieldDTO>) => void
   handleUpdateNodes: (newNodes: Node[]) => void
   handleUpdateEdges: (newEdges: Edge[]) => void
+  fieldErrors: Ref<FieldError[]>
+  isSaving: Ref<boolean>
+  save: () => Promise<void>
   loadWorkflow: (workflowId: string) => Promise<void>
 }
 
@@ -52,6 +56,8 @@ export function useWorkflowDesigner(): WorkflowDesignerState {
   const selectedNodeId = ref<string | null>(null)
   const isDirty = ref(false)
   const isLoading = ref(false)
+  const fieldErrors = ref<FieldError[]>([])
+  const isSaving = ref(false)
 
   const conditionDialogVisible = ref(false)
   const pendingEdge = ref<{ source: string; target: string } | null>(null)
@@ -203,6 +209,28 @@ export function useWorkflowDesigner(): WorkflowDesignerState {
     edges.value = newEdges
   }
 
+  async function save(): Promise<void> {
+    if (isSaving.value) return
+    const def = graphToDefinition(meta.value, nodes.value, edges.value)
+    const localErrors = validateGraph(def)
+    if (localErrors.length) {
+      fieldErrors.value = toFieldErrors(localErrors)
+      return
+    }
+    isSaving.value = true
+    fieldErrors.value = []
+    try {
+      await saveWorkflow(def.workflow_id, def)
+      isDirty.value = false
+      fieldErrors.value = []
+      notifySuccess('保存成功')
+    } catch (error) {
+      fieldErrors.value = toFieldErrors(error)
+    } finally {
+      isSaving.value = false
+    }
+  }
+
   async function loadWorkflow(workflowId: string) {
     isLoading.value = true
     try {
@@ -248,6 +276,9 @@ export function useWorkflowDesigner(): WorkflowDesignerState {
     handleUpdateSchema,
     handleUpdateNodes,
     handleUpdateEdges,
+    fieldErrors,
+    isSaving,
+    save,
     loadWorkflow,
   }
 }
