@@ -26,6 +26,8 @@ const {
   conditionDialogProps,
   conditionDialogHandlers,
   ConditionEdgeDialogStub,
+  yamlPreviewProps,
+  YamlPreviewDrawerStub,
 } = vi.hoisted(() => {
   const mockGetWorkflow = vi.fn()
   const mockGetWorkflowCapabilities = vi.fn()
@@ -137,6 +139,27 @@ const {
     },
   }
 
+  let _yamlPreviewTarget: Record<string, unknown> = {}
+  const yamlPreviewProps: Record<string, unknown> = new Proxy(
+    {},
+    { get: (_, k) => (_yamlPreviewTarget as Record<string, unknown>)[k as string] },
+  )
+  const yamlPreviewHandlers: Record<string, (...args: unknown[]) => void> = {}
+  const YamlPreviewDrawerStub = {
+    name: 'YamlPreviewDrawer',
+    props: {
+      modelValue: { type: Boolean, default: false },
+      workflowId: { type: String, default: '' },
+      dirty: { type: Boolean, default: false },
+    },
+    emits: ['update:modelValue'],
+    template: '<div class="yaml-preview-drawer-stub" />',
+    setup(p: Record<string, unknown>, { emit: e }: { emit: (...args: unknown[]) => void }) {
+      _yamlPreviewTarget = p
+      yamlPreviewHandlers.close = () => e('update:modelValue', false)
+    },
+  }
+
   return {
     mockGetWorkflow,
     mockGetWorkflowCapabilities,
@@ -157,6 +180,8 @@ const {
     conditionDialogProps,
     conditionDialogHandlers,
     ConditionEdgeDialogStub,
+    yamlPreviewProps,
+    YamlPreviewDrawerStub,
   }
 })
 
@@ -194,6 +219,10 @@ vi.mock('@/views/workflow/panel/StateSchemaPanel.vue', () => ({
 
 vi.mock('@/views/workflow/canvas/ConditionEdgeDialog.vue', () => ({
   default: ConditionEdgeDialogStub,
+}))
+
+vi.mock('@/views/workflow/YamlPreviewDrawer.vue', () => ({
+  default: YamlPreviewDrawerStub,
 }))
 
 import WorkflowDesignerView from '@/views/workflow/WorkflowDesignerView.vue'
@@ -412,5 +441,54 @@ describe('WorkflowDesignerView 能力门禁（spec-19）', () => {
     expect(canvasProps.readonly).toBe(false)
     const saveBtn = wrapper.find('[data-testid="save-button"]')
     expect(saveBtn.exists()).toBe(true)
+  })
+})
+
+describe('WorkflowDesignerView YAML 预览（spec-22）', () => {
+  it('预览按钮可点击（不禁用）', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const previewBtn = wrapper.find('[data-testid="yaml-preview-button"]')
+    expect(previewBtn.exists()).toBe(true)
+    expect(previewBtn.attributes('disabled')).toBeUndefined()
+  })
+
+  it('点击预览按钮 → YamlPreviewDrawer 收到 modelValue=true', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(yamlPreviewProps.modelValue).toBe(false)
+
+    await wrapper.find('[data-testid="yaml-preview-button"]').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(yamlPreviewProps.modelValue).toBe(true)
+    expect(yamlPreviewProps.workflowId).toBe('wf1')
+    expect(yamlPreviewProps.dirty).toBe(false)
+  })
+
+  it('新建模式 → 预览按钮可点击，drawer 收到空 workflowId', async () => {
+    routeState.name = 'workflow-new-design'
+    routeState.params = {}
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const previewBtn = wrapper.find('[data-testid="yaml-preview-button"]')
+    expect(previewBtn.exists()).toBe(true)
+
+    await previewBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(yamlPreviewProps.modelValue).toBe(true)
+    expect(yamlPreviewProps.workflowId).toBe('')
   })
 })

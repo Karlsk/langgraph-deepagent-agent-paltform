@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, computed } from 'vue'
+import { onMounted, onBeforeUnmount, computed, ref } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { useWorkflowDesigner } from '@/composables/useWorkflowDesigner'
@@ -9,6 +9,7 @@ import NodePalette from '@/views/workflow/canvas/NodePalette.vue'
 import NodeConfigPanel from '@/views/workflow/panel/NodeConfigPanel.vue'
 import StateSchemaPanel from '@/views/workflow/panel/StateSchemaPanel.vue'
 import ConditionEdgeDialog from '@/views/workflow/canvas/ConditionEdgeDialog.vue'
+import YamlPreviewDrawer from '@/views/workflow/YamlPreviewDrawer.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -41,6 +42,8 @@ const {
 const { canEdit, refresh: refreshCapabilities } = useWorkflowCapabilities()
 
 const isNewMode = computed(() => route.name === 'workflow-new-design')
+
+const yamlPreviewVisible = ref(false)
 
 function onEntryPointChange(event: Event) {
   const value = (event.target as HTMLSelectElement).value
@@ -123,7 +126,11 @@ onMounted(async () => {
       </div>
 
       <div class="designer-toolbar__actions">
-        <button class="designer-toolbar__btn" disabled title="YAML 预览由 spec-22 实现">
+        <button
+          data-testid="yaml-preview-button"
+          class="designer-toolbar__btn"
+          @click="yamlPreviewVisible = true"
+        >
           预览
         </button>
         <button
@@ -181,6 +188,12 @@ onMounted(async () => {
       :readonly="!canEdit"
       @update:model-value="conditionDialogVisible = $event"
       @confirm="handleConditionConfirm"
+    />
+
+    <YamlPreviewDrawer
+      v-model="yamlPreviewVisible"
+      :workflow-id="(route.params.workflowId as string) ?? ''"
+      :dirty="isDirty"
     />
   </div>
 </template>
