@@ -28,6 +28,7 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.models.user import User
 from app.schemas.base import ApiResponse as HostApiResponse
+from app.workflow.security import WorkflowValidationError
 from app.workflow.auth import require_workflow_admin
 from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact, redact_processor
@@ -116,12 +117,15 @@ ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http"})
 
 
 def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> WorkflowDefinition:
-    """Parse and validate a PUT body: pydantic → id match → node-type whitelist (S15).
+    """Parse and validate a PUT body: pydantic → id match → node-type whitelist → SSRF guard (S15, spec-20).
 
     Raises:
         ValidationError: If pydantic model validation fails.
         ValueError: If workflow_id mismatches or a node type is not whitelisted.
+        WorkflowValidationError: If an HTTP node URL fails SSRF validation (spec-20).
     """
+    from app.workflow.security import validate_http_url
+
     definition = WorkflowDefinition.model_validate(payload)
     if definition.workflow_id != workflow_id:
         msg = f"body workflow_id '{definition.workflow_id}' does not match path id '{workflow_id}'"
@@ -130,6 +134,13 @@ def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> W
         if node.type not in ALLOWED_NODE_TYPES:
             msg = f"node type '{node.type}' is not allowed; allowed types: {sorted(ALLOWED_NODE_TYPES)}"
             raise ValueError(msg)
+        # spec-20: SSRF guard for HTTP nodes with mock_enabled=false
+        if node.type == "http":
+            config = node.config
+            if not config.get("mock_enabled", False):
+                url = config.get("url")
+                if url:
+                    validate_http_url(url)
     return definition
 
 
@@ -347,6 +358,11 @@ async def save_workflow(
         logger.warning("api_save_workflow_id_mismatch_or_blocked", workflow_id=workflow_id)
         return _project_to_host_envelope(
             ApiResponse(success=False, error=_redacted_summary(str(exc))), 422
+        )
+    except WorkflowValidationError as exc:
+        logger.warning("api_save_workflow_ssrf_blocked", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(f"SSRF guard: {exc}")), 422
         )
 
     try:

@@ -28,6 +28,7 @@ from tenacity import RetryError, Retrying, retry_if_exception, stop_after_attemp
 from app.workflow.models import ExecutionLog, HTTPNodeError, NodeType, OperatorLog
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
+from app.workflow.security import validate_http_url
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 logger = structlog.get_logger(__name__)
@@ -207,6 +208,7 @@ class HTTPNode(BaseNode):
                     status_code = _MOCK_HIT_STATUS_CODE
                 else:
                     # 4. 真实分支：tenacity 按 retry_on_status 退避 + raise_for_status（S8）
+                    validate_http_url(rendered_url)  # spec-20: execution-time SSRF guard
                     response = self._send_with_retry(cfg.method, rendered_url, headers, body)
                     data = response.json()
                     status_code = response.status_code

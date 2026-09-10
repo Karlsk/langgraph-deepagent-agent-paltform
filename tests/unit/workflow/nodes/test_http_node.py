@@ -5,6 +5,7 @@ All tests run with zero real network: HTTP traffic is served by
 """
 
 import json
+import socket
 from typing import Any
 
 import httpx
@@ -17,6 +18,20 @@ from app.workflow.nodes.http_node import HTTPNode, HTTPNodeConfig
 
 STATE_MARK = "__full_state_marker__"
 SECRET_VALUE = "Bearer super-secret-token-spec05"  # noqa: S105 — dummy sentinel for H6 leak tests
+
+
+@pytest.fixture(autouse=True)
+def mock_dns_resolution(monkeypatch: pytest.MonkeyPatch):
+    """Mock DNS resolution to return a public IP for api.example.com (spec-20: SSRF guard)."""
+
+    def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        # 为测试中常用的主机名返回公网 IP
+        if host in ("api.example.com", "example.com"):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        # 其他主机名抛出异常（模拟 DNS 失败）
+        raise socket.gaierror(f"cannot resolve {host}")
+
+    monkeypatch.setattr("app.workflow.security.socket.getaddrinfo", mock_getaddrinfo)
 
 
 def make_node(config: dict[str, Any] | HTTPNodeConfig | None = None, **kwargs: Any) -> HTTPNode:

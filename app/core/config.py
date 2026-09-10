@@ -185,6 +185,12 @@ class Settings:
         # Empty list = no one can write (safe default)
         self.WORKFLOW_ADMIN_USERNAMES: list[str] = parse_list_from_env("WORKFLOW_ADMIN_USERNAMES", [])
 
+        # Workflow HTTP SSRF allowlist (spec-20: optional host whitelist, env-only)
+        # Empty list = allow all public hosts (private networks always blocked)
+        self.WORKFLOW_HTTP_ALLOWED_HOSTS: list[str] = parse_list_from_env(
+            "WORKFLOW_HTTP_ALLOWED_HOSTS", []
+        )
+
         # Workspace roots (G2 three-layer layout; spec-g2-workspace v3.3 §2.2).
         # DATA_ROOT is the single parent of global/, agents/<app_id>/ and
         # users/. The legacy SKILLS_ROOT env is honored one major version for
