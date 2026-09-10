@@ -37,6 +37,7 @@ const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     listWorkflows: vi.fn(),
     deleteWorkflow: vi.fn(),
+    getWorkflowCapabilities: vi.fn(),
   },
 }))
 
@@ -166,6 +167,7 @@ beforeEach(() => {
   confirmMock.mockResolvedValue(undefined)
   apiMock.listWorkflows.mockResolvedValue(ROWS.map((r) => ({ ...r })))
   apiMock.deleteWorkflow.mockResolvedValue(null)
+  apiMock.getWorkflowCapabilities.mockResolvedValue({ can_edit: true })
 })
 
 describe('WorkflowListView 列表页（spec-06）', () => {
@@ -258,5 +260,25 @@ describe('WorkflowListView 列表页（spec-06）', () => {
     const data = wrapper.findComponent(ElTableStub).props('data') as WorkflowSummary[]
     expect(data[1].description).toBeUndefined()
     expect(wrapper.text()).toContain('—')
+  })
+})
+
+describe('WorkflowListView 能力门禁（spec-19）', () => {
+  it('canEdit=false → 删除按钮隐藏', async () => {
+    apiMock.getWorkflowCapabilities.mockResolvedValue({ can_edit: false })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const buttons = wrapper.findAll('button').filter((b) => b.text().includes('删除'))
+    expect(buttons).toHaveLength(0)
+  })
+
+  it('canEdit=true → 删除按钮可见', async () => {
+    apiMock.getWorkflowCapabilities.mockResolvedValue({ can_edit: true })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const buttons = wrapper.findAll('button').filter((b) => b.text().includes('删除'))
+    expect(buttons.length).toBeGreaterThan(0)
   })
 })

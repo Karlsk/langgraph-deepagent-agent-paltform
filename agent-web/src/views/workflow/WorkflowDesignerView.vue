@@ -2,6 +2,7 @@
 import { onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useWorkflowDesigner } from '@/composables/useWorkflowDesigner'
+import { useWorkflowCapabilities } from '@/composables/useWorkflowCapabilities'
 import WorkflowCanvas from '@/views/workflow/canvas/WorkflowCanvas.vue'
 import NodePalette from '@/views/workflow/canvas/NodePalette.vue'
 import NodeConfigPanel from '@/views/workflow/panel/NodeConfigPanel.vue'
@@ -33,6 +34,8 @@ const {
   loadWorkflow,
 } = useWorkflowDesigner()
 
+const { canEdit, refresh: refreshCapabilities } = useWorkflowCapabilities()
+
 const isNewMode = computed(() => route.name === 'workflow-new-design')
 
 function onEntryPointChange(event: Event) {
@@ -46,6 +49,7 @@ function onWorkflowIdInput(event: Event) {
 }
 
 onMounted(async () => {
+  await refreshCapabilities()
   const workflowId = route.params.workflowId as string | undefined
   if (workflowId) {
     try {
@@ -87,7 +91,13 @@ onMounted(async () => {
         <button class="designer-toolbar__btn" disabled title="YAML 预览由 spec-22 实现">
           预览
         </button>
-        <button class="designer-toolbar__btn" disabled title="保存流程由 spec-21 实现">
+        <button
+          v-if="canEdit"
+          data-testid="save-button"
+          class="designer-toolbar__btn"
+          disabled
+          title="保存流程由 spec-21 实现"
+        >
           保存
         </button>
         <span v-if="isDirty" class="designer-toolbar__dirty">未保存</span>
@@ -95,11 +105,12 @@ onMounted(async () => {
     </div>
 
     <div class="designer-body">
-      <NodePalette @add-node="handleAddNode" />
+      <NodePalette :readonly="!canEdit" @add-node="handleAddNode" />
 
       <WorkflowCanvas
         :nodes="nodes"
         :edges="edges"
+        :readonly="!canEdit"
         @update:nodes="handleUpdateNodes"
         @update:edges="handleUpdateEdges"
         @select-node="handleSelectNode"
@@ -109,12 +120,14 @@ onMounted(async () => {
       <NodeConfigPanel
         v-if="selectedNode"
         :node="selectedNode"
+        :readonly="!canEdit"
         @update:node="handleUpdateNode"
         @remove-node="handleRemoveNode"
       />
       <StateSchemaPanel
         v-else
         :model-value="meta.state_schema"
+        :readonly="!canEdit"
         @update:model-value="handleUpdateSchema"
       />
     </div>
@@ -124,6 +137,7 @@ onMounted(async () => {
       :edge="conditionEdge"
       :node-names="nodeNames"
       :state-channels="stateChannels"
+      :readonly="!canEdit"
       @update:model-value="conditionDialogVisible = $event"
       @confirm="handleConditionConfirm"
     />

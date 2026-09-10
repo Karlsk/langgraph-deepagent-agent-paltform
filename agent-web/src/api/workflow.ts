@@ -66,6 +66,10 @@ export interface WorkflowExecuteResult {
   metadata: Record<string, unknown> & { execution_logs?: ExecutionLogView[] }
 }
 
+export interface WorkflowCapabilities {
+  can_edit: boolean
+}
+
 export function listWorkflows(): Promise<WorkflowSummary[]> {
   return get<WorkflowSummary[]>('/workflows')
 }
@@ -77,6 +81,10 @@ export function getWorkflow(
   return get<WorkflowDefinitionDTO | { yaml_text: string }>('/workflows/' + id, {
     params: { format },
   })
+}
+
+export function getWorkflowCapabilities(): Promise<WorkflowCapabilities> {
+  return get<WorkflowCapabilities>('/workflows/capabilities')
 }
 
 export function saveWorkflow(

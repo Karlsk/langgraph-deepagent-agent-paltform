@@ -23,10 +23,12 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from yaml import safe_dump as yaml_safe_dump
 
+from app.api.v1.auth import get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
+from app.models.user import User
 from app.schemas.base import ApiResponse as HostApiResponse
-from app.workflow.auth import require_admin
+from app.workflow.auth import require_workflow_admin
 from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact, redact_processor
 from app.workflow.models import ExecutionLog, WorkflowDefinition, WorkflowEngineError, WorkflowNotFoundError
@@ -142,11 +144,15 @@ def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> W
     },
 )
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_list"][0])
-async def list_workflows(request: Request) -> JSONResponse:
+async def list_workflows(
+    request: Request,
+    _user: User = Depends(get_current_user),
+) -> JSONResponse:
     """List all registered workflows as summaries (CONTRACT §4.13).
 
     Args:
         request: FastAPI request object required by the slowapi limiter and registry lookup.
+        _user: Current authenticated user (auth gate).
 
     Returns:
         JSONResponse carrying the host unified envelope with ``data`` as a list of summaries.
@@ -158,6 +164,28 @@ async def list_workflows(request: Request) -> JSONResponse:
         return _project_to_host_envelope(ApiResponse(success=False, error=str(exc)), 500)
     summaries = [_workflow_summary(registry, wf_id) for wf_id in registry.list_workflows()]
     return _project_to_host_envelope(ApiResponse(success=True, data=summaries), 200)
+
+
+@router.get(
+    "/workflows/capabilities",
+    response_model=HostApiResponse[dict[str, Any]],
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_list"][0])
+async def workflow_capabilities(
+    request: Request,
+    user: User = Depends(get_current_user),
+) -> JSONResponse:
+    """Return current user's workflow editing capabilities (spec-19).
+
+    Args:
+        request: FastAPI request object (limiter).
+        user: Current authenticated user.
+
+    Returns:
+        JSONResponse with ``{can_edit: bool}`` based on admin allowlist.
+    """
+    can_edit = user.username in settings.WORKFLOW_ADMIN_USERNAMES
+    return _project_to_host_envelope(ApiResponse(success=True, data={"can_edit": can_edit}), 200)
 
 
 @router.get(
@@ -179,6 +207,7 @@ async def get_workflow(
     request: Request,
     workflow_id: str,
     format: Literal["json", "yaml"] = "json",
+    _user: User = Depends(get_current_user),
 ) -> JSONResponse:
     """Return a single workflow definition (CONTRACT §4.13).
 
@@ -186,6 +215,7 @@ async def get_workflow(
         request: FastAPI request (limiter + registry lookup).
         workflow_id: Registered workflow to inspect.
         format: ``"json"`` (default) or ``"yaml"`` for read-only preview.
+        _user: Current authenticated user (auth gate).
 
     Returns:
         JSONResponse carrying the host unified envelope.
@@ -235,6 +265,7 @@ async def execute_workflow(
     request: Request,
     workflow_id: str,
     payload: dict[str, Any] | None = None,
+    _user: User = Depends(get_current_user),
 ) -> JSONResponse:
     """Execute one registered workflow and return the unified envelope (AD-10).
 
@@ -242,6 +273,7 @@ async def execute_workflow(
         request: FastAPI request object required by the slowapi limiter and registry lookup.
         workflow_id: Registered workflow to execute.
         payload: Optional JSON object passed as workflow input.
+        _user: Current authenticated user (auth gate).
 
     Returns:
         JSONResponse carrying the host unified envelope ``{code, message, data}`` (200/404/500).
@@ -297,7 +329,7 @@ async def save_workflow(
     request: Request,
     payload: dict[str, Any] = Body(...),
     registry: WorkflowRegistry = Depends(get_registry),
-    _admin: None = Depends(require_admin),
+    _admin: User = Depends(require_workflow_admin),
 ) -> JSONResponse:
     """Full-replace register a workflow definition (spec-16, S13 atomic replacement).
 
@@ -359,7 +391,7 @@ async def delete_workflow_endpoint(
     workflow_id: str,
     request: Request,
     registry: WorkflowRegistry = Depends(get_registry),
-    _admin: None = Depends(require_admin),
+    _admin: User = Depends(require_workflow_admin),
 ) -> JSONResponse:
     """Delete a workflow from registry and disk; 404 if unknown (spec-18)."""
     logger.info("api_workflow_delete_requested", workflow_id=workflow_id)

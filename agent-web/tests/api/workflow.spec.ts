@@ -10,6 +10,7 @@ import {
   deleteWorkflow,
   executeWorkflow,
   getWorkflow,
+  getWorkflowCapabilities,
   listWorkflows,
   saveWorkflow,
   type EdgeDTO,
@@ -17,6 +18,7 @@ import {
   type NodeDTO,
   type StateFieldDTO,
   type UiLayoutDTO,
+  type WorkflowCapabilities,
   type WorkflowDefinitionDTO,
   type WorkflowExecuteResult,
   type WorkflowSummary,
@@ -135,5 +137,15 @@ describe('@/api/workflow 执行', () => {
       { input },
       { timeout: 600000 },
     )
+  })
+})
+
+describe('@/api/workflow 能力查询（spec-19）', () => {
+  it('getWorkflowCapabilities: GET /workflows/capabilities → 返回 { can_edit: boolean }', async () => {
+    const caps: WorkflowCapabilities = { can_edit: true }
+    requestMock.get.mockResolvedValueOnce(caps)
+
+    await expect(getWorkflowCapabilities()).resolves.toEqual(caps)
+    expect(requestMock.get).toHaveBeenCalledWith('/workflows/capabilities')
   })
 })

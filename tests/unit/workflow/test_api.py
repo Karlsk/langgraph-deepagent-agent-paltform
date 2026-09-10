@@ -25,6 +25,23 @@ from tests.unit.workflow.test_cli import _ECHO_YAML, _FAIL_YAML, _FailNode
 
 pytestmark = pytest.mark.unit
 
+
+def _add_mock_auth(app: FastAPI, username: str = "test_user") -> None:
+    """Inject a mock user into the FastAPI app for testing (spec-19: endpoints require auth)."""
+    from unittest.mock import MagicMock
+
+    from app.api.v1.auth import get_current_user
+
+    mock_user = MagicMock()
+    mock_user.id = 1
+    mock_user.username = username
+    mock_user.email = f"{username}@example.com"
+
+    async def mock_get_current_user() -> MagicMock:
+        return mock_user
+
+    app.dependency_overrides[get_current_user] = mock_get_current_user
+
 _SECOND_YAML = """
 workflow_id: alpha_workflow
 description: "second workflow for list testing"
@@ -140,6 +157,7 @@ def client(tmp_path: Path) -> Generator[TestClient, None, None]:
     app.state.workflow_directory = tmp_path
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app, username="admin_user")
     with TestClient(app) as test_client:
         yield test_client
 
@@ -191,6 +209,7 @@ def test_api_missing_registry_injection_returns_500(tmp_path: Path) -> None:
     app.state.limiter = workflow_api.limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.post("/workflows/echo_demo/execute", json={})
     assert response.status_code == 500
@@ -220,6 +239,7 @@ def test_list_workflows_empty(tmp_path: Path) -> None:
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.get("/workflows")
     assert response.status_code == 200
@@ -238,6 +258,7 @@ def test_list_workflows_returns_summaries_sorted(tmp_path: Path) -> None:
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.get("/workflows")
     assert response.status_code == 200
@@ -259,6 +280,7 @@ def test_list_workflows_reflects_registry_changes(tmp_path: Path) -> None:
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         first = test_client.get("/workflows").json()["data"]
         assert len(first) == 1
@@ -274,6 +296,7 @@ def test_list_workflows_missing_registry_returns_500(tmp_path: Path) -> None:
     app.state.limiter = workflow_api.limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.get("/workflows")
     assert response.status_code == 500
@@ -333,6 +356,7 @@ def test_get_workflow_missing_registry_returns_500(tmp_path: Path) -> None:
     app.state.limiter = workflow_api.limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.get("/workflows/any_id")
     assert response.status_code == 500
@@ -380,6 +404,7 @@ def test_execute_logs_redact_secrets(tmp_path: Path) -> None:
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.post("/workflows/secret_demo/execute", json={"input": "hi"})
     assert response.status_code == 200
@@ -399,6 +424,7 @@ def test_execute_logs_truncate_long_values(tmp_path: Path) -> None:
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app)
     with TestClient(app) as test_client:
         response = test_client.post("/workflows/long_demo/execute", json={"input": "hi"})
     assert response.status_code == 200
@@ -470,6 +496,7 @@ def save_client(tmp_path: Path) -> Generator[TestClient, None, None]:
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    _add_mock_auth(app, username="admin_user")
     with TestClient(app) as test_client:
         yield test_client
 
@@ -478,7 +505,12 @@ def test_save_workflow_happy_path(save_client: TestClient) -> None:
     """Valid definition → 200, has_workflow True, _definition_view returned."""
     from unittest.mock import patch
 
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         mock_save.return_value = Path("/fake/save_test.yaml")
         response = save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
     assert response.status_code == 200
@@ -498,7 +530,12 @@ def test_save_workflow_atomic_replace(save_client: TestClient) -> None:
     """S13: re-PUT with same id replaces; node count does not double."""
     from unittest.mock import patch
 
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         mock_save.return_value = Path("/fake/save_test.yaml")
         save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
         replacement = {
@@ -524,7 +561,12 @@ def test_save_workflow_missing_entry_point_returns_422(save_client: TestClient) 
 
     bad_payload = {**_SAVE_PAYLOAD, "workflow_id": "bad_ep"}
     bad_payload = {k: v for k, v in bad_payload.items() if k != "entry_point"}
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/bad_ep", json=bad_payload)
     assert response.status_code == 422
     registry = save_client.app.state.workflow_registry
@@ -537,7 +579,12 @@ def test_save_workflow_empty_nodes_returns_422(save_client: TestClient) -> None:
     from unittest.mock import patch
 
     bad_payload = {**_SAVE_PAYLOAD, "workflow_id": "no_nodes", "nodes": []}
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/no_nodes", json=bad_payload)
     assert response.status_code == 422
     registry = save_client.app.state.workflow_registry
@@ -550,7 +597,12 @@ def test_save_workflow_id_mismatch_returns_422(save_client: TestClient) -> None:
     from unittest.mock import patch
 
     mismatched = {**_SAVE_PAYLOAD, "workflow_id": "other_id"}
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/save_test", json=mismatched)
     assert response.status_code == 422
     registry = save_client.app.state.workflow_registry
@@ -569,7 +621,12 @@ def test_save_workflow_python_type_rejected(save_client: TestClient) -> None:
         "edges": [{"source": "bad_node", "target": "END"}],
         "state_schema": {"input": {"type": "str", "description": "x"}},
     }
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/rce_test", json=python_payload)
     assert response.status_code == 422
     registry = save_client.app.state.workflow_registry
@@ -588,7 +645,12 @@ def test_save_workflow_dangling_edge_returns_422(save_client: TestClient) -> Non
         "edges": [{"source": "step_a", "target": "nonexistent"}],
         "state_schema": {"input": {"type": "str", "description": "x"}},
     }
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/dangling", json=dangling)
     assert response.status_code == 422
     registry = save_client.app.state.workflow_registry
@@ -607,7 +669,12 @@ def test_save_workflow_entry_point_not_in_nodes_returns_422(save_client: TestCli
         "edges": [{"source": "step_a", "target": "END"}],
         "state_schema": {"input": {"type": "str", "description": "x"}},
     }
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/bad_entry", json=bad_entry)
     assert response.status_code == 422
     registry = save_client.app.state.workflow_registry
@@ -619,7 +686,12 @@ def test_save_workflow_calls_save_definition_yaml(save_client: TestClient) -> No
     """After successful registration, save_definition_yaml is called (spec-17 integration)."""
     from unittest.mock import patch
 
-    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         mock_save.return_value = Path("/fake/save_test.yaml")
         save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
     mock_save.assert_called_once()
@@ -631,7 +703,12 @@ def test_save_workflow_persist_failure_rolls_back(save_client: TestClient) -> No
     """save_definition_yaml raises → 500, registry rolled back (has_workflow False)."""
     from unittest.mock import patch
 
-    with patch("app.workflow.api.save_definition_yaml", side_effect=OSError("disk full")):
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.save_definition_yaml", side_effect=OSError("disk full")),
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
     assert response.status_code == 500
     registry = save_client.app.state.workflow_registry
@@ -640,7 +717,12 @@ def test_save_workflow_persist_failure_rolls_back(save_client: TestClient) -> No
 
 def test_delete_workflow_happy_path(client: TestClient) -> None:
     """DELETE registered workflow → 200, data=null, registry.has_workflow False (C6/H7 four-table sync)."""
-    response = client.delete("/workflows/echo_demo")
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
+    with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+        response = client.delete("/workflows/echo_demo")
     assert response.status_code == 200
     envelope = response.json()
     assert envelope["code"] == 200
@@ -654,7 +736,12 @@ def test_delete_workflow_calls_delete_definition_yaml(client: TestClient) -> Non
     """After successful DELETE, delete_definition_yaml is called (spec-17 integration)."""
     from unittest.mock import patch
 
-    with patch("app.workflow.api.delete_definition_yaml") as mock_delete:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.delete_definition_yaml") as mock_delete,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         mock_delete.return_value = True
         client.delete("/workflows/echo_demo")
     mock_delete.assert_called_once_with("echo_demo")
@@ -664,7 +751,12 @@ def test_delete_workflow_unknown_id_returns_404(client: TestClient) -> None:
     """Unknown workflow_id → 404 + envelope; registry and disk unchanged."""
     from unittest.mock import patch
 
-    with patch("app.workflow.api.delete_definition_yaml") as mock_delete:
+    from app.core.config import settings
+
+    with (
+        patch("app.workflow.api.delete_definition_yaml") as mock_delete,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
         response = client.delete("/workflows/nonexistent")
     assert response.status_code == 404
     envelope = response.json()
@@ -678,20 +770,30 @@ def test_delete_workflow_unknown_id_returns_404(client: TestClient) -> None:
 
 def test_delete_workflow_idempotent_second_delete_returns_404(client: TestClient) -> None:
     """Second DELETE on same id → 404 (idempotency boundary)."""
-    first = client.delete("/workflows/echo_demo")
-    assert first.status_code == 200
-    second = client.delete("/workflows/echo_demo")
-    assert second.status_code == 404
-    envelope = second.json()
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
+    with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+        first = client.delete("/workflows/echo_demo")
+        assert first.status_code == 200
+        second = client.delete("/workflows/echo_demo")
+        assert second.status_code == 404
+        envelope = second.json()
     assert envelope["code"] == 404
     assert envelope["data"] is None
 
 
 def test_delete_workflow_registry_stats_decrement(client: TestClient) -> None:
     """get_registry_stats workflow_count decrements by 1 after DELETE."""
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
     registry = client.app.state.workflow_registry
     stats_before = registry.get_registry_stats()
     count_before = stats_before["workflow_count"]
-    client.delete("/workflows/echo_demo")
+    with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+        client.delete("/workflows/echo_demo")
     stats_after = registry.get_registry_stats()
     assert stats_after["workflow_count"] == count_before - 1

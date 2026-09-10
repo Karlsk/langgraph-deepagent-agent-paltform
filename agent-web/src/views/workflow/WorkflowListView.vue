@@ -9,7 +9,7 @@
  * 操作列：设计 → router.push 跳设计器；执行 → 打开 spec-07 对话框；
  * 删除 → useConfirm + deleteWorkflow，成功后 refresh。
  */
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import WebAgentTable from '@/components/WebAgentTable.vue'
@@ -21,6 +21,7 @@ import {
   type WorkflowSummary,
 } from '@/api/workflow'
 import { useConfirm } from '@/composables/useConfirm'
+import { useWorkflowCapabilities } from '@/composables/useWorkflowCapabilities'
 import { paginateLocal } from '@/utils/paginate'
 import type { PageQuery, PageResult } from '@/types'
 
@@ -34,6 +35,11 @@ const columns: TableColumnConfig[] = [
 
 const router = useRouter()
 const tableRef = ref<{ refresh: () => void }>()
+const { canEdit, refresh: refreshCapabilities } = useWorkflowCapabilities()
+
+onMounted(() => {
+  void refreshCapabilities()
+})
 
 async function api(query: PageQuery): Promise<PageResult<WorkflowSummary>> {
   const items = await listWorkflows()
@@ -90,7 +96,13 @@ function handleDelete(row: WorkflowSummary): void {
           <el-button link type="primary" size="small" @click="handleExecute(row as WorkflowSummary)">
             执行
           </el-button>
-          <el-button link type="danger" size="small" @click="handleDelete(row as WorkflowSummary)">
+          <el-button
+            v-if="canEdit"
+            link
+            type="danger"
+            size="small"
+            @click="handleDelete(row as WorkflowSummary)"
+          >
             删除
           </el-button>
         </template>

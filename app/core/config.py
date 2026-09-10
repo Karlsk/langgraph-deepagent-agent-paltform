@@ -181,6 +181,10 @@ class Settings:
         self.JWT_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_DAYS", "7"))
         self.JWT_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
+        # Workflow admin allowlist (H6: env-only, no DB migration)
+        # Empty list = no one can write (safe default)
+        self.WORKFLOW_ADMIN_USERNAMES: list[str] = parse_list_from_env("WORKFLOW_ADMIN_USERNAMES", [])
+
         # Workspace roots (G2 three-layer layout; spec-g2-workspace v3.3 §2.2).
         # DATA_ROOT is the single parent of global/, agents/<app_id>/ and
         # users/. The legacy SKILLS_ROOT env is honored one major version for

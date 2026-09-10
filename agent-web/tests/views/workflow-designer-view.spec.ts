@@ -11,6 +11,7 @@ import type { Component } from 'vue'
 
 const {
   mockGetWorkflow,
+  mockGetWorkflowCapabilities,
   mockElMessage,
   routeState,
   mockRouterPush,
@@ -27,6 +28,7 @@ const {
   ConditionEdgeDialogStub,
 } = vi.hoisted(() => {
   const mockGetWorkflow = vi.fn()
+  const mockGetWorkflowCapabilities = vi.fn()
   const mockElMessage = vi.fn()
   const mockRouterPush = vi.fn()
 
@@ -137,6 +139,7 @@ const {
 
   return {
     mockGetWorkflow,
+    mockGetWorkflowCapabilities,
     mockElMessage,
     routeState,
     mockRouterPush,
@@ -159,6 +162,7 @@ const {
 
 vi.mock('@/api/workflow', () => ({
   getWorkflow: mockGetWorkflow,
+  getWorkflowCapabilities: mockGetWorkflowCapabilities,
 }))
 
 vi.mock('vue-router', () => ({
@@ -220,6 +224,8 @@ beforeEach(() => {
   routeState.name = 'workflow-design'
   routeState.params = { workflowId: 'wf1' }
   mockGetWorkflow.mockReset()
+  mockGetWorkflowCapabilities.mockReset()
+  mockGetWorkflowCapabilities.mockResolvedValue({ can_edit: true })
 })
 
 describe('WorkflowDesignerView 集成', () => {
@@ -376,5 +382,33 @@ describe('WorkflowDesignerView 集成', () => {
 
     const entrySelectElement = entrySelect.element as HTMLSelectElement
     expect(entrySelectElement.value).toBe('http_1')
+  })
+})
+
+describe('WorkflowDesignerView 能力门禁（spec-19）', () => {
+  it('canEdit=false → 画布/面板收到 readonly=true；保存按钮隐藏', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+    mockGetWorkflowCapabilities.mockResolvedValue({ can_edit: false })
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(canvasProps.readonly).toBe(true)
+    const saveBtn = wrapper.find('[data-testid="save-button"]')
+    expect(saveBtn.exists()).toBe(false)
+  })
+
+  it('canEdit=true → 可编辑，保存按钮可见', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+    mockGetWorkflowCapabilities.mockResolvedValue({ can_edit: true })
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(canvasProps.readonly).toBe(false)
+    const saveBtn = wrapper.find('[data-testid="save-button"]')
+    expect(saveBtn.exists()).toBe(true)
   })
 })
