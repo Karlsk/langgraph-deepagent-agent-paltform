@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -440,3 +441,198 @@ def test_serialize_execution_logs_unit() -> None:
     assert serialized[0]["node_name"] == "n1"
     assert serialized[0]["input_data"]["token"] == "***REDACTED***"  # noqa: S105 — dict key, not a secret
     assert serialized[0]["timestamp"] == "2026-01-01T12:00:00"
+
+
+# -- spec-16: PUT /workflows/{workflow_id} ------------------------------------
+
+_SAVE_PAYLOAD: dict[str, Any] = {
+    "workflow_id": "save_test",
+    "entry_point": "classify",
+    "nodes": [
+        {"name": "classify", "type": "llm", "config": {}},
+        {"name": "fetch", "type": "http", "config": {"url": "https://example.com", "method": "GET"}},
+    ],
+    "edges": [
+        {"source": "classify", "target": "fetch"},
+        {"source": "fetch", "target": "END"},
+    ],
+    "state_schema": {
+        "input": {"type": "str", "description": "user input"},
+    },
+}
+
+
+@pytest.fixture()
+def save_client(tmp_path: Path) -> Generator[TestClient, None, None]:
+    """FastAPI app with an empty registry for PUT handler tests."""
+    app = FastAPI()
+    app.state.limiter = workflow_api.limiter
+    app.state.workflow_registry = build_registry(tmp_path)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(workflow_api.router)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def test_save_workflow_happy_path(save_client: TestClient) -> None:
+    """Valid definition → 200, has_workflow True, _definition_view returned."""
+    from unittest.mock import patch
+
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        mock_save.return_value = Path("/fake/save_test.yaml")
+        response = save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
+    assert response.status_code == 200
+    envelope = response.json()
+    assert envelope["code"] == 200
+    assert envelope["message"] == "success"
+    data = envelope["data"]
+    assert data["workflow_id"] == "save_test"
+    assert data["entry_point"] == "classify"
+    assert len(data["nodes"]) == 2
+    assert "execution_history" not in data
+    registry = save_client.app.state.workflow_registry
+    assert registry.has_workflow("save_test")
+
+
+def test_save_workflow_atomic_replace(save_client: TestClient) -> None:
+    """S13: re-PUT with same id replaces; node count does not double."""
+    from unittest.mock import patch
+
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        mock_save.return_value = Path("/fake/save_test.yaml")
+        save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
+        replacement = {
+            "workflow_id": "save_test",
+            "entry_point": "only_llm",
+            "nodes": [{"name": "only_llm", "type": "llm", "config": {}}],
+            "edges": [{"source": "only_llm", "target": "END"}],
+            "state_schema": {"input": {"type": "str", "description": "x"}},
+        }
+        save_client.put("/workflows/save_test", json=replacement)
+    registry = save_client.app.state.workflow_registry
+    stats = registry.get_registry_stats()
+    assert stats["workflow_count"] == 1
+    definition = registry.get_workflow_definition("save_test")
+    assert definition is not None
+    assert len(definition.nodes) == 1
+    assert definition.entry_point == "only_llm"
+
+
+def test_save_workflow_missing_entry_point_returns_422(save_client: TestClient) -> None:
+    """Payload missing entry_point → 422, no registry side-effect."""
+    from unittest.mock import patch
+
+    bad_payload = {**_SAVE_PAYLOAD, "workflow_id": "bad_ep"}
+    bad_payload = {k: v for k, v in bad_payload.items() if k != "entry_point"}
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        response = save_client.put("/workflows/bad_ep", json=bad_payload)
+    assert response.status_code == 422
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("bad_ep")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_empty_nodes_returns_422(save_client: TestClient) -> None:
+    """Empty nodes list → 422, no registry side-effect."""
+    from unittest.mock import patch
+
+    bad_payload = {**_SAVE_PAYLOAD, "workflow_id": "no_nodes", "nodes": []}
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        response = save_client.put("/workflows/no_nodes", json=bad_payload)
+    assert response.status_code == 422
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("no_nodes")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_id_mismatch_returns_422(save_client: TestClient) -> None:
+    """body.workflow_id != path id → 422."""
+    from unittest.mock import patch
+
+    mismatched = {**_SAVE_PAYLOAD, "workflow_id": "other_id"}
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        response = save_client.put("/workflows/save_test", json=mismatched)
+    assert response.status_code == 422
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("other_id")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_python_type_rejected(save_client: TestClient) -> None:
+    """S15: type=python → 422 (RCE defense)."""
+    from unittest.mock import patch
+
+    python_payload = {
+        "workflow_id": "rce_test",
+        "entry_point": "bad_node",
+        "nodes": [{"name": "bad_node", "type": "python", "config": {"code": "print(1)"}}],
+        "edges": [{"source": "bad_node", "target": "END"}],
+        "state_schema": {"input": {"type": "str", "description": "x"}},
+    }
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        response = save_client.put("/workflows/rce_test", json=python_payload)
+    assert response.status_code == 422
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("rce_test")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_dangling_edge_returns_422(save_client: TestClient) -> None:
+    """S6: dangling edge (target not in nodes, not END) → 422."""
+    from unittest.mock import patch
+
+    dangling = {
+        "workflow_id": "dangling",
+        "entry_point": "step_a",
+        "nodes": [{"name": "step_a", "type": "llm", "config": {}}],
+        "edges": [{"source": "step_a", "target": "nonexistent"}],
+        "state_schema": {"input": {"type": "str", "description": "x"}},
+    }
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        response = save_client.put("/workflows/dangling", json=dangling)
+    assert response.status_code == 422
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("dangling")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_entry_point_not_in_nodes_returns_422(save_client: TestClient) -> None:
+    """S6: entry_point not in nodes → 422."""
+    from unittest.mock import patch
+
+    bad_entry = {
+        "workflow_id": "bad_entry",
+        "entry_point": "ghost",
+        "nodes": [{"name": "step_a", "type": "llm", "config": {}}],
+        "edges": [{"source": "step_a", "target": "END"}],
+        "state_schema": {"input": {"type": "str", "description": "x"}},
+    }
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        response = save_client.put("/workflows/bad_entry", json=bad_entry)
+    assert response.status_code == 422
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("bad_entry")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_calls_save_definition_yaml(save_client: TestClient) -> None:
+    """After successful registration, save_definition_yaml is called (spec-17 integration)."""
+    from unittest.mock import patch
+
+    with patch("app.workflow.api.save_definition_yaml") as mock_save:
+        mock_save.return_value = Path("/fake/save_test.yaml")
+        save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
+    mock_save.assert_called_once()
+    call_arg = mock_save.call_args[0][0]
+    assert call_arg.workflow_id == "save_test"
+
+
+def test_save_workflow_persist_failure_rolls_back(save_client: TestClient) -> None:
+    """save_definition_yaml raises → 500, registry rolled back (has_workflow False)."""
+    from unittest.mock import patch
+
+    with patch("app.workflow.api.save_definition_yaml", side_effect=OSError("disk full")):
+        response = save_client.put("/workflows/save_test", json=_SAVE_PAYLOAD)
+    assert response.status_code == 500
+    registry = save_client.app.state.workflow_registry
+    assert not registry.has_workflow("save_test")

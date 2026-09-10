@@ -17,18 +17,21 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from yaml import safe_dump as yaml_safe_dump
 
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.schemas.base import ApiResponse as HostApiResponse
+from app.workflow.auth import require_admin
 from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact, redact_processor
-from app.workflow.models import ExecutionLog, WorkflowDefinition, WorkflowNotFoundError
+from app.workflow.models import ExecutionLog, WorkflowDefinition, WorkflowEngineError, WorkflowNotFoundError
 from app.workflow.registry import WorkflowRegistry
+from app.workflow.store import save_definition_yaml
 
 logger = structlog.get_logger(__name__)
 
@@ -105,6 +108,27 @@ def _definition_to_yaml_text(definition: WorkflowDefinition) -> str:
 def _serialize_execution_logs(logs: list[ExecutionLog]) -> list[dict[str, Any]]:
     """Serialize execution logs with redaction (H6) and truncation (max_len=500)."""
     return [redact(log.model_dump(mode="json"), max_len=500) for log in logs]
+
+
+ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http"})
+
+
+def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> WorkflowDefinition:
+    """Parse and validate a PUT body: pydantic → id match → node-type whitelist (S15).
+
+    Raises:
+        ValidationError: If pydantic model validation fails.
+        ValueError: If workflow_id mismatches or a node type is not whitelisted.
+    """
+    definition = WorkflowDefinition.model_validate(payload)
+    if definition.workflow_id != workflow_id:
+        msg = f"body workflow_id '{definition.workflow_id}' does not match path id '{workflow_id}'"
+        raise ValueError(msg)
+    for node in definition.nodes:
+        if node.type not in ALLOWED_NODE_TYPES:
+            msg = f"node type '{node.type}' is not allowed; allowed types: {sorted(ALLOWED_NODE_TYPES)}"
+            raise ValueError(msg)
+    return definition
 
 
 @router.get(
@@ -251,3 +275,62 @@ async def execute_workflow(
         },
     )
     return _project_to_host_envelope(response, 200)
+
+
+@router.put(
+    "/workflows/{workflow_id}",
+    response_model=HostApiResponse[dict[str, Any]],
+    responses={
+        422: {
+            "model": HostApiResponse[None],
+            "description": "Validation or build-time error: envelope with code=422, message=redacted summary, data=null",
+        },
+        500: {
+            "model": HostApiResponse[None],
+            "description": "Persistence failure: envelope with code=500, message=redacted summary, data=null",
+        },
+    },
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_save"][0])
+async def save_workflow(
+    workflow_id: str,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+    registry: WorkflowRegistry = Depends(get_registry),
+    _admin: None = Depends(require_admin),
+) -> JSONResponse:
+    """Full-replace register a workflow definition (spec-16, S13 atomic replacement).
+
+    Processing order: parse → id match → whitelist → register → persist → return.
+    On persist failure the registry entry is rolled back to keep registry = disk.
+    """
+    try:
+        definition = _validate_definition_payload(payload, workflow_id)
+    except ValidationError as exc:
+        logger.warning("api_save_workflow_validation_failed", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(f"invalid definition: {exc}")), 422
+        )
+    except ValueError as exc:
+        logger.warning("api_save_workflow_id_mismatch_or_blocked", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(str(exc))), 422
+        )
+
+    try:
+        await run_in_threadpool(registry.register_workflow, definition)
+    except (ValueError, WorkflowEngineError) as exc:
+        logger.warning("api_save_workflow_build_failed", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(f"build-time error: {exc}")), 422
+        )
+
+    try:
+        await run_in_threadpool(save_definition_yaml, definition)
+    except Exception as exc:  # noqa: BLE001 — rollback on any persist failure
+        logger.exception("api_save_workflow_persist_failed", workflow_id=workflow_id)
+        registry.delete_workflow(workflow_id)
+        summary = f"persistence failed for '{workflow_id}': {type(exc).__name__}: {exc}"
+        return _project_to_host_envelope(ApiResponse(success=False, error=_redacted_summary(summary)), 500)
+
+    return _project_to_host_envelope(ApiResponse(success=True, data=_definition_view(definition)), 200)
