@@ -134,7 +134,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402"]
 "app/workflow/cli.py" = ["T201"]
-"tests/**" = ["S101"]
+"tests/**" = ["S101", "D101", "D102"]
 # Pre-existing violations of newly enabled rules (T20/BLE/S) in legacy code,
 # scoped per file; see spec-00 AD-07 closure list. New code must comply.
 "app/api/v1/auth.py" = ["S106"]

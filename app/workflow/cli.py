@@ -49,11 +49,21 @@ class ApiResponse:
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def build_registry(directory: str | Path) -> WorkflowRegistry:
-    """Load every definition in ``directory`` and register it (shared with api.py)."""
+def build_registry(
+    directory: str | Path,
+    *,
+    user_dir: str | Path | None = None,
+) -> WorkflowRegistry:
+    """Load definitions from ``directory`` (examples) and optionally ``user_dir``."""
+    from app.workflow.store import user_workflow_dir as _default_user_dir
+
     registry = WorkflowRegistry()
     for definition in load_definitions_from_dir(directory):
         registry.register_workflow(definition)
+    resolved_user_dir = Path(user_dir) if user_dir is not None else _default_user_dir()
+    if resolved_user_dir.is_dir():
+        for definition in load_definitions_from_dir(resolved_user_dir):
+            registry.register_workflow(definition)
     return registry
 
 
