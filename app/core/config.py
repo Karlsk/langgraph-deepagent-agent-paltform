@@ -277,6 +277,7 @@ class Settings:
             "workflows_list": ["20 per minute"],
             "workflows_detail": ["20 per minute"],
             "workflows_save": ["20 per minute"],
+            "workflows_delete": ["20 per minute"],
             "subagent": ["60 per minute"],
             "skill": ["60 per minute"],
             "agent_app": ["60 per minute"],

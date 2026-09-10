@@ -636,3 +636,62 @@ def test_save_workflow_persist_failure_rolls_back(save_client: TestClient) -> No
     assert response.status_code == 500
     registry = save_client.app.state.workflow_registry
     assert not registry.has_workflow("save_test")
+
+
+def test_delete_workflow_happy_path(client: TestClient) -> None:
+    """DELETE registered workflow → 200, data=null, registry.has_workflow False (C6/H7 four-table sync)."""
+    response = client.delete("/workflows/echo_demo")
+    assert response.status_code == 200
+    envelope = response.json()
+    assert envelope["code"] == 200
+    assert envelope["message"] == "success"
+    assert envelope["data"]["result"] is None
+    registry = client.app.state.workflow_registry
+    assert not registry.has_workflow("echo_demo")
+
+
+def test_delete_workflow_calls_delete_definition_yaml(client: TestClient) -> None:
+    """After successful DELETE, delete_definition_yaml is called (spec-17 integration)."""
+    from unittest.mock import patch
+
+    with patch("app.workflow.api.delete_definition_yaml") as mock_delete:
+        mock_delete.return_value = True
+        client.delete("/workflows/echo_demo")
+    mock_delete.assert_called_once_with("echo_demo")
+
+
+def test_delete_workflow_unknown_id_returns_404(client: TestClient) -> None:
+    """Unknown workflow_id → 404 + envelope; registry and disk unchanged."""
+    from unittest.mock import patch
+
+    with patch("app.workflow.api.delete_definition_yaml") as mock_delete:
+        response = client.delete("/workflows/nonexistent")
+    assert response.status_code == 404
+    envelope = response.json()
+    assert envelope["code"] == 404
+    assert "nonexistent" in envelope["message"]
+    assert envelope["data"] is None
+    mock_delete.assert_not_called()
+    registry = client.app.state.workflow_registry
+    assert registry.has_workflow("echo_demo")
+
+
+def test_delete_workflow_idempotent_second_delete_returns_404(client: TestClient) -> None:
+    """Second DELETE on same id → 404 (idempotency boundary)."""
+    first = client.delete("/workflows/echo_demo")
+    assert first.status_code == 200
+    second = client.delete("/workflows/echo_demo")
+    assert second.status_code == 404
+    envelope = second.json()
+    assert envelope["code"] == 404
+    assert envelope["data"] is None
+
+
+def test_delete_workflow_registry_stats_decrement(client: TestClient) -> None:
+    """get_registry_stats workflow_count decrements by 1 after DELETE."""
+    registry = client.app.state.workflow_registry
+    stats_before = registry.get_registry_stats()
+    count_before = stats_before["workflow_count"]
+    client.delete("/workflows/echo_demo")
+    stats_after = registry.get_registry_stats()
+    assert stats_after["workflow_count"] == count_before - 1

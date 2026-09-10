@@ -31,7 +31,7 @@ from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact, redact_processor
 from app.workflow.models import ExecutionLog, WorkflowDefinition, WorkflowEngineError, WorkflowNotFoundError
 from app.workflow.registry import WorkflowRegistry
-from app.workflow.store import save_definition_yaml
+from app.workflow.store import delete_definition_yaml, save_definition_yaml
 
 logger = structlog.get_logger(__name__)
 
@@ -334,3 +334,40 @@ async def save_workflow(
         return _project_to_host_envelope(ApiResponse(success=False, error=_redacted_summary(summary)), 500)
 
     return _project_to_host_envelope(ApiResponse(success=True, data=_definition_view(definition)), 200)
+
+
+def _remove_workflow(registry: WorkflowRegistry, workflow_id: str) -> bool:
+    """Orchestrate memory + disk deletion; return True if removed from registry (C6/H7)."""
+    removed = registry.delete_workflow(workflow_id)
+    if removed:
+        delete_definition_yaml(workflow_id)
+    return removed
+
+
+@router.delete(
+    "/workflows/{workflow_id}",
+    response_model=HostApiResponse[None],
+    responses={
+        404: {
+            "model": HostApiResponse[None],
+            "description": "Unknown workflow_id: envelope with code=404, data=null",
+        },
+    },
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_delete"][0])
+async def delete_workflow_endpoint(
+    workflow_id: str,
+    request: Request,
+    registry: WorkflowRegistry = Depends(get_registry),
+    _admin: None = Depends(require_admin),
+) -> JSONResponse:
+    """Delete a workflow from registry and disk; 404 if unknown (spec-18)."""
+    logger.info("api_workflow_delete_requested", workflow_id=workflow_id)
+    removed = await run_in_threadpool(_remove_workflow, registry, workflow_id)
+    if not removed:
+        logger.warning("api_workflow_not_found_for_delete", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(f"workflow not found: {workflow_id}")),
+            404,
+        )
+    return _project_to_host_envelope(ApiResponse(success=True, data=None), 200)
