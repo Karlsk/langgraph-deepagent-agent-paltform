@@ -28,6 +28,7 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.models.user import User
 from app.schemas.base import ApiResponse as HostApiResponse
+from app.services.llm.provider_service import validate_reference
 from app.workflow.security import WorkflowValidationError
 from app.workflow.auth import require_workflow_admin
 from app.workflow.cli import ApiResponse
@@ -142,6 +143,28 @@ def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> W
                 if url:
                     validate_http_url(url)
     return definition
+
+
+def _validate_provider_refs(definition: WorkflowDefinition) -> None:
+    """Reject llm nodes whose provider_ref cannot resolve (S6 build-time first, S20).
+
+    Kept separate from ``_validate_definition_payload`` because it performs sync
+    DB I/O through the provider service facade, whereas that helper stays pure.
+
+    Raises:
+        ValueError: Naming the offending node and reference.
+    """
+    for node in definition.nodes:
+        if node.type not in ("llm", "LLM"):
+            continue
+        ref = node.config.get("provider_ref")
+        if not ref:
+            continue
+        try:
+            validate_reference(str(ref))
+        except ValueError as exc:
+            msg = f"node '{node.name}': provider_ref '{ref}' is not usable: {exc}"
+            raise ValueError(msg) from exc
 
 
 @router.get(
@@ -348,8 +371,9 @@ async def save_workflow(
 ) -> JSONResponse:
     """Full-replace register a workflow definition (spec-16, S13 atomic replacement).
 
-    Processing order: parse → id match → whitelist → register → persist → return.
-    On persist failure the registry entry is rolled back to keep registry = disk.
+    Processing order: parse → id match → whitelist → provider_ref → register →
+    persist → return. On persist failure the registry entry is rolled back to
+    keep registry = disk.
     """
     try:
         definition = _validate_definition_payload(payload, workflow_id)
@@ -367,6 +391,14 @@ async def save_workflow(
         logger.warning("api_save_workflow_ssrf_blocked", workflow_id=workflow_id)
         return _project_to_host_envelope(
             ApiResponse(success=False, error=_redacted_summary(f"SSRF guard: {exc}")), 422
+        )
+
+    try:
+        await run_in_threadpool(_validate_provider_refs, definition)
+    except ValueError as exc:
+        logger.warning("api_save_workflow_provider_ref_invalid", workflow_id=workflow_id)
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=_redacted_summary(f"provider_ref invalid: {exc}")), 422
         )
 
     try:

@@ -119,7 +119,7 @@ L0  nodes/base.py ──► utils.py ──────────────�
 1. `models.py` 不得 import 任何引擎模块（只依赖 pydantic / 标准库 / `yaml`）。
 2. `nodes/*` 不得 import `registry` / `graph_builder`（节点不知道图与注册表的存在，同时根除 H5）。
 3. `utils.py` 不得 import LLM/HTTP 客户端库（C7）。
-4. 引擎自包含：`app/workflow/` 任何模块**不得 import `app.core.*` / `app.api.*` / `app.services.*`**（AD-02；反向集成时由外部装配，如可选 `api.py` 允许 import `app.core.limiter`，它是入口层例外，见 spec-08）。宿主经构造参数注入的**不透明 callable**（如 `ChatModelFactory`，见 §4.7/S20）不构成依赖——引擎只持有类型别名 `app/workflow/ports.py`，不感知其实现，装配责任在组合根（`app/main.py`）。
+4. 引擎自包含：`app/workflow/` 任何模块**不得 import `app.core.*` / `app.api.*` / `app.services.*`**（AD-02；反向集成时由外部装配）。**唯一例外是入口层 `api.py`**（及为其服务的 `auth.py` / `security.py`），它可 import `app.core.limiter` / `app.core.config` / `app.api.v1.auth` / `app.services.llm.provider_service`（S20 注册期校验 `provider_ref`）；引擎内核模块（`models` / `nodes/*` / `graph_builder` / `registry` / `store` / `ports` / `utils` / `cli`）**一律不得**跨线。宿主经构造参数注入的**不透明 callable**（如 `ChatModelFactory`）不构成依赖——引擎只持有类型别名 `app/workflow/ports.py`，不感知其实现，装配责任在组合根（`app/main.py`）。
 
 ## 4. 接口冻结清单
 

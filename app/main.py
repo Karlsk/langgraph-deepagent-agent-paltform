@@ -41,6 +41,7 @@ from app.core.observability import langfuse_init
 from app.services.agents.bootstrap import ensure_all_agent_workspaces, ensure_default_agent_app
 from app.services.agents.mcp_manager import get_mcp_tools, shutdown_mcp_clients
 from app.services.database import database_service
+from app.services.llm.provider_service import resolve_chat_model
 from app.services.memory import memory_service
 from app.workflow.cli import DEFAULT_CONFIG_DIR, build_registry
 
@@ -130,8 +131,13 @@ app.add_middleware(CorrelationIdMiddleware)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
 
-# Inject the workflow registry on app.state (spec-09 TC1, H4/G7: engine keeps no module-level cache)
-app.state.workflow_registry = build_registry(DEFAULT_CONFIG_DIR)
+# Inject the workflow registry on app.state (spec-09 TC1, H4/G7: engine keeps no module-level cache).
+# The chat model factory is injected here — and only here — so the engine can resolve
+# provider_ref credentials without importing any host module (CONTRACT §3 red line 4, S20).
+app.state.workflow_registry = build_registry(
+    DEFAULT_CONFIG_DIR,
+    chat_model_factory=resolve_chat_model,
+)
 logger.info("workflow_registry_built", directory=str(DEFAULT_CONFIG_DIR))
 
 

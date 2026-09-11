@@ -6,9 +6,11 @@ by the host composition root; the engine module keeps no module-level cache.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
@@ -16,10 +18,12 @@ from fastapi.testclient import TestClient
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
+from app.core.config import settings
 from app.core.logging import get_structlog_processors
 from app.workflow import api as workflow_api
 from app.workflow.cli import build_registry
 from app.workflow.logging_conf import redact_processor
+from app.workflow.models import EdgeDefinition, NodeDefinition, WorkflowDefinition
 from app.workflow.nodes.factory import register_node_type
 from tests.unit.workflow.test_cli import _ECHO_YAML, _FAIL_YAML, _FailNode
 
@@ -807,3 +811,112 @@ def test_delete_workflow_registry_stats_decrement(client: TestClient) -> None:
         client.delete("/workflows/echo_demo")
     stats_after = registry.get_registry_stats()
     assert stats_after["workflow_count"] == count_before - 1
+
+
+# ---------------------------------------------------------------------------
+# S20: provider_ref registration-time validation (S6 build-time first)
+# ---------------------------------------------------------------------------
+
+
+def _payload_with_provider_ref(ref: str | None) -> dict[str, Any]:
+    """Clone the save payload and set provider_ref on its llm node."""
+    payload = dict(_SAVE_PAYLOAD)
+    config: dict[str, Any] = {"model_name": "gpt-4o-mini"}
+    if ref is not None:
+        config["provider_ref"] = ref
+    payload["nodes"] = [
+        {"name": "classify", "type": "llm", "config": config},
+        {"name": "fetch", "type": "http", "config": {"url": "https://example.com", "method": "GET"}},
+    ]
+    return payload
+
+
+def test_save_workflow_rejects_unresolvable_provider_ref(save_client: TestClient) -> None:
+    """A dangling provider_ref is rejected at registration with 422, not at execution (S6/S20)."""
+
+    def fake_validate(reference: str) -> None:
+        msg = f"model config '{reference}' not found or disabled. available models: acme/gpt-4o"
+        raise ValueError(msg)
+
+    with (
+        patch("app.workflow.api.validate_reference", side_effect=fake_validate) as mock_validate,
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        response = save_client.put("/workflows/save_test", json=_payload_with_provider_ref("acme/missing"))
+
+    assert response.status_code == 422
+    envelope = response.json()
+    assert envelope["code"] == 422
+    assert "provider_ref invalid" in envelope["message"]
+    assert "classify" in envelope["message"]
+    assert "acme/missing" in envelope["message"]
+    mock_validate.assert_called_once_with("acme/missing")
+    # Neither registration nor persistence happened
+    mock_save.assert_not_called()
+    assert save_client.get("/workflows/save_test").status_code == 404
+
+
+def test_save_workflow_accepts_resolvable_provider_ref(save_client: TestClient) -> None:
+    """A valid provider_ref passes validation and the definition round-trips it (S20)."""
+    with (
+        patch("app.workflow.api.validate_reference") as mock_validate,
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        mock_save.return_value = Path("/fake/save_test.yaml")
+        response = save_client.put("/workflows/save_test", json=_payload_with_provider_ref("acme/gpt-4o"))
+
+    assert response.json()["code"] == 200
+    mock_validate.assert_called_once_with("acme/gpt-4o")
+    mock_save.assert_called_once()
+
+    stored = save_client.get("/workflows/save_test").json()["data"]
+    llm_node = next(n for n in stored["nodes"] if n["name"] == "classify")
+    assert llm_node["config"]["provider_ref"] == "acme/gpt-4o"
+
+
+def test_save_workflow_without_provider_ref_skips_validation(save_client: TestClient) -> None:
+    """No provider_ref -> the facade is never touched, so env-only workflows need no DB (S20)."""
+    with (
+        patch("app.workflow.api.validate_reference") as mock_validate,
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        mock_save.return_value = Path("/fake/save_test.yaml")
+        response = save_client.put("/workflows/save_test", json=_payload_with_provider_ref(None))
+
+    assert response.json()["code"] == 200
+    mock_validate.assert_not_called()
+
+
+def test_validate_provider_refs_only_checks_llm_nodes() -> None:
+    """The type filter skips non-llm nodes.
+
+    Asserted against the helper directly: NodeDefinition.config is a loose dict at
+    this layer, whereas routing an http node carrying provider_ref through PUT would
+    422 for an unrelated reason (HTTPNodeConfig is extra="forbid", S14).
+    """
+    definition = WorkflowDefinition(
+        workflow_id="wf_filter",
+        entry_point="ask",
+        nodes=[
+            NodeDefinition(name="fetch", type="http", config={"url": "https://x.test", "provider_ref": "acme/nope"}),
+            NodeDefinition(name="ask", type="llm", config={"provider_ref": "acme/gpt-4o"}),
+        ],
+        edges=[EdgeDefinition(source="fetch", target="ask"), EdgeDefinition(source="ask", target="END")],
+        state_schema={},
+    )
+
+    with patch("app.workflow.api.validate_reference") as mock_validate:
+        workflow_api._validate_provider_refs(definition)  # noqa: SLF001
+
+    mock_validate.assert_called_once_with("acme/gpt-4o")
+
+
+def test_api_module_never_touches_the_store_layer() -> None:
+    """Layering guard: api.py uses the provider service facade, not llm_store or database_service."""
+    source = Path(workflow_api.__file__).read_text(encoding="utf-8")
+    assert "provider_service" in source
+    assert not re.search(r"^\s*(?:from|import)\s+app\.services\.llm\.llm_store\b", source, re.MULTILINE)
+    assert not re.search(r"^\s*(?:from|import)\s+app\.services\.database\b", source, re.MULTILINE)
