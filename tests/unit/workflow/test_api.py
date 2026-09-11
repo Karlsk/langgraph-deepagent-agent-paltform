@@ -25,9 +25,9 @@ from app.workflow.cli import build_registry
 from app.workflow.logging_conf import redact_processor
 from app.workflow.models import EdgeDefinition, NodeDefinition, WorkflowDefinition
 from app.workflow.nodes.factory import register_node_type
-from tests.unit.workflow.test_cli import _ECHO_YAML, _FAIL_YAML, _FailNode
+from tests.unit.workflow.test_cli import _ECHO_YAML, _FAIL_YAML, _PROBE_YAML, _FailNode, _MessageProbeNode
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("isolated_user_workflow_dir")]
 
 
 def _add_mock_auth(app: FastAPI, username: str = "test_user") -> None:
@@ -458,6 +458,29 @@ def test_execute_failure_no_execution_logs(client: TestClient) -> None:
     response = client.post("/workflows/fail_demo/execute", json={})
     assert response.status_code == 500
     assert response.json()["data"] is None
+
+
+def _install_probe_workflow(client: TestClient) -> None:
+    """Register the ``msg_probe`` node and reload the registry with the probe definition."""
+    register_node_type("msg_probe", _MessageProbeNode)
+    app_state = client.app.state
+    probe_path = Path(app_state.workflow_directory) / "probe_demo.yaml"
+    probe_path.write_text(_PROBE_YAML, encoding="utf-8")
+    app_state.workflow_registry = build_registry(app_state.workflow_directory)
+
+
+def test_execute_string_input_synthesizes_messages(client: TestClient) -> None:
+    """S21: both wire forms reach the node as one synthesized user message (api.py unchanged)."""
+    _install_probe_workflow(client)
+    expected = [{"role": "user", "content": "hello"}]
+
+    flat = client.post("/workflows/probe_demo/execute", json={"input": "hello"})
+    assert flat.status_code == 200
+    assert flat.json()["data"]["probe_result"]["seen_messages"] == expected
+
+    nested = client.post("/workflows/probe_demo/execute", json={"input": {"input": "hello"}})
+    assert nested.status_code == 200
+    assert nested.json()["data"]["probe_result"]["seen_messages"] == expected
 
 
 def test_serialize_execution_logs_unit() -> None:

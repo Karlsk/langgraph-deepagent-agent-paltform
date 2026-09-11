@@ -81,6 +81,30 @@ class RunLogCollector:
             return sorted(self._logs, key=lambda log: log.timestamp)
 
 
+def synthesize_run_input(definition: WorkflowDefinition, input_data: dict[str, Any]) -> dict[str, Any]:
+    """Derive the ``messages`` channel from a bare string ``input`` (S21).
+
+    A truthy ``messages`` wins and passes through as-is; otherwise a non-empty
+    string ``input`` is additively turned into one user message. Any other
+    shape is a no-op. Applies to every workflow regardless of node types (R2):
+    LangGraph drops keys absent from the state schema. Returns a new dict,
+    never mutates ``input_data``, never removes a caller-supplied key.
+    """
+    if input_data.get("messages"):
+        return input_data
+
+    source = input_data.get("input")
+    if not isinstance(source, str) or not source.strip():
+        return input_data
+
+    logger.debug(
+        "run_input_synthesized",
+        workflow_id=definition.workflow_id,
+        input_keys=sorted(input_data),
+    )
+    return {**input_data, "messages": [{"role": "user", "content": source}]}
+
+
 class WorkflowRegistry:
     """Process-level registry of compiled workflows (CONTRACT §4.10).
 
@@ -164,10 +188,12 @@ class WorkflowRegistry:
     def execute_workflow(self, workflow_id: str, input_data: dict[str, Any]) -> RunResult:
         """Run one workflow under its per-workflow RLock and return the RunResult.
 
-        Log collection is run-scoped (S11): a fresh RunLogCollector is bound to
-        the ContextVar and reset in finally, so the ContextVar never leaks.
-        Node exceptions propagate to the caller unchanged (EXP-G7). The
-        definition's execution_history keeps only the latest run (S12, bounded).
+        The caller payload goes through ``synthesize_run_input`` (S21) before
+        the graph runs. Log collection is run-scoped (S11): a fresh
+        RunLogCollector is bound to the ContextVar and reset in finally, so the
+        ContextVar never leaks. Node exceptions propagate to the caller
+        unchanged (EXP-G7). The definition's execution_history keeps only the
+        latest run (S12, bounded).
         """
         workflow = self.get_workflow(workflow_id)
         definition = self._definitions[workflow_id]
@@ -178,7 +204,7 @@ class WorkflowRegistry:
             started_at = datetime.now()
             token = set_run_collector(collector)
             try:
-                output = workflow.invoke(input_data)
+                output = workflow.invoke(synthesize_run_input(definition, input_data))
             except Exception:
                 logger.exception("workflow_execution_failed", workflow_id=workflow_id, run_id=run_id)
                 raise

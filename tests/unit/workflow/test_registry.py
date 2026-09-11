@@ -24,7 +24,13 @@ from app.workflow.models import (
 )
 from app.workflow.nodes.base import BaseNode, RunLogCollectorLike, get_run_collector
 from app.workflow.nodes.factory import register_node_type
-from app.workflow.registry import RunLogCollector, RunResult, WorkflowRegistry, load_definitions_from_dir
+from app.workflow.registry import (
+    RunLogCollector,
+    RunResult,
+    WorkflowRegistry,
+    load_definitions_from_dir,
+    synthesize_run_input,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -359,3 +365,63 @@ def test_build_registry_forwards_factory(tmp_path: Path) -> None:
     sentinel = object()
     registry = build_registry(tmp_path, user_dir=tmp_path, chat_model_factory=sentinel)  # type: ignore[arg-type]
     assert registry._builder._chat_model_factory is sentinel  # noqa: SLF001
+
+
+# --- TC: S21 run-input synthesis --------------------------------------------
+
+
+class _MessageRecordingClient:
+    """Chat client stand-in capturing the message list handed to invoke()."""
+
+    def __init__(self) -> None:
+        self.seen_messages: list[Any] = []
+
+    def invoke(self, messages: list[Any]) -> Any:
+        self.seen_messages = list(messages)
+        return AIMessage(content="ok")
+
+
+def test_synthesize_str_input_adds_messages() -> None:
+    """S21 ②: a non-empty str `input` is additively synthesized into a user message."""
+    definition = make_llm_definition()
+    result = synthesize_run_input(definition, {"input": "hello", "user_id": "u1"})
+    assert result == {
+        "input": "hello",
+        "user_id": "u1",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+
+def test_synthesize_skips_when_messages_present() -> None:
+    """S21 ①: explicit messages win and are passed through untouched."""
+    definition = make_llm_definition()
+    given = {"input": "hello", "messages": [{"role": "user", "content": "explicit"}]}
+    assert synthesize_run_input(definition, given) == given
+
+
+def test_synthesize_noop_for_dict_or_missing_input() -> None:
+    """S21 ③: missing / non-str / blank `input` never synthesizes messages."""
+    definition = make_llm_definition()
+    for payload in ({}, {"input": {"a": 1}}, {"input": ""}, {"input": "   "}, {"input": 42}):
+        assert synthesize_run_input(definition, payload) == payload
+
+
+def test_synthesize_does_not_mutate_input() -> None:
+    """synthesize_run_input is pure: the caller's dict is never modified (S21)."""
+    definition = make_llm_definition()
+    payload = {"input": "hello"}
+    snapshot = dict(payload)
+    result = synthesize_run_input(definition, payload)
+    assert payload == snapshot
+    assert result is not payload
+
+
+def test_execute_workflow_synthesizes_messages_for_llm_node() -> None:
+    """S21: execute_workflow synthesizes before invoke, so LLMNode sees the user message."""
+    client = _MessageRecordingClient()
+    registry = WorkflowRegistry(chat_model_factory=lambda ref, overrides: client)
+    registry.register_workflow(make_llm_definition(provider_ref="acme/gpt-4o"))
+
+    registry.execute_workflow("wf_provider", {"input": "hello"})
+
+    assert client.seen_messages == [{"role": "user", "content": "hello"}]

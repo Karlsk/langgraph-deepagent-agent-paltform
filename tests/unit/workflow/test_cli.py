@@ -15,8 +15,9 @@ from app.workflow import logging_conf
 from app.workflow.cli import ApiResponse, build_registry, main
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
+from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("isolated_user_workflow_dir")]
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +77,44 @@ class _FailNode(BaseNode):
         def func(state: Any) -> dict[str, Any]:
             msg = "upstream failed api_key=sk-live-leak-999"
             raise RuntimeError(msg)
+
+        return self.wrap_runnable(func)
+
+    @override
+    def validate_config(self) -> bool:
+        return True
+
+
+_PROBE_YAML = """
+workflow_id: probe_demo
+description: "reports the messages channel the graph received (S21)"
+entry_point: probe
+nodes:
+  - name: probe
+    type: msg_probe
+    config: {}
+edges:
+  - source: probe
+    target: END
+state_schema:
+  input:
+    type: str
+    description: user input
+  messages:
+    type: list
+    description: chat messages
+"""
+
+
+class _MessageProbeNode(BaseNode):
+    """Test-only node echoing back the ``messages`` channel it was handed (S21)."""
+
+    @override
+    def build_runnable(self) -> Runnable:
+        def func(state: Any) -> dict[str, Any]:
+            state_dict = convert_state_to_dict(state)
+            output = {"seen_messages": state_dict.get("messages")}
+            return map_output_to_state(self.name, output, state_dict)
 
         return self.wrap_runnable(func)
 
@@ -157,6 +196,16 @@ def test_cli_error_no_state_leak(tmp_path: Path, capsys: pytest.CaptureFixture[s
     envelope = _last_json_line(out)
     assert envelope["success"] is False
     assert envelope["data"] is None
+
+
+def test_cli_str_input_synthesizes_messages(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """S21: a bare string ``--input`` reaches the graph as one user message (cli.py unchanged)."""
+    register_node_type("msg_probe", _MessageProbeNode)
+    (tmp_path / "probe_demo.yaml").write_text(_PROBE_YAML, encoding="utf-8")
+    exit_code = main(["run", "--dir", str(tmp_path), "--workflow", "probe_demo", "--input", '{"input":"hello"}'])
+    assert exit_code == 0
+    envelope = _last_json_line(capsys.readouterr().out)
+    assert envelope["data"]["probe_result"]["seen_messages"] == [{"role": "user", "content": "hello"}]
 
 
 def test_build_registry_loads_dir(tmp_path: Path) -> None:
