@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import yaml
 from fastapi import FastAPI
@@ -19,9 +19,10 @@ from slowapi.errors import RateLimitExceeded
 import pytest
 
 from app.workflow import api as workflow_api
+from app.workflow.auth import require_workflow_admin
 from app.workflow.cli import build_registry
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("isolated_user_workflow_dir")]
 
 _SAVE_PAYLOAD: dict[str, Any] = {
     "workflow_id": "integ_save",
@@ -42,12 +43,23 @@ _SAVE_PAYLOAD: dict[str, Any] = {
 
 @pytest.fixture()
 def integ_client(tmp_path: Path) -> TestClient:
-    """FastAPI app with real save_definition_yaml (user dir = tmp_path)."""
+    """FastAPI app with real save_definition_yaml (user dir = tmp_path) and an admin caller.
+
+    PUT is admin-gated (S19); this suite exercises the persistence pipeline, so
+    the gate is stubbed rather than tested (``test_api_auth`` covers it).
+    """
     app = FastAPI()
     app.state.limiter = workflow_api.limiter
     app.state.workflow_registry = build_registry(tmp_path)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
+    admin = MagicMock()
+    admin.username = "integ_admin"
+
+    async def stub_admin() -> MagicMock:
+        return admin
+
+    app.dependency_overrides[require_workflow_admin] = stub_admin
     return TestClient(app)
 
 

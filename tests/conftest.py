@@ -2,12 +2,14 @@
 
 import time
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any, override
 
 import pytest
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
+from app.workflow import store
 from app.workflow.models import ExecutionLog
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
@@ -84,3 +86,19 @@ def register_echo_node() -> Generator[None, None, None]:
     """Register the shared EchoNode for every test; cleanup relies on restore_node_registry (D7)."""
     register_node_type("echo", EchoNode)
     yield
+
+
+@pytest.fixture()
+def isolated_user_workflow_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``user_workflow_dir`` at an empty tmp dir for the duration of a test.
+
+    ``build_registry`` scans the real ``app/workflow/config/user`` on top of the
+    directory it is given, so YAML saved through the designer at runtime both
+    leaks into registry-content assertions and shadows a same-id example.
+    Modules that build a registry opt in via ``pytest.mark.usefixtures``;
+    ``test_store`` stays out because it asserts the real path shape.
+    """
+    empty = tmp_path / "user_workflows"
+    empty.mkdir()
+    monkeypatch.setattr(store, "user_workflow_dir", lambda: empty)
+    return empty

@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage
 from app.workflow.cli import build_registry
 from app.workflow.models import ConditionNotMatchedError
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("isolated_user_workflow_dir")]
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "app" / "workflow" / "config" / "examples"
 
