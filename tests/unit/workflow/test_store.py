@@ -79,6 +79,21 @@ class TestSaveDefinitionYaml:
         assert len(loaded.nodes) == len(definition.nodes)
         assert len(loaded.edges) == len(definition.edges)
 
+    def test_roundtrip_preserves_ui_layout(self, tmp_path: Path) -> None:
+        """D4: ui_layout survives save → load round-trip."""
+        from app.workflow.store import save_definition_yaml
+
+        definition = _make_definition()
+        definition.ui_layout = {"nodes": {"step_one": {"x": 10, "y": 20}, "step_two": {"x": 200, "y": 20}}}
+
+        with patch("app.workflow.store.user_workflow_dir", return_value=tmp_path):
+            save_definition_yaml(definition)
+            loaded = load_definition_from_yaml(tmp_path / "test_wf.yaml")
+
+        assert loaded.ui_layout is not None
+        assert loaded.ui_layout["nodes"]["step_one"] == {"x": 10, "y": 20}
+        assert loaded.ui_layout["nodes"]["step_two"] == {"x": 200, "y": 20}
+
     @pytest.mark.parametrize(
         "bad_id",
         [

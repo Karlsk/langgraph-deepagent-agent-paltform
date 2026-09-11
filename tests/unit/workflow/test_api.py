@@ -95,6 +95,14 @@ state_schema:
   input:
     type: str
     description: user input
+ui_layout:
+  nodes:
+    step_a:
+      x: 10
+      y: 20
+    step_b:
+      x: 200
+      y: 20
 """
 
 _REDACT_DEMO_YAML = """
@@ -319,11 +327,13 @@ def test_get_workflow_json_projection(client: TestClient) -> None:
     assert "execution_history" not in data
 
 
-def test_get_workflow_json_ui_layout_not_present(client: TestClient) -> None:
-    """WorkflowDefinition(extra='ignore') drops ui_layout at parse time; projection reflects model reality."""
+def test_get_workflow_json_ui_layout_preserved(client: TestClient) -> None:
+    """D4: ui_layout annotation is a declared field and survives model_dump projection."""
     response = client.get("/workflows/detail_test")
     data = response.json()["data"]
-    assert "ui_layout" not in data
+    assert "ui_layout" in data
+    assert data["ui_layout"]["nodes"]["step_a"] == {"x": 10, "y": 20}
+    assert data["ui_layout"]["nodes"]["step_b"] == {"x": 200, "y": 20}
 
 
 def test_get_workflow_yaml_roundtrip(client: TestClient) -> None:

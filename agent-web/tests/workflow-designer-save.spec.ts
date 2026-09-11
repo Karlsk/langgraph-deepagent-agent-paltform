@@ -24,6 +24,7 @@ const {
   routeState,
   mockRouterPush,
   mockRouterReplace,
+  mockOnBeforeRouteLeave,
   paletteHandlers,
   NodePaletteStub,
   WorkflowCanvasStub,
@@ -40,6 +41,7 @@ const {
   const mockNotifyError = vi.fn()
   const mockRouterPush = vi.fn()
   const mockRouterReplace = vi.fn()
+  const mockOnBeforeRouteLeave = vi.fn()
 
   const routeState: { name: string; params: Record<string, string> } = {
     name: 'workflow-design',
@@ -131,6 +133,7 @@ const {
     routeState,
     mockRouterPush,
     mockRouterReplace,
+    mockOnBeforeRouteLeave,
     WorkflowCanvasStub,
     paletteHandlers,
     NodePaletteStub,
@@ -149,7 +152,7 @@ vi.mock('@/api/workflow', () => ({
 vi.mock('vue-router', () => ({
   useRoute: () => routeState,
   useRouter: () => ({ push: mockRouterPush, replace: mockRouterReplace }),
-  onBeforeRouteLeave: vi.fn(),
+  onBeforeRouteLeave: (...args: unknown[]) => mockOnBeforeRouteLeave(...args),
 }))
 
 vi.mock('element-plus', () => ({
@@ -362,5 +365,55 @@ describe('WorkflowDesignerView save flow（spec-21）', () => {
 
     const saveBtn = wrapper.find('[data-testid="save-button"]')
     expect(saveBtn.exists()).toBe(false)
+  })
+
+  it('isDirty=true + route leave → confirm 离开', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+    mockElMessageBoxConfirm.mockResolvedValue('confirm')
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    paletteHandlers.addNode({ type: 'llm', position: { x: 0, y: 0 } })
+    await wrapper.vm.$nextTick()
+
+    const guard = mockOnBeforeRouteLeave.mock.calls[0][0] as () => Promise<boolean>
+    const result = await guard()
+
+    expect(mockElMessageBoxConfirm).toHaveBeenCalled()
+    expect(result).toBe(true)
+  })
+
+  it('isDirty=true + route leave → cancel 留下', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+    mockElMessageBoxConfirm.mockRejectedValue('cancel')
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    paletteHandlers.addNode({ type: 'llm', position: { x: 0, y: 0 } })
+    await wrapper.vm.$nextTick()
+
+    const guard = mockOnBeforeRouteLeave.mock.calls[0][0] as () => Promise<boolean>
+    const result = await guard()
+
+    expect(mockElMessageBoxConfirm).toHaveBeenCalled()
+    expect(result).toBe(false)
+  })
+
+  it('isDirty=false + route leave → 直接离开，不弹确认', async () => {
+    mockGetWorkflow.mockResolvedValue(sampleDTO)
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const guard = mockOnBeforeRouteLeave.mock.calls[0][0] as () => Promise<boolean>
+    const result = await guard()
+
+    expect(mockElMessageBoxConfirm).not.toHaveBeenCalled()
+    expect(result).toBe(true)
   })
 })

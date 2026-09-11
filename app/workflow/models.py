@@ -119,6 +119,7 @@ class WorkflowDefinition(BaseModel):
     nodes: list[NodeDefinition]
     edges: list[EdgeDefinition] = Field(default_factory=list)
     state_schema: dict[str, StateFieldSchema]
+    ui_layout: dict[str, Any] | None = None
     operator_logs: dict[str, OperatorLog] = Field(default_factory=dict)
     execution_history: list[ExecutionLog] = Field(default_factory=list)
 
