@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from app.workflow.logging_conf import redact_processor, setup_logging
 from app.workflow.models import WorkflowEngineError
+from app.workflow.ports import ChatModelFactory
 from app.workflow.registry import WorkflowRegistry, load_definitions_from_dir
 
 logger = structlog.get_logger(__name__)
@@ -53,11 +54,16 @@ def build_registry(
     directory: str | Path,
     *,
     user_dir: str | Path | None = None,
+    chat_model_factory: ChatModelFactory | None = None,
 ) -> WorkflowRegistry:
-    """Load definitions from ``directory`` (examples) and optionally ``user_dir``."""
+    """Load definitions from ``directory`` (examples) and optionally ``user_dir``.
+
+    ``chat_model_factory`` is forwarded to the registry for ``provider_ref``
+    resolution (S20); the CLI leaves it ``None``, so such nodes keep the env path.
+    """
     from app.workflow.store import user_workflow_dir as _default_user_dir
 
-    registry = WorkflowRegistry()
+    registry = WorkflowRegistry(chat_model_factory=chat_model_factory)
     for definition in load_definitions_from_dir(directory):
         registry.register_workflow(definition)
     resolved_user_dir = Path(user_dir) if user_dir is not None else _default_user_dir()

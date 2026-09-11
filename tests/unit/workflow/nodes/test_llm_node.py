@@ -5,6 +5,8 @@ clients are either injected via ``_llm_instance`` or patched at the
 ``app.workflow.nodes.llm_node`` import location.
 """
 
+import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -443,3 +445,177 @@ def test_execution_log_no_secret_leak(monkeypatch: pytest.MonkeyPatch) -> None:
         serialized = log.model_dump_json()
         assert secret_value not in serialized
         assert state_payload not in serialized
+
+
+# ---------------------------------------------------------------------------
+# S20: provider_ref resolution via injected ChatModelFactory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_config_provider_ref_defaults_none() -> None:
+    """provider_ref is a declared optional field (CONTRACT §4.7, S20)."""
+    assert "provider_ref" in LLMConfig.model_fields
+    assert LLMConfig().provider_ref is None
+
+
+@pytest.mark.unit
+def test_provider_ref_with_factory_uses_factory_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch 1: provider_ref + injected factory -> factory builds the client (S20)."""
+    monkeypatch.setenv("OPENAI_API_KEY", DUMMY_KEY)
+    sentinel = FakeLLM()
+    captured: dict[str, Any] = {}
+
+    def fake_factory(ref: str, overrides: dict[str, Any]) -> FakeLLM:
+        captured["ref"] = ref
+        captured["overrides"] = overrides
+        return sentinel
+
+    node = make_node(
+        {"provider_ref": "acme/gpt-4o", "temperature": 0.3},
+        chat_model_factory=fake_factory,
+    )
+    client = node._get_llm_instance()  # noqa: SLF001
+
+    assert client is sentinel
+    assert captured["ref"] == "acme/gpt-4o"
+    assert captured["overrides"]["temperature"] == 0.3
+
+
+@pytest.mark.unit
+def test_provider_ref_overrides_include_max_tokens_when_set() -> None:
+    """Node-level max_tokens is forwarded so it wins over ModelConfig.extra_params (S20)."""
+    captured: dict[str, Any] = {}
+
+    def fake_factory(ref: str, overrides: dict[str, Any]) -> FakeLLM:
+        captured["overrides"] = overrides
+        return FakeLLM()
+
+    node = make_node(
+        {"provider_ref": "acme/gpt-4o", "max_tokens": 256},
+        chat_model_factory=fake_factory,
+    )
+    node._get_llm_instance()  # noqa: SLF001
+
+    assert captured["overrides"]["max_tokens"] == 256
+
+
+@pytest.mark.unit
+def test_provider_ref_overrides_omit_max_tokens_when_unset() -> None:
+    """An unset max_tokens must not appear in overrides, so provider defaults survive (S20)."""
+    captured: dict[str, Any] = {}
+
+    def fake_factory(ref: str, overrides: dict[str, Any]) -> FakeLLM:
+        captured["overrides"] = overrides
+        return FakeLLM()
+
+    node = make_node({"provider_ref": "acme/gpt-4o"}, chat_model_factory=fake_factory)
+    node._get_llm_instance()  # noqa: SLF001
+
+    assert "max_tokens" not in captured["overrides"]
+
+
+@pytest.mark.unit
+def test_provider_ref_without_factory_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch 2: provider_ref set but no factory -> ConfigError, never a silent env fallback (S20)."""
+    monkeypatch.setenv("OPENAI_API_KEY", DUMMY_KEY)
+    node = make_node({"provider_ref": "acme/gpt-4o"})
+
+    with pytest.raises(ConfigError) as excinfo:
+        node._get_llm_instance()  # noqa: SLF001
+
+    message = str(excinfo.value)
+    assert "acme/gpt-4o" in message
+    assert "llm1" in message
+    # H6: the error must not carry any secret-looking value
+    assert DUMMY_KEY not in message
+
+
+@pytest.mark.unit
+def test_provider_ref_path_does_not_construct_env_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch 1 must bypass ChatOpenAI/ChatAnthropic entirely (no env credential use)."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def boom(**kwargs: Any) -> FakeLLM:
+        raise AssertionError("env-path client constructor must not be called")
+
+    monkeypatch.setattr("app.workflow.nodes.llm_node.ChatOpenAI", boom)
+    monkeypatch.setattr("app.workflow.nodes.llm_node.ChatAnthropic", boom)
+
+    node = make_node(
+        {"provider_ref": "acme/gpt-4o"},
+        chat_model_factory=lambda ref, overrides: FakeLLM(),
+    )
+    assert isinstance(node._get_llm_instance(), FakeLLM)  # noqa: SLF001
+
+
+@pytest.mark.unit
+def test_no_provider_ref_keeps_env_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Branch 3: without provider_ref the env path is unchanged even if a factory is injected."""
+    monkeypatch.setenv("OPENAI_API_KEY", DUMMY_KEY)
+    captured: dict[str, Any] = {}
+
+    def fake_ctor(**kwargs: Any) -> FakeLLM:
+        captured.update(kwargs)
+        return FakeLLM()
+
+    def fail_factory(ref: str, overrides: dict[str, Any]) -> FakeLLM:
+        raise AssertionError("factory must not be called without provider_ref")
+
+    monkeypatch.setattr("app.workflow.nodes.llm_node.ChatOpenAI", fake_ctor)
+    node = make_node({"model_name": "gpt-4o-mini"}, chat_model_factory=fail_factory)
+    node._get_llm_instance()  # noqa: SLF001
+
+    assert captured["model"] == "gpt-4o-mini"
+    assert captured["api_key"] == DUMMY_KEY
+
+
+@pytest.mark.unit
+def test_provider_ref_factory_memoized_once() -> None:
+    """K10 preserved: the factory is called once per node instance, not per invocation."""
+    calls = {"count": 0}
+
+    def fake_factory(ref: str, overrides: dict[str, Any]) -> FakeLLM:
+        calls["count"] += 1
+        return FakeLLM()
+
+    node = make_node({"provider_ref": "acme/gpt-4o"}, chat_model_factory=fake_factory)
+    first = node._get_llm_instance()  # noqa: SLF001
+    second = node._get_llm_instance()  # noqa: SLF001
+
+    assert first is second
+    assert calls["count"] == 1
+
+
+@pytest.mark.unit
+def test_provider_ref_factory_client_is_used_for_invocation() -> None:
+    """End to end: the factory-built client actually serves the run."""
+    fake = FakeLLM(side_effect=[AIMessage(content="from-provider")])
+    node = make_node(
+        {"provider_ref": "acme/gpt-4o"},
+        chat_model_factory=lambda ref, overrides: fake,
+    )
+    result = node.build_runnable().invoke({"messages": [HumanMessage(content="hi")]})
+
+    assert result["response"] == "from-provider"
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.unit
+def test_engine_modules_stay_free_of_host_imports() -> None:
+    """Red line 4 guard: the injection port and llm_node import nothing from app.core/app.services.
+
+    The ChatModelFactory exists precisely so the engine can consume provider-backed
+    credentials without acquiring a host dependency (CONTRACT §3, S20).
+    """
+    pattern = re.compile(r"^\s*(?:from|import)\s+app\.(?:core|services|api)\b", re.MULTILINE)
+    root = Path(__file__).resolve().parents[4] / "app" / "workflow"
+    for relative in ("ports.py", "nodes/llm_node.py", "nodes/factory.py", "graph_builder.py", "registry.py"):
+        source = (root / relative).read_text(encoding="utf-8")
+        assert not pattern.search(source), f"{relative} must not import app.core/app.services/app.api"

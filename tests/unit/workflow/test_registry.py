@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any, override
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import Runnable
 
+from app.workflow.cli import build_registry
 from app.workflow.models import (
     EdgeDefinition,
     ExecutionLog,
@@ -290,3 +292,70 @@ def test_load_definitions_empty_dir(tmp_path: Path) -> None:
     """Empty (or missing) directory yields an empty list."""
     assert load_definitions_from_dir(tmp_path / "nowhere") == []
     assert load_definitions_from_dir(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# S20: chat_model_factory injection reaches LLM nodes through the build chain
+# ---------------------------------------------------------------------------
+
+
+def make_llm_definition(workflow_id: str = "wf_provider", *, provider_ref: str | None = None) -> WorkflowDefinition:
+    """Single LLM node workflow used to assert factory plumbing (zero real LLM calls)."""
+    config: dict[str, Any] = {"model_name": "gpt-4o-mini"}
+    if provider_ref is not None:
+        config["provider_ref"] = provider_ref
+    return WorkflowDefinition(
+        workflow_id=workflow_id,
+        entry_point="ask",
+        nodes=[NodeDefinition(name="ask", type="llm", config=config)],
+        edges=[EdgeDefinition(source="ask", target="END")],
+        state_schema={"messages": StateFieldSchema(type="list")},
+        operator_logs={},
+        execution_history=[],
+    )
+
+
+class _RecordingClient:
+    """Minimal chat client stand-in returned by the injected factory."""
+
+    def invoke(self, messages: list[Any]) -> Any:
+        """Return a fixed AI message so the run completes without network."""
+        return AIMessage(content="from-injected-factory")
+
+
+def test_factory_reaches_llm_node_via_registry() -> None:
+    """Registry -> GraphBuilder -> create_node -> LLMNode carries the injected factory (S20)."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    def factory(ref: str, overrides: dict[str, Any]) -> _RecordingClient:
+        seen.append((ref, overrides))
+        return _RecordingClient()
+
+    registry = WorkflowRegistry(chat_model_factory=factory)
+    registry.register_workflow(make_llm_definition(provider_ref="acme/gpt-4o"))
+
+    node = registry.get_node_by_name("wf_provider", "ask")
+    assert node is not None
+    # Not yet called: the client is lazy (K10)
+    assert seen == []
+
+    registry.execute_workflow("wf_provider", {"messages": [HumanMessage(content="hi")]})
+
+    assert seen == [("acme/gpt-4o", {"temperature": 0.7})]
+
+
+def test_registry_without_factory_leaves_node_env_path() -> None:
+    """No factory injected -> the node keeps the env path, so existing YAML is unaffected (S20)."""
+    registry = WorkflowRegistry()
+    registry.register_workflow(make_llm_definition())
+
+    node = registry.get_node_by_name("wf_provider", "ask")
+    assert node is not None
+    assert getattr(node, "_chat_model_factory", "missing") is None
+
+
+def test_build_registry_forwards_factory(tmp_path: Path) -> None:
+    """cli.build_registry forwards the factory so the composition root can inject it (S20)."""
+    sentinel = object()
+    registry = build_registry(tmp_path, user_dir=tmp_path, chat_model_factory=sentinel)  # type: ignore[arg-type]
+    assert registry._builder._chat_model_factory is sentinel  # noqa: SLF001

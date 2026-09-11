@@ -27,6 +27,7 @@ from tenacity import RetryError, Retrying, retry_if_exception, stop_after_attemp
 from app.workflow.models import ConfigError, ExecutionLog, LLMNodeError, NodeType, OperatorLog
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
+from app.workflow.ports import ChatModelFactory
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 logger = structlog.get_logger(__name__)
@@ -44,7 +45,8 @@ class LLMConfig(BaseModel):
     """LLM node configuration (CONTRACT §4.7, S14 extra='forbid').
 
     No plaintext api_key field exists (H6/ADR-008): secrets are resolved from
-    environment variables via api_key_env / base_url_env or llm_type defaults.
+    environment variables via api_key_env / base_url_env or llm_type defaults,
+    or — when provider_ref is set — by the host-injected ChatModelFactory (S20).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -61,6 +63,10 @@ class LLMConfig(BaseModel):
     extra_params: dict[str, Any] = Field(default_factory=dict)
     max_retries: int = Field(default=3, ge=0)
     retry_base_delay: float = Field(default=1.0, gt=0)
+    # "<provider_name>/<model_name>" reference only (S20). Credentials stay in the
+    # provider store and are fetched by the injected factory at call time, so no
+    # secret is ever persisted into config or YAML (H6).
+    provider_ref: str | None = None
 
 
 def _is_retryable_llm_error(exc: BaseException) -> bool:
@@ -78,12 +84,14 @@ class LLMNode(BaseNode):
         llm_config: LLMConfig | dict[str, Any],
         messages: list[BaseMessage] | None = None,
         operator_log: OperatorLog | None = None,
+        chat_model_factory: ChatModelFactory | None = None,
     ) -> None:
         """Store the validated config; the provider client is created lazily (K10)."""
         config = llm_config if isinstance(llm_config, LLMConfig) else LLMConfig(**llm_config)
         super().__init__(name, NodeType.LLM, config.model_dump(), operator_log)
         self._llm_config = config
         self.messages = messages
+        self._chat_model_factory = chat_model_factory
         self._llm_instance: Any = None
 
     @override
@@ -113,9 +121,18 @@ class LLMNode(BaseNode):
         return None
 
     def _get_llm_instance(self) -> Any:
-        """Lazily build and memoize the provider chat client (K10)."""
+        """Lazily build and memoize the provider chat client (K10).
+
+        S20 resolution: ``provider_ref`` set -> host-injected factory builds the
+        client from the provider store; ``provider_ref`` set but no factory ->
+        ConfigError (never a silent env fallback — that would call the wrong
+        endpoint with the wrong credentials); otherwise the env-var path below.
+        """
         if self._llm_instance is None:
             cfg = self._llm_config
+            if cfg.provider_ref:
+                self._llm_instance = self._build_from_provider()
+                return self._llm_instance
             common: dict[str, Any] = {
                 "model": cfg.model_name,
                 "api_key": self._resolve_api_key(),
@@ -134,6 +151,20 @@ class LLMNode(BaseNode):
                     **common,
                 )
         return self._llm_instance
+
+    def _build_from_provider(self) -> Any:
+        """Build the client via the injected factory; node config wins over provider defaults (S20)."""
+        cfg = self._llm_config
+        if self._chat_model_factory is None:
+            msg = (
+                f"LLMNode '{self.name}': provider_ref '{cfg.provider_ref}' requires a "
+                "chat_model_factory injected by the host composition root, but none was provided"
+            )
+            raise ConfigError(msg)
+        overrides: dict[str, Any] = {"temperature": cfg.temperature}
+        if cfg.max_tokens is not None:
+            overrides["max_tokens"] = cfg.max_tokens
+        return self._chat_model_factory(str(cfg.provider_ref), overrides)
 
     def _invoke_with_retry(self, llm: Any, messages: list[Any]) -> Any:
         """Invoke with tenacity exponential backoff on 429/5xx (AD-03, S8)."""

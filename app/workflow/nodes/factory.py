@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from app.workflow.models import NodeDefinition, OperatorLog
 from app.workflow.nodes.base import BaseNode
+from app.workflow.ports import ChatModelFactory
 
 _NODE_REGISTRY: dict[str, type[BaseNode]] = {}
 
@@ -30,12 +31,25 @@ def list_node_types() -> list[str]:
     return list(_NODE_REGISTRY)
 
 
-def create_node(definition: NodeDefinition, operator_log: OperatorLog | None = None) -> BaseNode:
-    """内置优先（恰好 2 分支）→ 插件注册表兜底 → 未知 ValueError（R4，方案 A）."""
+def create_node(
+    definition: NodeDefinition,
+    operator_log: OperatorLog | None = None,
+    chat_model_factory: ChatModelFactory | None = None,
+) -> BaseNode:
+    """内置优先（恰好 2 分支）→ 插件注册表兜底 → 未知 ValueError（R4，方案 A）.
+
+    ``chat_model_factory`` 仅透传给 llm 分支（S20）：它是不透明 callable 而非注册表，
+    故不违反 H5「factory 无 workflow_registry 参数」。
+    """
     op_log = operator_log or OperatorLog(node_name=definition.name, input_schema={}, output_schema={})
     # 1. 内置兜底恰好 2 个分支（R4：禁 elif），专用构造器签名
     if definition.type in ("llm", "LLM"):
-        return _llm_node.LLMNode(name=definition.name, llm_config=definition.config, operator_log=op_log)
+        return _llm_node.LLMNode(
+            name=definition.name,
+            llm_config=definition.config,
+            operator_log=op_log,
+            chat_model_factory=chat_model_factory,
+        )
     if definition.type in ("http", "HTTP"):
         return _http_node.HTTPNode(name=definition.name, config=definition.config, operator_log=op_log)
     # 2. 插件注册表（generic BaseNode interface）
