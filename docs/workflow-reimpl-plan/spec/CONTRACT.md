@@ -119,7 +119,7 @@ L0  nodes/base.py ──► utils.py ──────────────�
 1. `models.py` 不得 import 任何引擎模块（只依赖 pydantic / 标准库 / `yaml`）。
 2. `nodes/*` 不得 import `registry` / `graph_builder`（节点不知道图与注册表的存在，同时根除 H5）。
 3. `utils.py` 不得 import LLM/HTTP 客户端库（C7）。
-4. 引擎自包含：`app/workflow/` 任何模块**不得 import `app.core.*` / `app.api.*` / `app.services.*`**（AD-02；反向集成时由外部装配，如可选 `api.py` 允许 import `app.core.limiter`，它是入口层例外，见 spec-08）。
+4. 引擎自包含：`app/workflow/` 任何模块**不得 import `app.core.*` / `app.api.*` / `app.services.*`**（AD-02；反向集成时由外部装配，如可选 `api.py` 允许 import `app.core.limiter`，它是入口层例外，见 spec-08）。宿主经构造参数注入的**不透明 callable**（如 `ChatModelFactory`，见 §4.7/S20）不构成依赖——引擎只持有类型别名 `app/workflow/ports.py`，不感知其实现，装配责任在组合根（`app/main.py`）。
 
 ## 4. 接口冻结清单
 
@@ -264,10 +264,12 @@ def list_node_types() -> list[str]: ...
 def create_node(
     definition: NodeDefinition,
     operator_log: OperatorLog | None = None,
+    chat_model_factory: ChatModelFactory | None = None,
 ) -> BaseNode:
     """插件注册表优先；内置兜底恰好 2 个分支：("llm","LLM")→LLMNode、("http","HTTP")→HTTPNode；
     未知类型 ValueError 列出 list_node_types() 并提示 register_node_type()；
-    无 workflow_registry 参数（H5）。"""
+    无 workflow_registry 参数（H5）。chat_model_factory 仅透传给 llm 分支（S20），
+    是不透明 callable 而非注册表，故不违反 H5。"""
 ```
 
 【AD-04】factory 及节点模块一律**顶层导入**（覆盖原文档"函数内延迟导入"口径）；langchain-anthropic 为正式依赖。
@@ -307,7 +309,9 @@ class LLMConfig(BaseModel):
     extra_params: dict[str, Any] = Field(default_factory=dict)
     max_retries: int = Field(default=3, ge=0)
     retry_base_delay: float = Field(default=1.0, gt=0)
-    # 不设明文 api_key 字段（H6/ADR-008）
+    provider_ref: str | None = None    # "<provider_name>/<model_name>"；非空时走注入工厂解析（S20）
+    # 不设明文 api_key 字段（H6/ADR-008）。provider_ref 只存**引用**，
+    # 凭据由宿主注入的 ChatModelFactory 在调用期从 provider 表解析，config/YAML 永不落密钥。
 
 class LLMNode(BaseNode):
     def __init__(
@@ -316,13 +320,20 @@ class LLMNode(BaseNode):
         llm_config: LLMConfig | dict[str, Any],
         messages: list[BaseMessage] | None = None,
         operator_log: OperatorLog | None = None,
+        chat_model_factory: ChatModelFactory | None = None,
     ) -> None: ...
     def validate_config(self) -> bool: ...
     def _resolve_api_key(self) -> str: ...        # 缺失 → ConfigError，消息含 env 名不含密钥值
-    def _get_llm_instance(self) -> Any: ...       # 懒加载（K10）
+    def _get_llm_instance(self) -> Any: ...       # 懒加载（K10）；三分支见 S20
     def _invoke_with_retry(self, llm: Any, messages: list[Any]) -> Any: ...
     def build_runnable(self) -> Runnable: ...
 # 模块底部自注册：register_node_type("llm", LLMNode)
+```
+
+`ChatModelFactory` 定义于 `app/workflow/ports.py`（引擎内部端口，零 `app.*` 依赖）：
+
+```python
+ChatModelFactory = Callable[[str, dict[str, Any]], Any]  # (provider_ref, overrides) -> chat client
 ```
 
 【AD-03】`_invoke_with_retry` 用 **tenacity** 实现（覆盖原文档手写循环口径），语义合同不变：仅 429/rate 命中重试；退避 `retry_base_delay * 2**attempt`；耗尽抛 `LLMNodeError`（含尝试次数）；测试 monkeypatch `tenacity.nap.sleep` 断言退避序列 `1,2,4`。
@@ -372,6 +383,7 @@ class GraphBuilder:
         self,
         *,
         no_match_policy: Literal["raise", "default"] = "raise",
+        chat_model_factory: ChatModelFactory | None = None,
     ) -> None: ...
     def build_graph(
         self,
@@ -427,6 +439,7 @@ class WorkflowRegistry:
         self,
         *,
         no_match_policy: Literal["raise", "default"] = "raise",
+        chat_model_factory: ChatModelFactory | None = None,
     ) -> None: ...
     def register_workflow(
         self,
@@ -608,6 +621,7 @@ class HTTPNodeError(WorkflowEngineError):
 | S17 | YAML 落盘持久化（2026-09-07 新增） | 用户定义目录 `app/workflow/config/user/`（与只读 `examples/` 分离）；`PUT` 全量覆盖写 + 原子替换（对齐 S13 原子替换语义）；文件名 `workflow_id` 白名单校验 `^[A-Za-z0-9_-]{1,64}$`（防路径穿越）；`build_registry` 启动扫描 `examples/` + `user/`（S16 fail-fast 不变）；`DELETE` 同步删除对应 YAML 文件。落盘失败 → 500（message 携脱敏原因，H6） |
 | S18 | 节点类型 API 白名单（2026-09-07 新增） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http}`（`NodeType` 枚举内置集，C8）；拒绝 `python`（S15 非沙箱 RCE，经 HTTP 注册等价远程代码执行）及未知类型；校验失败 → HTTP 422（S6 构建期校验），`message` 携脱敏原因（H6）。前端画布 palette 仅 `llm`/`http`（`docs/workflow-frontend-spec.md` §5.1），但**安全边界在后端** |
 | S19 | 写端点鉴权（2026-09-07 新增） | `PUT` / `DELETE` 写端点须 `Depends(get_current_user)` + **管理员角色**校验；未授权 → HTTP 403。现状 `execute` 端点无鉴权（仅 slowapi 限流），本期不改动；写端点鉴权策略由后端联动任务补齐（前端按角色禁用写按钮，`docs/workflow-frontend-spec.md` §5.4） |
+| S20 | LLM 凭据解析（2026-09-11 新增） | `LLMConfig.provider_ref` 非空时，客户端由宿主注入的 `ChatModelFactory` 构建：`factory(provider_ref, overrides)`，`overrides` 携节点级 `temperature`（及 `max_tokens`，若设置），**节点配置优先于** `ModelConfig.extra_params`。凭据（api_key/base_url/model_id）全部来自 provider 表，**config 与 YAML 永不落密钥**（H6）。`_get_llm_instance()` 三分支：① `provider_ref` + 工厂 → 工厂路径；② `provider_ref` 但工厂为 `None` → **`ConfigError`**（消息含节点名与 ref，**不静默回退 env**——用错端点/密钥比直接失败更危险）；③ `provider_ref` 为空 → 现有 env 路径（`llm_type` 分支）逐字不变（向后兼容既有 YAML）。K10 memoize 不变：客户端按节点实例缓存，provider 换密钥需重新注册工作流方生效。`provider_ref` 存在性/enabled 校验在**注册期**完成（S6 构建期优先）：`PUT` 对每个携 `provider_ref` 的 llm 节点校验，失败 → HTTP 422 |
 
 ## 7. 探索先行规则（R-EXP）
 
@@ -722,6 +736,7 @@ grep -rni "dispatcher\|triage\|subgraph" app/workflow/
 | 日期 | 变更内容 | 影响章节 | 生效 spec | 备注 |
 | --- | --- | --- | --- | --- |
 | 2026-09-07 | 画布编排契约扩展：§4.12 `metadata` 新增可选第五键 `execution_logs`（execute 成功响应内嵌轨迹，脱敏后）；新增 §4.13 画布管理端点签名（GET 列表 / GET 查定义 / PUT 全量保存 / DELETE 删除）；§6 新增 S17（YAML 落盘持久化）、S18（节点类型 API 白名单）、S19（写端点鉴权） | §4.12 / §4.13 / §6（S17-S19） | `docs/changelog/workflow-canvas-orchestration/spec-01-contract-change.md` 及下游 spec-02..04、16..20 | 纯契约变更，提交 `docs:`；引擎内核零改动；详细设计见 `docs/workflow-frontend-spec.md` §4-5 与 `docs/workflow-api-and-trace.md` §7.1 |
+| 2026-09-11 | LLM 节点接入 provider 体系：§4.7 `LLMConfig` 新增可选 `provider_ref`、`LLMNode.__init__` 新增可选 `chat_model_factory`；§4.5 `create_node`、`GraphBuilder.__init__`、`WorkflowRegistry.__init__` 各新增可选 `chat_model_factory` 透传参数；新增 `app/workflow/ports.py` 承载 `ChatModelFactory` 类型别名；§3 红线 4 补充「注入的不透明 callable 不构成 `app.*` 依赖」；§6 新增 S20（凭据解析三分支 + 注册期校验） | §3 / §4.5 / §4.7 / §6（S20） | `docs/changelog/workflow-llm-provider-integration/spec-01-contract-change.md`；下游 `spec-04-llmnode.md`、`docs/workflow-node-development.md` §3.1-3.2、`docs/changelog/workflow-canvas-orchestration/spec-12-node-config-forms.md` | 签名变更（全部为新增带默认值的可选参数，向后兼容），代码提交用 `refactor!`。**动机**：引擎原先只从 env 取凭据，与 provider 表的 `auth_config.api_key`/`base_url` 完全割裂，设计器手填 `model_name` 既不校验存在性也用不上真实端点 |
 
 ## 12. 每 Phase 交付自检表
 

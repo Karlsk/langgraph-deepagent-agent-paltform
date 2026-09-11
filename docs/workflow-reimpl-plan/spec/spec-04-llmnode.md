@@ -46,7 +46,7 @@
 
 ## 6. 接口契约
 
-见 CONTRACT §4.7（`LLMConfig` / `LLMNode` 签名）、§5（`ConfigError`/`LLMNodeError` 场景）、§6 S5/S8/S14/S15（进出管线、retry 语义、extra=forbid、日志摘要）。
+见 CONTRACT §4.7（`LLMConfig` / `LLMNode` 签名，含 2026-09-11 新增的 `provider_ref` 字段与 `chat_model_factory` 注入参数）、§5（`ConfigError`/`LLMNodeError` 场景）、§6 S5/S8/S14/S15（进出管线、retry 语义、extra=forbid、日志摘要）、**S20（LLM 凭据解析三分支：`provider_ref` + 注入工厂 → 工厂路径；`provider_ref` 但无工厂 → `ConfigError`；无 `provider_ref` → env 路径）**。变更依据见 `docs/changelog/workflow-llm-provider-integration/spec-01-contract-change.md`。
 
 ## 7. TDD 测试要点
 

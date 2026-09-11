@@ -21,12 +21,13 @@ props: { node: Node | null; readonly?: boolean }
 emits: { 'update:node': (patch: { name?: string; config?: Record<string, unknown> }) => void; 'remove-node': (id: string) => void }
 ```
 
-**字段（严格对齐示例 YAML，见 `config/examples/`）**：
+**字段（对齐 CONTRACT §4.7 `LLMConfig` / §4.8 `HTTPNodeConfig` 冻结字段集）**：
 
 | 表单 | 字段 | 控件 | 约束 |
 | --- | --- | --- | --- |
-| LLM | `llm_type` | select（openai/...） | 必填 |
-| LLM | `model_name` | input | 必填（如 gpt-4o-mini） |
+| LLM | `provider_ref` | select（按 provider 分组的模型下拉，选项值为 `"<provider>/<model>"`） | 选填；非空则凭据由后端从 provider 表解析（S20）。支持 `allow-create` 手填裸模型名 → 此时 `provider_ref` 置空、走 env 回退 |
+| LLM | `model_name` | 由上述下拉联动写入（= 所选 `ModelConfig.model_id`）；手填路径下为输入值 | 必填（`validate_config` 要求非空）；不再单独提供自由文本框 |
+| LLM | `llm_type` | select（openai/anthropic）；`provider_ref` 非空时**只读展示**，值由 provider `type` 推导（`OPENAI`/`OPENAI_COMPATIBLE`/`OLLAMA`→`openai`，`ANTHROPIC`→`anthropic`） | 必填 |
 | LLM | `temperature` | number(0-2) | 选填 |
 | LLM | `system_prompt` | textarea | 选填 |
 | HTTP | `url` | input | 必填；前端提示「服务端将做 SSRF 白名单校验」（spec-20） |
@@ -61,7 +62,9 @@ emits: { 'update:node': (patch: { name?: string; config?: Record<string, unknown
 ## 7. 验收门限（DoD Gate）
 
 - [ ] RED 用例全绿；**「LLM 无 api_key」断言通过**（H6 硬门）；`npm run type-check` 零错误；`npm test` 通过。
-- [ ] 字段集与 `config/examples/*.yaml` 完全对应（无多字段 / 无漏字段）；immutable patch（不直接改 props）。
+- [ ] 表单写入的键**全部属于** CONTRACT §4.7 `LLMConfig` / §4.8 `HTTPNodeConfig` 冻结字段集（`extra="forbid"`，多一个键即注册期 422）；编辑单个字段时**不得丢弃** config 中其他既有键（如 `max_retries`/`retry_base_delay`）；immutable patch（不直接改 props）。
+  > 基准由「与 `config/examples/*.yaml` 完全对应」改为「与冻结字段集对应」：示例 YAML 从未携带 `nodeCatalog.ts` 注入的 `max_retries`/`retry_base_delay`，原口径自相矛盾。
+- [ ] 模型下拉选项来自 provider 系统（`listAllProviderModels()` + `listProviders()`），按 provider 分组；provider 或 model 未 enabled 的不出现在选项中；目录为空时有清晰 `no-data-text`，不白屏。
 - [ ] `readonly` 门禁生效（spec-19 复用）；无硬编码颜色。
 - [ ] 提交 `feat(web): add workflow node config panel and llm/http forms`。
 

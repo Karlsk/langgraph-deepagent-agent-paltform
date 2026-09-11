@@ -161,8 +161,10 @@ def log_execution(self, execution_log: ExecutionLog) -> None:
 | `extra_params` | `dict[str, Any]` | `{}` | 透传为 `model_kwargs` |
 | `max_retries` | `int` | `3` | 约束 `ge=0`；重试次数（tenacity `stop_after_attempt(max_retries+1)`） |
 | `retry_base_delay` | `float` | `1.0` | 约束 `gt=0`；退避乘数 |
+| `provider_ref` | `str \| None` | `None` | `"<provider_name>/<model_name>"`；非空时凭据与 model_id 全部由宿主注入的 `ChatModelFactory` 从 provider 表解析（S20），`llm_type`/`model_name`/`base_url`/`api_key_env` 降级为展示与 env 回退用途 |
 
-> **不存在明文 `api_key` 字段**（H6/ADR-008/R5）。密钥只经 `_resolve_api_key()` 从环境变量解析。
+> **不存在明文 `api_key` 字段**（H6/ADR-008/R5）。`provider_ref` 为空时密钥只经 `_resolve_api_key()` 从环境变量解析；
+> `provider_ref` 非空时密钥由注入工厂在调用期从 provider 表取得，**config 与 YAML 永不落密钥**。
 
 ### 3.2 密钥解析（env-only，R5/H6）
 
@@ -174,6 +176,20 @@ _DEFAULT_BASE_URL_ENV = {"openai": "OPENAI_BASE_URL"}
 - `_resolve_api_key()`：取 `api_key_env` 或 `llm_type` 默认 env → `os.environ.get(env_name)`；缺失抛
   `ConfigError`，消息**含 env 名、不含密钥值**（H6）。
 - `_resolve_base_url()`：显式 `base_url` 优先 → `base_url_env` → `llm_type` 默认 env（AD-12）。
+
+**上述 env 路径仅在 `provider_ref` 为空时生效**（S20）。`_get_llm_instance()` 的完整三分支：
+
+| 条件 | 客户端来源 | 凭据来源 |
+| --- | --- | --- |
+| `provider_ref` 非空 + 工厂已注入 | `chat_model_factory(provider_ref, overrides)` | provider 表（`Provider.auth_config` / `base_url` / `ModelConfig.model_id`） |
+| `provider_ref` 非空 + 工厂为 `None` | — | 抛 `ConfigError`（**不静默回退 env**：打错端点/用错账号计费比直接失败更危险） |
+| `provider_ref` 为空 | 按 `llm_type` 分支构造 `ChatOpenAI`/`ChatAnthropic` | env（上表两个 `_resolve_*`） |
+
+`overrides` 携节点级 `temperature`（及 `max_tokens`，若设置），**节点配置优先于** `ModelConfig.extra_params`。
+工厂由组合根（`app/main.py`）注入，经 `WorkflowRegistry` → `GraphBuilder` → `create_node` → `LLMNode` 透传；
+引擎侧只见 `app/workflow/ports.py` 的 `ChatModelFactory` 类型别名，零 `app.*` 依赖（§3 红线 4）。
+
+> **K10 memoize 副作用**：客户端按节点实例缓存，provider 轮换密钥后需**重新保存/注册该工作流**才会生效。
 
 ### 3.3 重试与懒加载（AD-03/S8/K10）
 
