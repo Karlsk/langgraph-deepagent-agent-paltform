@@ -62,8 +62,8 @@ export interface ExecutionLogView {
 }
 
 export interface WorkflowExecuteResult {
-  output: Record<string, unknown>
   metadata: Record<string, unknown> & { execution_logs?: ExecutionLogView[] }
+  [key: string]: unknown
 }
 
 export interface WorkflowCapabilities {
@@ -94,8 +94,8 @@ export function saveWorkflow(
   return put<WorkflowDefinitionDTO>('/workflows/' + id, definition)
 }
 
-export function deleteWorkflow(id: string): Promise<null> {
-  return del<null>('/workflows/' + id)
+export function deleteWorkflow(id: string): Promise<{ result: null; metadata: Record<string, unknown> }> {
+  return del<{ result: null; metadata: Record<string, unknown> }>('/workflows/' + id)
 }
 
 export function executeWorkflow(

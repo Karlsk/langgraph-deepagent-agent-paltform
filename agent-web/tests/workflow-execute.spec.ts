@@ -69,8 +69,9 @@ const LOGS: ExecutionLogView[] = [
 ]
 
 const EXECUTE_RESULT: WorkflowExecuteResult = {
-  output: { result: 'done', count: 3 },
-  metadata: { total_time_ms: 520, execution_logs: LOGS },
+  result: 'done',
+  count: 3,
+  metadata: { duration_ms: 520, execution_logs: LOGS },
 }
 
 const ElDialogStub = defineComponent({

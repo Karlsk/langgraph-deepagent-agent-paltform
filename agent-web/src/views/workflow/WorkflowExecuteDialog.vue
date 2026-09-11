@@ -55,6 +55,12 @@ function onPresetChange(key: string): void {
 
 const hasResult = computed(() => result.value !== null)
 
+const outputFields = computed(() => {
+  if (!result.value) return null
+  const { metadata: _meta, ...rest } = result.value
+  return rest
+})
+
 function formatJson(data: unknown): string {
   if (data === null || data === undefined) return '—'
   try {
@@ -151,11 +157,11 @@ function handleOpenTrace(): void {
       <div v-if="hasResult" class="execute-dialog__result">
         <h4 class="execute-dialog__result-title">执行结果</h4>
         <div class="execute-dialog__meta">
-          <span>耗时：{{ formatTime(result?.metadata?.total_time_ms) }}</span>
+          <span>耗时：{{ formatTime(result?.metadata?.duration_ms) }}</span>
         </div>
         <div class="execute-dialog__output">
           <span class="execute-dialog__label">输出</span>
-          <pre class="execute-dialog__json">{{ formatJson(result?.output) }}</pre>
+          <pre class="execute-dialog__json">{{ formatJson(outputFields) }}</pre>
         </div>
         <div class="execute-dialog__actions">
           <el-button link type="primary" @click="handleOpenTrace">
