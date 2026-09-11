@@ -462,6 +462,9 @@ class WorkflowRegistry:
     def get_registry_stats(self) -> dict[str, Any]: ...
 
 def load_definitions_from_dir(directory: str | Path) -> list[WorkflowDefinition]: ...
+
+# S21（2026-09-11 新增）：运行输入合成。纯函数，返回新 dict，不 mutate 入参。
+def synthesize_run_input(definition: WorkflowDefinition, input_data: dict[str, Any]) -> dict[str, Any]: ...
 ```
 
 ### 4.11 `app/workflow/logging_conf.py`
@@ -622,6 +625,7 @@ class HTTPNodeError(WorkflowEngineError):
 | S18 | 节点类型 API 白名单（2026-09-07 新增） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http}`（`NodeType` 枚举内置集，C8）；拒绝 `python`（S15 非沙箱 RCE，经 HTTP 注册等价远程代码执行）及未知类型；校验失败 → HTTP 422（S6 构建期校验），`message` 携脱敏原因（H6）。前端画布 palette 仅 `llm`/`http`（`docs/workflow-frontend-spec.md` §5.1），但**安全边界在后端** |
 | S19 | 写端点鉴权（2026-09-07 新增） | `PUT` / `DELETE` 写端点须 `Depends(get_current_user)` + **管理员角色**校验；未授权 → HTTP 403。现状 `execute` 端点无鉴权（仅 slowapi 限流），本期不改动；写端点鉴权策略由后端联动任务补齐（前端按角色禁用写按钮，`docs/workflow-frontend-spec.md` §5.4） |
 | S20 | LLM 凭据解析（2026-09-11 新增） | `LLMConfig.provider_ref` 非空时，客户端由宿主注入的 `ChatModelFactory` 构建：`factory(provider_ref, overrides)`，`overrides` 携节点级 `temperature`（及 `max_tokens`，若设置），**节点配置优先于** `ModelConfig.extra_params`。凭据（api_key/base_url/model_id）全部来自 provider 表，**config 与 YAML 永不落密钥**（H6）。`_get_llm_instance()` 三分支：① `provider_ref` + 工厂 → 工厂路径；② `provider_ref` 但工厂为 `None` → **`ConfigError`**（消息含节点名与 ref，**不静默回退 env**——用错端点/密钥比直接失败更危险）；③ `provider_ref` 为空 → 现有 env 路径（`llm_type` 分支）逐字不变（向后兼容既有 YAML）。K10 memoize 不变：客户端按节点实例缓存，provider 换密钥需重新注册工作流方生效。`provider_ref` 存在性/enabled 校验在**注册期**完成（S6 构建期优先）：`PUT` 对每个携 `provider_ref` 的 llm 节点校验，失败 → HTTP 422 |
+| S21 | 运行输入合成（2026-09-11 新增） | `execute_workflow` 在 `graph.invoke` 前调用纯函数 `synthesize_run_input(definition, input_data)`（§4.10），规则按序：① `input_data["messages"]` 真值 → 原样透传（显式消息优先，向后兼容）；② 否则 `input_data["input"]` 为非空 `str` → **附加式**注入 `messages=[{"role":"user","content":<input>}]`（不删改任何用户键，`input` 键仍写入 state 供 `{input}` 占位符使用）；③ `input` 缺失/非 `str`/空白 → 不合成（缺失 channel 按 S14 走声明默认值，LLMNode 空 messages 仍按现状 `ValueError`）；④ 对**所有**工作流生效，不按节点类型特判（R2）；无 llm 节点时多余 `messages` 键被 langgraph 静默丢弃（S14）。wire 双形态兼容：`{"input":"hi"}` 与 `{"input":{"input":"hi",...}}` 均命中合成（`api.py` 解包逻辑不变）。本语义约束**运行入口的输入预处理**，不改变 `state.py`「状态模型构建不做字段名特判」原则 |
 
 ## 7. 探索先行规则（R-EXP）
 
@@ -737,6 +741,7 @@ grep -rni "dispatcher\|triage\|subgraph" app/workflow/
 | --- | --- | --- | --- | --- |
 | 2026-09-07 | 画布编排契约扩展：§4.12 `metadata` 新增可选第五键 `execution_logs`（execute 成功响应内嵌轨迹，脱敏后）；新增 §4.13 画布管理端点签名（GET 列表 / GET 查定义 / PUT 全量保存 / DELETE 删除）；§6 新增 S17（YAML 落盘持久化）、S18（节点类型 API 白名单）、S19（写端点鉴权） | §4.12 / §4.13 / §6（S17-S19） | `docs/changelog/workflow-canvas-orchestration/spec-01-contract-change.md` 及下游 spec-02..04、16..20 | 纯契约变更，提交 `docs:`；引擎内核零改动；详细设计见 `docs/workflow-frontend-spec.md` §4-5 与 `docs/workflow-api-and-trace.md` §7.1 |
 | 2026-09-11 | LLM 节点接入 provider 体系：§4.7 `LLMConfig` 新增可选 `provider_ref`、`LLMNode.__init__` 新增可选 `chat_model_factory`；§4.5 `create_node`、`GraphBuilder.__init__`、`WorkflowRegistry.__init__` 各新增可选 `chat_model_factory` 透传参数；新增 `app/workflow/ports.py` 承载 `ChatModelFactory` 类型别名；§3 红线 4 补充「注入的不透明 callable 不构成 `app.*` 依赖」；§6 新增 S20（凭据解析三分支 + 注册期校验） | §3 / §4.5 / §4.7 / §6（S20） | `docs/changelog/workflow-llm-provider-integration/spec-01-contract-change.md`；下游 `spec-04-llmnode.md`、`docs/workflow-node-development.md` §3.1-3.2、`docs/changelog/workflow-canvas-orchestration/spec-12-node-config-forms.md` | 签名变更（全部为新增带默认值的可选参数，向后兼容），代码提交用 `refactor!`。**动机**：引擎原先只从 env 取凭据，与 provider 表的 `auth_config.api_key`/`base_url` 完全割裂，设计器手填 `model_name` 既不校验存在性也用不上真实端点 |
+| 2026-09-11 | 运行输入合成：§4.10 新增模块级纯函数 `synthesize_run_input(definition, input_data)`；§6 新增 S21（`execute_workflow` 在 `graph.invoke` 前把非空 `input` str 附加式合成为 `messages=[{"role":"user","content":...}]`；`messages` 已存在则透传；对所有工作流生效、不按节点类型特判） | §4.10 / §6（S21） | `docs/changelog/workflow-input-synthesis/spec-01-contract-change.md` | 纯契约变更，提交 `docs:`；引擎仅 registry 一行接线，`api.py`/`cli.py`/`state.py`/`llm_node.py` 零改动。**动机**：执行含 LLM 节点的工作流须手写完整 langchain 消息结构，`messages` 实为引擎内置通道而非业务字段 |
 
 ## 12. 每 Phase 交付自检表
 
