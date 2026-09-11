@@ -290,7 +290,11 @@ async def execute_workflow(
         JSONResponse carrying the host unified envelope ``{code, message, data}`` (200/404/500).
     """
     logger.info("api_workflow_execution_requested", workflow_id=workflow_id)
-    input_data = payload or {}
+    # Frontend sends {"input": {...state fields...}}; extract the inner dict.
+    # Fall back to the whole payload for direct/legacy callers that send flat state.
+    raw = payload or {}
+    inner = raw.get("input")
+    input_data: dict[str, Any] = inner if isinstance(inner, dict) else raw
     try:
         # Resolved inside the try block so a missing injection lands in the envelope (R6).
         registry = get_registry(request)
