@@ -13,6 +13,7 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
   llm: {
     llm_type: 'openai',
     model_name: 'gpt-4o-mini',
+    provider_ref: null,
     system_prompt: '',
     temperature: 0.7,
     max_retries: 3,
