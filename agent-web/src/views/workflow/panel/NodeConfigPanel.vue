@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import type { Node } from '@vue-flow/core'
+import type { WorkflowNodeType } from '@/api/workflow'
 import LlmNodeForm from './LlmNodeForm.vue'
 import HttpNodeForm from './HttpNodeForm.vue'
+import PythonNodeForm from './PythonNodeForm.vue'
 
 interface Props {
   node: Node | null
@@ -43,7 +45,7 @@ function onDelete() {
   emit('remove-node', props.node.id)
 }
 
-function getNodeType(): 'llm' | 'http' | null {
+function getNodeType(): WorkflowNodeType | null {
   if (!props.node) return null
   return props.node.data?.type ?? null
 }
@@ -81,6 +83,12 @@ function getNodeConfig(): Record<string, unknown> {
         />
         <HttpNodeForm
           v-else-if="getNodeType() === 'http'"
+          :config="getNodeConfig()"
+          :readonly="props.readonly"
+          @update:config="onConfigUpdate"
+        />
+        <PythonNodeForm
+          v-else-if="getNodeType() === 'python'"
           :config="getNodeConfig()"
           :readonly="props.readonly"
           @update:config="onConfigUpdate"

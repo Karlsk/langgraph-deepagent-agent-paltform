@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { WorkflowNodeType } from '@/api/workflow'
 import { PALETTE_ITEMS } from './nodeCatalog'
 
 interface Props {
@@ -10,15 +11,15 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const emit = defineEmits<{
-  'add-node': [payload: { type: 'llm' | 'http'; position: { x: number; y: number } }]
+  'add-node': [payload: { type: WorkflowNodeType; position: { x: number; y: number } }]
 }>()
 
-function onDragStart(event: DragEvent, type: 'llm' | 'http') {
+function onDragStart(event: DragEvent, type: WorkflowNodeType) {
   if (props.readonly) return
   event.dataTransfer?.setData('application/json', JSON.stringify({ type }))
 }
 
-function onClick(type: 'llm' | 'http') {
+function onClick(type: WorkflowNodeType) {
   if (props.readonly) return
   emit('add-node', { type, position: { x: 0, y: 0 } })
 }
@@ -86,6 +87,10 @@ function onClick(type: 'llm' | 'http') {
 
 .node-palette__item--http:hover:not([aria-disabled="true"]) {
   border-color: var(--color-node-http);
+}
+
+.node-palette__item--python:hover:not([aria-disabled="true"]) {
+  border-color: var(--color-node-python);
 }
 
 .node-palette__item[aria-disabled="true"] {

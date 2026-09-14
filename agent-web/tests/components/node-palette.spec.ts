@@ -1,10 +1,11 @@
 // @vitest-environment happy-dom
 /**
- * NodePalette 组件测试（spec-11）：
- * - 验证 palette 项白名单（仅 llm/http，S15 守卫：不含 python）；
+ * NodePalette 组件测试（spec-11，S18/S22 修订）：
+ * - 验证 palette 项白名单为 llm/http/python（`python` 自 S22 起有真沙箱执行路径，故可编排）；
  * - 验证拖拽事件（dragstart 写入 dataTransfer）；
  * - 验证 readonly 模式（draggable=false + aria-disabled=true）；
  * - 验证点击回退路径（emit add-node）；
+ * - 验证 DEFAULT_CONFIGS.python 只暴露 code（无 entry / sandboxed，§5.1）；
  * - 验证 nextNodeName 纯函数（唯一、递增、填补空缺）。
  */
 import { describe, expect, it, vi } from 'vitest'
@@ -12,7 +13,7 @@ import { mount } from '@vue/test-utils'
 import type { Component } from 'vue'
 
 import NodePalette from '@/views/workflow/canvas/NodePalette.vue'
-import { nextNodeName, PALETTE_ITEMS } from '@/views/workflow/canvas/nodeCatalog'
+import { DEFAULT_CONFIGS, nextNodeName, PALETTE_ITEMS } from '@/views/workflow/canvas/nodeCatalog'
 
 function mountPalette(extraProps: Record<string, unknown> = {}) {
   const wrapper = mount(NodePalette as Component, {
@@ -24,16 +25,21 @@ function mountPalette(extraProps: Record<string, unknown> = {}) {
 }
 
 describe('NodePalette 节点面板', () => {
-  it('渲染恰好 2 个可拖项（llm / http）', () => {
+  it('渲染恰好 3 个可拖项（llm / http / python）', () => {
     const wrapper = mountPalette()
     const items = wrapper.findAll('.node-palette__item')
-    expect(items).toHaveLength(2)
+    expect(items).toHaveLength(3)
   })
 
-  it('S15 守卫：palette 项白名单不含 python', () => {
+  it('S18 白名单：palette 项为 llm / http / python（python 走沙箱路径，S22）', () => {
     const types = PALETTE_ITEMS.map(item => item.type)
-    expect(types).toEqual(['llm', 'http'])
-    expect(types).not.toContain('python')
+    expect(types).toEqual(['llm', 'http', 'python'])
+  })
+
+  it('DEFAULT_CONFIGS.python 只含 code，不含 entry / sandboxed（§5.1）', () => {
+    expect(Object.keys(DEFAULT_CONFIGS.python!)).toEqual(['code'])
+    expect(DEFAULT_CONFIGS.python).not.toHaveProperty('entry')
+    expect(DEFAULT_CONFIGS.python).not.toHaveProperty('sandboxed')
   })
 
   it('拖拽项 dragstart → dataTransfer.setData 写入 type', async () => {
@@ -90,6 +96,17 @@ describe('NodePalette 节点面板', () => {
     ])
   })
 
+  it('点击 python 项 → emit add-node({ type: "python" })', async () => {
+    const wrapper = mountPalette()
+    const pythonItem = wrapper.findAll('.node-palette__item')[2]
+
+    await pythonItem.trigger('click')
+
+    expect(wrapper.emitted('add-node')![0]).toEqual([
+      { type: 'python', position: { x: 0, y: 0 } },
+    ])
+  })
+
   it('readonly=true → 点击不触发 emit', async () => {
     const wrapper = mountPalette({ readonly: true })
     const llmItem = wrapper.findAll('.node-palette__item')[0]
@@ -104,11 +121,13 @@ describe('nextNodeName 纯函数', () => {
   it('空列表 → 返回 type_1', () => {
     expect(nextNodeName('llm', [])).toBe('llm_1')
     expect(nextNodeName('http', [])).toBe('http_1')
+    expect(nextNodeName('python', [])).toBe('python_1')
   })
 
   it('已有 type_1 → 返回 type_2', () => {
     expect(nextNodeName('llm', ['llm_1'])).toBe('llm_2')
     expect(nextNodeName('http', ['http_1'])).toBe('http_2')
+    expect(nextNodeName('python', ['python_1'])).toBe('python_2')
   })
 
   it('混合类型 → 仅计数同类型', () => {

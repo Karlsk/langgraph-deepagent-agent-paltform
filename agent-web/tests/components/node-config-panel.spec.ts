@@ -1,9 +1,10 @@
 // @vitest-environment happy-dom
 /**
- * NodeConfigPanel 组件测试（spec-12）：
- * - 验证 type 驱动表单切换（llm → LlmNodeForm，http → HttpNodeForm，null → 空态）；
+ * NodeConfigPanel 组件测试（spec-12，S18/S22 修订）：
+ * - 验证 type 驱动表单切换（llm → LlmNodeForm，http → HttpNodeForm，python → PythonNodeForm，null → 空态）；
  * - 验证 H6 守卫（LLM 表单不含 api_key 输入）；
  * - 验证 immutable patch（emit update:node 含新 config 对象，不修改原 props）；
+ *   python 节点的 patch 额外不得携 entry / sandboxed 两键（§5.1 / §14）；
  * - 验证 readonly 模式（控件禁用、删除按钮隐藏）；
  * - 验证节点重命名（emit update:node({ name })）；
  * - 验证删除节点（emit remove-node(id)）。
@@ -46,6 +47,18 @@ const mockHttpNode = {
   },
 }
 
+const mockPythonNode = {
+  id: 'node-3',
+  type: 'workflow',
+  data: {
+    name: 'python_1',
+    type: 'python',
+    config: {
+      code: 'return {"upper": state["input"].upper()}',
+    },
+  },
+}
+
 function mountPanel(extraProps: Record<string, unknown> = {}) {
   return mount(NodeConfigPanel as Component, {
     props: {
@@ -72,6 +85,13 @@ describe('NodeConfigPanel 节点配置面板', () => {
       const wrapper = mountPanel({ node: mockHttpNode })
       expect(wrapper.find('.http-node-form').exists()).toBe(true)
       expect(wrapper.find('.llm-node-form').exists()).toBe(false)
+    })
+
+    it('node.type="python" → 渲染 PythonNodeForm（S18/S22）', () => {
+      const wrapper = mountPanel({ node: mockPythonNode })
+      expect(wrapper.find('.python-node-form').exists()).toBe(true)
+      expect(wrapper.find('.llm-node-form').exists()).toBe(false)
+      expect(wrapper.find('.http-node-form').exists()).toBe(false)
     })
   })
 
@@ -114,6 +134,19 @@ describe('NodeConfigPanel 节点配置面板', () => {
       const emitted = wrapper.emitted('update:node')![0][0] as { config: Record<string, unknown> }
       expect(emitted.config.url).toBe('https://new-api.example.com')
       expect(emitted.config).not.toBe(mockHttpNode.data.config)
+    })
+    it('修改 code → emit update:node({ config }) 含新值，且不带 entry / sandboxed（§14）', async () => {
+      const wrapper = mountPanel({ node: mockPythonNode })
+      const form = wrapper.findComponent({ name: 'PythonNodeForm' })
+
+      await form.vm.$emit('update:config', { code: 'return {"n": len(state["items"])}' })
+
+      expect(wrapper.emitted('update:node')).toHaveLength(1)
+      const emitted = wrapper.emitted('update:node')![0][0] as { config: Record<string, unknown> }
+      expect(emitted.config.code).toBe('return {"n": len(state["items"])}')
+      expect(emitted.config).not.toBe(mockPythonNode.data.config)
+      expect(emitted.config).not.toHaveProperty('entry')
+      expect(emitted.config).not.toHaveProperty('sandboxed')
     })
   })
 

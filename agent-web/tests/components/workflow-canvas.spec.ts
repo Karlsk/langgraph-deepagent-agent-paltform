@@ -87,6 +87,7 @@ vi.mock('@vue-flow/minimap', () => ({
 import WorkflowCanvas from '@/views/workflow/canvas/WorkflowCanvas.vue'
 import WorkflowNode from '@/views/workflow/canvas/WorkflowNode.vue'
 import EndNode from '@/views/workflow/canvas/EndNode.vue'
+import type { WorkflowNodeType } from '@/api/workflow'
 
 const sampleNodes = [
   { id: '1', type: 'workflow', position: { x: 0, y: 0 }, data: { name: 'LLM 节点', type: 'llm', config: {} } },
@@ -178,7 +179,7 @@ describe('WorkflowCanvas 画布容器', () => {
 })
 
 describe('WorkflowNode 自定义节点', () => {
-  function mountNode(data: { name: string; type: 'llm' | 'http'; config: Record<string, unknown> }) {
+  function mountNode(data: { name: string; type: WorkflowNodeType; config: Record<string, unknown> }) {
     return mount(WorkflowNode as Component, {
       props: { data },
     })
@@ -192,6 +193,11 @@ describe('WorkflowNode 自定义节点', () => {
   it('type=http → 应用 workflow-node--http class', () => {
     const wrapper = mountNode({ name: 'HTTP', type: 'http', config: {} })
     expect(wrapper.find('.workflow-node--http').exists()).toBe(true)
+  })
+
+  it('type=python → 应用 workflow-node--python class（S18/S22）', () => {
+    const wrapper = mountNode({ name: 'PYTHON', type: 'python', config: { code: 'return {}' } })
+    expect(wrapper.find('.workflow-node--python').exists()).toBe(true)
   })
 
   it('渲染 data.name 文本', () => {

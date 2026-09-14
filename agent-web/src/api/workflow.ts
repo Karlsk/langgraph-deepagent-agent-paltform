@@ -26,9 +26,12 @@ export interface StateFieldDTO {
   reducer?: 'add' | 'last' | null
 }
 
+/** S18 节点类型白名单的前端镜像（安全边界在后端，此处仅用于编排体验与预校验）。 */
+export type WorkflowNodeType = 'llm' | 'http' | 'python'
+
 export interface NodeDTO {
   name: string
-  type: 'llm' | 'http'
+  type: WorkflowNodeType
   config: Record<string, unknown>
 }
 

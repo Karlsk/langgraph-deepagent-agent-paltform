@@ -1,5 +1,7 @@
+import type { WorkflowNodeType } from '@/api/workflow'
+
 export interface PaletteItem {
-  type: 'llm' | 'http'
+  type: WorkflowNodeType
   label: string
   icon: string
 }
@@ -7,6 +9,7 @@ export interface PaletteItem {
 export const PALETTE_ITEMS: PaletteItem[] = [
   { type: 'llm', label: 'LLM 节点', icon: '🤖' },
   { type: 'http', label: 'HTTP 节点', icon: '🌐' },
+  { type: 'python', label: 'Python 节点', icon: '🐍' },
 ]
 
 export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
@@ -30,9 +33,13 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
     max_retries: 0,
     retry_base_delay: 1.0,
   },
+  // 只有 code：entry 无法沙箱化、sandboxed 由后端强制，两者都不进提交体（S18 / §5.1）
+  python: {
+    code: '',
+  },
 }
 
-export function nextNodeName(type: 'llm' | 'http', existingNames: string[]): string {
+export function nextNodeName(type: WorkflowNodeType, existingNames: string[]): string {
   const prefix = type
   const existingNumbers = existingNames
     .filter(name => name.startsWith(`${prefix}_`))

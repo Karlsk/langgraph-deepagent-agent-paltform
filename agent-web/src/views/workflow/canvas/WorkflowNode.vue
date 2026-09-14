@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { Handle, Position } from '@vue-flow/core'
+import type { WorkflowNodeType } from '@/api/workflow'
 
 interface Props {
-  data: { name: string; type: 'llm' | 'http'; config: Record<string, unknown> }
+  data: { name: string; type: WorkflowNodeType; config: Record<string, unknown> }
 }
 
 const props = defineProps<Props>()
@@ -13,6 +14,7 @@ const props = defineProps<Props>()
     <div class="workflow-node__icon">
       <span v-if="props.data.type === 'llm'">🤖</span>
       <span v-else-if="props.data.type === 'http'">🌐</span>
+      <span v-else-if="props.data.type === 'python'">🐍</span>
     </div>
     <div class="workflow-node__name">{{ props.data.name }}</div>
     <Handle type="target" :position="Position.Top" />
@@ -38,6 +40,10 @@ const props = defineProps<Props>()
 
 .workflow-node--http {
   border-color: var(--color-node-http);
+}
+
+.workflow-node--python {
+  border-color: var(--color-node-python);
 }
 
 .workflow-node__icon {

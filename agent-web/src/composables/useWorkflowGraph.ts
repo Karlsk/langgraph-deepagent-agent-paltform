@@ -3,7 +3,7 @@
  * 三个纯函数，不依赖 Vue 响应式。
  */
 import type { Node, Edge } from '@vue-flow/core'
-import type { WorkflowDefinitionDTO, NodeDTO, EdgeDTO } from '@/api/workflow'
+import type { WorkflowDefinitionDTO, NodeDTO, EdgeDTO, WorkflowNodeType } from '@/api/workflow'
 import { isValidS7Condition } from '@/utils/s7Condition'
 
 export interface GraphValidationError {
@@ -13,7 +13,7 @@ export interface GraphValidationError {
   edgeId?: string
 }
 
-const VALID_NODE_TYPES = new Set(['llm', 'http'])
+const VALID_NODE_TYPES = new Set<WorkflowNodeType>(['llm', 'http', 'python'])
 const END_NODE_ID = 'END'
 const GRID_SPACING = 200
 
@@ -112,9 +112,28 @@ export function validateGraph(def: WorkflowDefinitionDTO): GraphValidationError[
     if (!VALID_NODE_TYPES.has(node.type)) {
       errors.push({
         field: 'nodes',
-        message: `Invalid node type "${node.type}". Must be one of: llm, http.`,
+        message: `Invalid node type "${node.type}". Must be one of: llm, http, python.`,
         nodeId: node.name,
       })
+    }
+
+    // python 预校验只是省去一次必然失败的 PUT；安全边界始终在后端（S18）
+    if (node.type === 'python') {
+      if ('entry' in node.config) {
+        errors.push({
+          field: 'nodes',
+          message: `Python node "${node.name}" must not use entry mode: it cannot be sandboxed.`,
+          nodeId: node.name,
+        })
+      }
+      const code = node.config.code
+      if (typeof code !== 'string' || code.trim() === '') {
+        errors.push({
+          field: 'nodes',
+          message: `Python node "${node.name}" requires non-empty code.`,
+          nodeId: node.name,
+        })
+      }
     }
   }
 

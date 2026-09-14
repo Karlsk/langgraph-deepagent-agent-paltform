@@ -1,6 +1,6 @@
 import { ref, computed, shallowRef, type Ref, type ComputedRef, type ShallowRef } from 'vue'
 import type { Node, Edge } from '@vue-flow/core'
-import type { WorkflowDefinitionDTO, StateFieldDTO } from '@/api/workflow'
+import type { WorkflowDefinitionDTO, StateFieldDTO, WorkflowNodeType } from '@/api/workflow'
 import { getWorkflow, saveWorkflow } from '@/api/workflow'
 import { definitionToGraph, graphToDefinition, validateGraph } from '@/composables/useWorkflowGraph'
 import { nextNodeName, DEFAULT_CONFIGS } from '@/views/workflow/canvas/nodeCatalog'
@@ -25,7 +25,7 @@ export interface WorkflowDesignerState {
   pendingEdge: Ref<{ source: string; target: string } | null>
   nodeNames: ComputedRef<string[]>
   stateChannels: ComputedRef<string[]>
-  handleAddNode: (payload: { type: 'llm' | 'http'; position: { x: number; y: number } }) => void
+  handleAddNode: (payload: { type: WorkflowNodeType; position: { x: number; y: number } }) => void
   handleConnect: (connection: { source: string; target: string }) => void
   handleConditionConfirm: (payload: { target: string; condition: string | null }) => void
   handleSelectNode: (id: string | null) => void
@@ -85,7 +85,7 @@ export function useWorkflowDesigner(): WorkflowDesignerState {
     return edges.value.some((e) => e.source === sourceId && e.data?.condition)
   }
 
-  function handleAddNode(payload: { type: 'llm' | 'http'; position: { x: number; y: number } }) {
+  function handleAddNode(payload: { type: WorkflowNodeType; position: { x: number; y: number } }) {
     const existingNames = nodeNames.value
     const name = nextNodeName(payload.type, existingNames)
     const id = name

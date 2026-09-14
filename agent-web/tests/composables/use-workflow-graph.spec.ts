@@ -253,16 +253,63 @@ describe('validateGraph', () => {
     expect(validateGraph(def)).toEqual([])
   })
 
-  it('reports error when node type is "python" (not in whitelist)', () => {
+  it('accepts a python node carrying non-empty code (S18/S22 whitelist)', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'py_ok',
+      entry_point: 'a',
+      nodes: [{ name: 'a', type: 'python', config: { code: 'return {"n": 1}' } }],
+      edges: [],
+      state_schema: {},
+    }
+    expect(validateGraph(def)).toEqual([])
+  })
+
+  it('reports error when a python node has no code', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'py_no_code',
+      entry_point: 'a',
+      nodes: [{ name: 'a', type: 'python', config: {} }],
+      edges: [],
+      state_schema: {},
+    }
+    const errors = validateGraph(def)
+    expect(errors.some((e) => e.field === 'nodes' && e.nodeId === 'a' && e.message.includes('code'))).toBe(true)
+  })
+
+  it('reports error when a python node code is blank', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'py_blank',
+      entry_point: 'a',
+      nodes: [{ name: 'a', type: 'python', config: { code: '   ' } }],
+      edges: [],
+      state_schema: {},
+    }
+    expect(validateGraph(def).some((e) => e.nodeId === 'a')).toBe(true)
+  })
+
+  it('reports error when a python node carries entry (cannot be sandboxed, S18 ①)', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'py_entry',
+      entry_point: 'a',
+      nodes: [{ name: 'a', type: 'python', config: { code: 'return {}', entry: 'app.utils:fn' } }],
+      edges: [],
+      state_schema: {},
+    }
+    const errors = validateGraph(def)
+    expect(errors.some((e) => e.field === 'nodes' && e.nodeId === 'a' && e.message.includes('entry'))).toBe(true)
+  })
+
+  it('reports error when node type is unknown (not in the llm/http/python whitelist)', () => {
     const def: WorkflowDefinitionDTO = {
       workflow_id: 'bad_type',
       entry_point: 'a',
-      nodes: [{ name: 'a', type: 'python' as any, config: {} }],
+      nodes: [{ name: 'a', type: 'shell' as any, config: {} }],
       edges: [],
       state_schema: {},
     }
     const errors = validateGraph(def)
     expect(errors.some((e) => e.field === 'nodes' && e.nodeId === 'a')).toBe(true)
+    expect(errors[0].message).toContain('python')
   })
 
   it('reports error for illegal condition: "a or b" (not S7 grammar)', () => {

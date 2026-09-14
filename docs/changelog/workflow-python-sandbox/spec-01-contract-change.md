@@ -190,6 +190,21 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
 - `tests/unit/workflow/nodes/test_python_node.py` 追加：`sandboxed=true` 路由到 `run_sandboxed`（monkeypatch 计数）；`sandboxed=false` 仍走进程内 `exec`（回归保护）；`entry` + `sandboxed=true` → `ValidationError`；日志摘要含 `sandboxed` 且不含代码正文。该文件原**缺 `pytestmark = pytest.mark.unit`**（`tests/unit/workflow/nodes/` 全目录同此历史漂移），本次补上使其真正进入 `-m unit` 门禁。
 - `tests/integration/workflow/test_python_sandbox_pipeline.py`（**新增**，5 卡）：真实落盘 YAML + 真实子进程，覆盖 `PUT → 持久化 → registry 执行` 这条两个单测套件都看不见的接缝——`test_python_node.py` stub 掉 `run_sandboxed`（不起子进程）、`test_sandbox.py` stub 掉 `subprocess.run`（不起 worker），故「服务端强制的 `sandboxed=true` 是否真的活到执行期」在单测里**结构上无法证伪**（与 #131 漏掉 `stdin`/`input` 冲突同类盲点）。判别手法：用 `hash("x")`——它通过全部 AST 规则，却不在 `SAFE_BUILTINS` 内，故进程内路径会返回值、沙箱路径必抛 `NameError`，比超时探针更快且确定。
 
+**前端守护测试修订（§2.7「设计器侧需改」落地时必改的既有断言）**
+
+- `tests/components/node-palette.spec.ts`：原「S15 守卫：palette 项白名单不含 python」与「渲染恰好 2 个可拖项」两卡
+  断言的正是 S18 修订前的行为，**反转**为「白名单恰为 `llm/http/python`」「渲染恰好 3 个可拖项」，并补 `DEFAULT_CONFIGS.python`
+  只含 `code`、点击 python 项 emit、`nextNodeName('python', …)` 三卡。
+- `tests/composables/use-workflow-graph.spec.ts`：原「reports error when node type is "python" (not in whitelist)」
+  **反转**为「accepts a python node carrying non-empty code」，未知类型卡改用 `shell`（该分支仍需覆盖），
+  并按前端 spec §12 第 3 条补 `python` 缺 `code` / `code` 为空白 / 含 `entry` 三卡。
+- `tests/components/python-node-form.spec.ts`（**新增**）：只暴露一个等宽 `code` textarea；html 中**不出现** `entry`
+  与 `sandboxed` 字样（即便 config 里被塞进这两键也不渲染控件、且提交体剔除）；沙箱限制说明含 import/文件/网络/dict/超时/内存/422；
+  无运行或校验按钮（§5.1 前端不做 eval / 预览执行）；readonly 与 props 同步。
+- `tests/components/node-config-panel.spec.ts` / `tests/components/workflow-canvas.spec.ts`：各补一卡（python → `PythonNodeForm`
+  且 patch 不带 `entry`/`sandboxed`；`workflow-node--python` token class）。
+- 类型收敛：`'llm' | 'http'` 在 6 处手写重复，本次统一为 `api/workflow.ts` 导出的单一 `WorkflowNodeType`，避免白名单在前端各处漂移。
+
 **门禁**：`uv run pytest -m unit`、`uv run pytest -m integration`、`make lint`、`make typecheck` 全绿；前端 `npm run type-check`、`npm test`、`npm run build` 全绿。
 
 **E2E**：docker-up 全栈 → 管理员登录 → 画布拖 python 节点，代码 `return {"upper": state["input"].upper()}` → PUT 200 → 简单模式执行 → 轨迹抽屉摘要含 `sandboxed: true` 且输出正确。反例：`import os` → PUT 422，`message` 含规则名不含代码体；非管理员 → 403。
