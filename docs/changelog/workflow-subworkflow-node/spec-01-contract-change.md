@@ -73,11 +73,14 @@ H3 则由 S24 正面解决：内层持独立 collector，完成后按 `"{caller}
 ```python
 # app/workflow/ports.py 新增（引擎内部端口，零 app.* 依赖）
 WorkflowRunner = Callable[[str, dict[str, Any], str], dict[str, Any]]
-"""(workflow_id, input_data, caller_label) -> 内层运行的输出摘要。
+"""(workflow_id, input_data, caller_label) -> 内层运行结果信封（冻结，恰三键）。
 
-第三参 caller_label 是发起调用的节点名，供被调方做日志前缀（S24）；
-引擎不感知其实现——生产为 WorkflowRegistry._run_nested 的 bound method，
-测试为 FakeRunner。
+    {"output": dict[str, Any], "run_id": str, "inner_log_count": int}
+
+第三参 caller_label 是发起调用的节点名，供被调方做日志前缀（S24）。
+`output` 是内层 RunResult.output；另两键供调用方构造 S24 摘要——它们只存在于内层
+RunResult 上，节点自己无从得知，故必须由 runner 一并回传（见下方「信封歧义澄清」）。
+引擎不感知其实现——生产为 WorkflowRegistry._run_nested 的 bound method，测试为 FakeRunner。
 """
 
 class SubWorkflowNodeConfig(BaseModel, extra="forbid"):
@@ -104,8 +107,21 @@ class SubWorkflowNode(BaseNode):
 `input_map` 覆盖，后者优先）→ `workflow_runner(workflow_id, inner_input, self.name)` →
 输出摘要（见 S24）→ `map_output_to_state` 出。
 
-`workflow_runner` 为 `None` → **`ConfigError`**（S20 分支②同款处置：**不静默降级**、不返回空 dict。
-静默降级会让「忘了注入 runner」表现为「子工作流什么都没做」，比直接失败难查得多）。
+`workflow_runner` 为 `None` → **`ConfigError`**，**在 `__init__` 抛出**（时机已冻结，见下方澄清）。
+处置口径同 S20 分支②：**不静默降级**、不返回空 dict——静默降级会让「忘了注入 runner」表现为
+「子工作流什么都没做」，比直接失败难查得多。
+
+**信封歧义澄清（编码前发现并回填契约）**：初稿把 `WorkflowRunner` 返回值写作「内层运行的输出摘要」，
+而 S24 冻结的节点摘要含 `run_id` 与 `inner_log_count`——若 runner 只回传裸 output dict，这两个字段
+节点**无从获得**（它们只存在于内层 `RunResult` 上）。两处口径互相矛盾，故按 §11 先行澄清而非在实现里
+自行取舍：返回值定为**三键结果信封**，节点只把 `output` 交给 `map_output_to_state`（meta 键不得污染
+外层 state），其余两键用于摘要。类型别名 `Callable[..., dict[str, Any]]` 不变，故**未触碰已冻结签名**，
+只是把语义写死。
+
+**ConfigError 时机澄清**：初稿只写「→ `ConfigError`」未定时机。定为 **`__init__` 抛出**，依据 S6
+「构建期校验优先」——构造期抛出使装配错误落在 `register_workflow` → `api.py` 的
+`except (ValueError, WorkflowEngineError)` → **422 build-time error**；若推迟到执行期，同样的装配错误
+只能表现为运行期 **500**，排查成本高一个量级。
 
 ### 2.5 §4.5 / §4.9 / §4.10 可选参链式透传（S20 同款形态）
 

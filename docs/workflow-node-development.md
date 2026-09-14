@@ -359,14 +359,21 @@ CONTRACT §8 R1 已就此追加 carve-out。它能否经 `PUT /api/v1/workflows/
 ```
 convert_state_to_dict 进
   → 组装内层输入（inherit_input 全量拷贝 → input_map 覆盖，后者优先）
-  → workflow_runner(workflow_id, inner_input, self.name)
-  → 输出摘要（§6.4）
-  → map_output_to_state 出
+  → workflow_runner(workflow_id, inner_input, self.name) 得到三键结果信封
+  → 只取 envelope["output"] 交 map_output_to_state 出（meta 键不入外层 state）
+  → 节点自身 ExecutionLog 记摘要（§6.4）
 ```
 
-`workflow_runner` 为 `None` → **`ConfigError`**（CONTRACT §5）。这与 S20 的
-「`provider_ref` 非空但工厂为 `None`」是同一处置口径：**不静默降级、不返回空 dict**。
-静默降级会让「忘了注入 runner」表现为「子工作流什么都没做」，比直接失败难查得多。
+**结果信封（CONTRACT §4.15 冻结，恰三键）**：`{"output": dict, "run_id": str, "inner_log_count": int}`。
+`output` 是内层 `RunResult.output`；`run_id` 与 `inner_log_count` 只存在于内层 `RunResult` 上，
+节点无从自知，故必须由 runner 一并回传，供 §6.4 的摘要使用。
+
+`workflow_runner` 为 `None` → **`ConfigError`（CONTRACT §5），在 `__init__` 抛出**。时机依据 S6
+「构建期校验优先」：构造期抛出使装配错误落在 `register_workflow` → `api.py` 的
+`except (ValueError, WorkflowEngineError)` → **422 build-time error**；推迟到执行期则同样的错误
+只能表现为运行期 **500**。处置口径与 S20 的「`provider_ref` 非空但工厂为 `None`」一致：
+**不静默降级、不返回空 dict**——静默降级会让「忘了注入 runner」表现为「子工作流什么都没做」，
+比直接失败难查得多。
 
 生产装配路径（**组合根零改动**）：`WorkflowRegistry.__init__` 以 bound method `self._run_nested`
 作为 runner 构造 `GraphBuilder` → `_add_nodes` 透传给 `create_node` → 插件分支按签名探测传给本节点。
@@ -421,6 +428,9 @@ log.model_copy(update={"node_name": f"{caller_label}/{log.node_name}"})
 ```python
 {"output_keys": [...], "run_id": ..., "duration_ms": ..., "inner_log_count": ...}
 ```
+
+字段来源：`output_keys` 取自信封 `output` 的键，`run_id`/`inner_log_count` 取自 runner 回传的信封，
+`duration_ms` 由节点自行计时。
 
 **不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍，且前后端都要去重）。
 内层业务数据经 R3 出口 `map_output_to_state` 正常写入外层 state，**不丢失**。

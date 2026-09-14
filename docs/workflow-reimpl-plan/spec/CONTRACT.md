@@ -490,7 +490,8 @@ class WorkflowRegistry:
     # execute_workflow 自身签名不变（冻结面），变化只在其内部（运行栈 set/reset）与本方法。
     def _run_nested(self, workflow_id: str, input_data: dict[str, Any], caller_label: str) -> dict[str, Any]:
         """栈检查（S23）→ 递归 self.execute_workflow（自动获得 per-id RLock、独立 collector、S21 输入合成）
-        → 内层日志按 "{caller_label}/" 前缀并入外层 collector（S24）→ 返回内层输出摘要。
+        → 内层日志按 "{caller_label}/" 前缀并入外层 collector（S24）→ 返回 §4.15 冻结的三键结果信封
+        {"output": RunResult.output, "run_id": ..., "inner_log_count": ...}。
         环或深度超限 → NestedWorkflowError（消息含完整栈）；被引用 id 未注册 → WorkflowNotFoundError。
         检查在递归**之前**（调用前拒绝），绝不依赖 RecursionError 兜底——它不属 WorkflowEngineError 家族，
         会穿透 CLI 的异常分类。"""
@@ -670,9 +671,16 @@ def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = Sand
 ```python
 # app/workflow/ports.py 新增（引擎内部端口，零 app.* 依赖）
 WorkflowRunner = Callable[[str, dict[str, Any], str], dict[str, Any]]
-"""(workflow_id, input_data, caller_label) -> 内层运行的输出摘要。
+"""(workflow_id, input_data, caller_label) -> 内层运行结果信封。
 
 第三参 caller_label 是发起调用的节点名，供被调方做日志前缀（S24）。
+
+**返回信封（冻结，恰三键）**：
+    {"output": dict[str, Any], "run_id": str, "inner_log_count": int}
+`output` 是内层 `RunResult.output`（内层业务数据）；另两键供调用方构造 S24 摘要——
+它们只存在于内层 `RunResult` 上，节点自己无从得知，故必须由 runner 一并回传。
+节点**只把 `output` 交给 `map_output_to_state`**，信封的 meta 键不得写入外层 state。
+
 引擎不感知其实现：生产为 WorkflowRegistry._run_nested 的 bound method，测试为 FakeRunner。
 与 ChatModelFactory 的差异见 §3 红线 4——本 callable 由**引擎自身**提供，组合根零改动。
 """
@@ -700,13 +708,18 @@ class SubWorkflowNode(BaseNode):
 ```
 
 **执行语义（R3 管线不变）**：`convert_state_to_dict` 进 → 组装内层输入（`inherit_input` 为真则先全量拷贝外层
-state，再叠加 `input_map` 解析结果，**后者优先**）→ `workflow_runner(workflow_id, inner_input, self.name)` →
-输出摘要（S24）→ `map_output_to_state` 出。
+state，再叠加 `input_map` 解析结果，**后者优先**）→ `workflow_runner(workflow_id, inner_input, self.name)`
+得到结果信封 → **只取 `envelope["output"]`** 交 `map_output_to_state` 出（信封 meta 键不入外层 state）；
+节点自身 `ExecutionLog.output_data` 记 S24 摘要（`output_keys` 取自 `output`，`run_id`/`inner_log_count`
+取自信封，`duration_ms` 由节点自行计时）。
 
 **约束**：
 
-- `workflow_runner` 为 `None` → **`ConfigError`**（S20 分支②同款处置：**不静默降级**、不返回空 dict）。
-  静默降级会让「忘了注入 runner」表现为「子工作流什么都没做」，比直接失败难查得多。
+- `workflow_runner` 为 `None` → **`ConfigError`**，**在 `__init__` 抛出**（时机冻结）。理由：S6「构建期校验优先」——
+  构造期抛出使它落在 `register_workflow` → `api.py` 的 `except (ValueError, WorkflowEngineError)` → **422
+  build-time error**；若推迟到执行期则同样装配错误只能表现为运行期 **500**，排查成本高一个量级。
+  处置口径与 S20 分支②一致：**不静默降级、不返回空 dict**——静默降级会让「忘了注入 runner」表现为
+  「子工作流什么都没做」，比直接失败难查得多。
 - `input_map` 的外层路径**不存在时跳过该键**（不写入内层输入，让内层按 S14 走声明默认值），
   而非抛 `KeyError`——与 `{input}` 占位符渲染的既有容错口径一致。须有测试固定，否则易被写成报错。
 - **不得 import `registry` / `graph_builder`**（§3 红线 2）；只 import `ports` 的类型别名。
@@ -834,7 +847,7 @@ SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支�
 | 内层收集 | 内层 `execute_workflow` 自带独立 `RunLogCollector` 并绑定 `_RUN_COLLECTOR`（S11 既有行为，**零改动**）。同线程 ContextVar 嵌套 set/reset ⇒ 内层 collector 在外层看来是**临时遮蔽**，内层 `finally` reset 后外层 collector 自动恢复 |
 | 前缀合并 | 内层返回后，`_run_nested` 取 `result.execution_logs`，逐条 `model_copy(update={"node_name": f"{caller_label}/{原 node_name}"})` 后 `add` 进**外层** collector（经 `nodes/base.py` 既有的 `get_run_collector()` 取得，无需新增访问器）。外层轨迹因此形如 `sub_1/classify`、`sub_1/fetch` |
 | 多层复合 | 前缀**自然复合**，无需特判层数：C 的日志并入 B 时成 `sub_c/xxx`，B 的日志（已含该条）并入 A 时成 `sub_b/sub_c/xxx` |
-| 子节点自身 output | `SubWorkflowNode` 的 `ExecutionLog.output_data` **只记摘要** `{output_keys: [...], run_id, duration_ms, inner_log_count}`，**不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍且前后端都要去重）。内层业务数据经 R3 出口 `map_output_to_state` 正常写入外层 state，不丢失 |
+| 子节点自身 output | `SubWorkflowNode` 的 `ExecutionLog.output_data` **只记摘要** `{output_keys: [...], run_id, duration_ms, inner_log_count}`，**不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍且前后端都要去重）。字段来源：`output_keys` 取自信封 `output` 的键、`run_id`/`inner_log_count` 取自 runner 回传的信封（§4.15，二者只存在于内层 `RunResult` 上，节点无从自知）、`duration_ms` 由节点自行计时。内层业务数据（信封 `output`）经 R3 出口 `map_output_to_state` 正常写入外层 state，**不丢失**；信封的 meta 键**不得**写入外层 state |
 | 前端影响 | `WorkflowTraceDrawer` **零改动**：前缀名是普通字符串，直接展示即可读出层级 |
 | H6 | 合并的是既有 `ExecutionLog`（脱敏在 `api.py` 投影时由 `redact` 统一做），前缀化不引入新泄漏面；`caller_label` 是节点名（YAML 自有），非用户数据 |
 
