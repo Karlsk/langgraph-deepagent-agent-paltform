@@ -680,10 +680,6 @@ def test_save_workflow_unknown_node_type_rejected(save_client: TestClient) -> No
 
 def test_save_workflow_python_code_node_accepted(save_client: TestClient) -> None:
     """S18: code-only python is allowed, and the server forces sandboxed=true."""
-    from unittest.mock import patch
-
-    from app.core.config import settings
-
     payload = _python_payload({"code": 'return {"upper": state["input"].upper()}'})
     with (
         patch("app.workflow.api.save_definition_yaml") as mock_save,
@@ -702,10 +698,6 @@ def test_save_workflow_python_code_node_accepted(save_client: TestClient) -> Non
 
 def test_save_workflow_python_entry_node_rejected(save_client: TestClient) -> None:
     """S18 condition 1: entry mode can load arbitrary repo modules, so it cannot be sandboxed."""
-    from unittest.mock import patch
-
-    from app.core.config import settings
-
     payload = _python_payload({"entry": "app.utils:helper"}, workflow_id="entry_test")
     with (
         patch("app.workflow.api.save_definition_yaml") as mock_save,
@@ -718,12 +710,27 @@ def test_save_workflow_python_entry_node_rejected(save_client: TestClient) -> No
     mock_save.assert_not_called()
 
 
+@pytest.mark.parametrize("config", [{}, {"code": ""}, {"code": "   \n"}])
+def test_save_workflow_python_unusable_code_rejected(save_client: TestClient, config: dict[str, Any]) -> None:
+    """S18: no usable code is rejected before the AST check, so a blank node can never be registered.
+
+    Reachable in practice: the designer's default python config is an empty code
+    string, and the frontend pre-check is not the security boundary.
+    """
+    payload = _python_payload(config, workflow_id="blank_code")
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        response = save_client.put("/workflows/blank_code", json=payload)
+    assert response.status_code == 422
+    assert "code" in response.json()["message"]
+    assert not save_client.app.state.workflow_registry.has_workflow("blank_code")
+    mock_save.assert_not_called()
+
+
 def test_save_workflow_python_illegal_code_rejected(save_client: TestClient) -> None:
     """S18 condition 2: AST pre-check rejects, naming the rule but never the code (H6)."""
-    from unittest.mock import patch
-
-    from app.core.config import settings
-
     payload = _python_payload({"code": 'secret_marker = "hunter2"\nimport os\nreturn {}'}, workflow_id="ast_test")
     with (
         patch("app.workflow.api.save_definition_yaml") as mock_save,
@@ -741,10 +748,6 @@ def test_save_workflow_python_illegal_code_rejected(save_client: TestClient) -> 
 
 def test_save_workflow_python_sandboxed_flag_is_forced(save_client: TestClient) -> None:
     """S18 condition 3: sandboxed is a security property, so the client value is overwritten."""
-    from unittest.mock import patch
-
-    from app.core.config import settings
-
     payload = _python_payload({"code": "return {}", "sandboxed": False}, workflow_id="forced_test")
     with (
         patch("app.workflow.api.save_definition_yaml") as mock_save,

@@ -209,6 +209,26 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
 
 **E2E**：docker-up 全栈 → 管理员登录 → 画布拖 python 节点，代码 `return {"upper": state["input"].upper()}` → PUT 200 → 简单模式执行 → 轨迹抽屉摘要含 `sandboxed: true` 且输出正确。反例：`import os` → PUT 422，`message` 含规则名不含代码体；非管理员 → 403。
 
+**E2E 实测记录（2026-09-14，`make docker-up MODE=full`，linux/arm64 容器，appuser 非 root）**
+
+已在容器内**直接验证**（`docker exec` 拉起引擎，不经 HTTP）：
+
+| 项 | 结果 |
+| --- | --- |
+| `run_sandboxed` 真实子进程执行 | ✅ `{'upper': 'HELLO SANDBOX', 'n': 13}`，`exit_code=0`，`duration_ms=21.67` |
+| rlimit 四项 | ✅ `applied=['RLIMIT_AS','RLIMIT_CPU','RLIMIT_FSIZE','RLIMIT_NPROC']`、`refused=[]`，**无 `sandbox_rlimit_partial` 告警**——印证残留风险 1 的「Linux 生产四项均可施加」 |
+| 内存上限（macOS 缺的那道） | ✅ `[0]*10**10` → `MemoryError`，0.02s |
+| 超时 kill | ✅ 2.00s 终止（文案见残留风险 8） |
+| AST 三条规则 | ✅ `[no-import]` / `[dunder-identifier]` / `[forbidden-call]`，均含行号、不含代码正文 |
+| registry → 图 → 节点全链路 | ✅ `execute_workflow` 输出正确，`ExecutionLog.input_data == {'mode':'code','code_chars':40,'sandboxed':True}` |
+| 镜像内容 | ✅ `sandbox.py` / `sandbox_worker.py` 已入镜像；前端 bundle 含「Python 节点」 |
+
+**未执行**：上表的 HTTP/浏览器路径（管理员登录 → 画布拖拽 → PUT → 执行 → 轨迹抽屉）**本次未跑通**——
+带凭证的 `curl` 与浏览器自动化均被当前权限模式的分类器拦截，未反复重试。故 S18 的 PUT 层断言
+（服务端强制 `sandboxed=true`、`entry` → 422、AST → 422、非管理员 → 403）目前**仅由本地测试覆盖**：
+`tests/unit/workflow/test_api.py`（7 卡）与 `tests/integration/workflow/test_python_sandbox_pipeline.py`（5 卡，真实落盘 + 真实子进程）。
+容器内唯一未被覆盖的差异面是「HTTP 层 + 前端画布」，而非沙箱本身。**建议合并前由人工补跑一次浏览器 E2E。**
+
 ## 5. 残留风险与 open questions
 
 1. **~~`RLIMIT_AS` 在 macOS 常被忽略~~ → 实测推翻，已按 §7.5 修订契约**（2026-09-14，darwin 25.3.0 / arm64 / CPython 3.13）：`resource.setrlimit(RLIMIT_AS, (64MB, 64MB))` **抛 `ValueError: current limit exceeds maximum limit`**（当前软硬限均为 `INT64_MAX`），不是「被忽略」。原设计把施加放进父进程 `preexec_fn`，而 `preexec_fn` 内抛异常会让 `subprocess.run` 整体失败（`SubprocessError: Exception occurred in preexec_fn`）——后果是 macOS 上**每一次**沙箱调用都失败，而不只是内存上限失效。`RLIMIT_CPU` / `RLIMIT_FSIZE` 可施加；`RLIMIT_NPROC` 当前 `(2666, 4000)`，降至 `(0,0)` 可施加。
@@ -226,5 +246,13 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
    而规则 3 **只有 AST 预检一道**；一旦被绕过，`().__class__.__bases__[0].__subclasses__()` 这类经典逃逸链在语言层面是可达的。
    **实际暴露面**：`validate_code_ast` 在注册期（S18）与每次 `run_sandboxed` 生成子进程前**各跑一次**，
    要绕过必须能直接以 `sys.executable -I sandbox_worker.py` 拉起子进程——而此时攻击者已能在宿主上执行任意命令，沙箱已非边界。
-   **补第二道防线的代价**（本期不做）：AST 层改写属性访问（插入运行时守卫）会破坏「代码逐字执行」的可预期性；
-   或改用 `__class_getitem__`/audit hook（`sys.addaudithook` 可拦 `object.__getattribute__`，但开销与误伤面均需评估）。
+8. **`RLIMIT_CPU` 与父进程 wall-clock 超时存在竞速，报错文案取决于谁先到**（2026-09-14 容器内实测发现）：
+   S22 同时规定了 `RLIMIT_CPU = ceil(timeout_s)` 与 `subprocess.run(timeout=timeout_s)`。对 CPU 密集的死循环，
+   两者会在几乎同一时刻触发：`RLIMIT_CPU` 计子进程 CPU 时间、到点由内核 SIGKILL；父进程 timeout 计 wall time、
+   到点由 stdlib kill。实测（linux 容器，`timeout_s=2.0`）子进程先被内核杀死，父进程读到 `returncode=-9`，
+   于是走 `_no_document_error` 分支，最终文案为 **`sandbox worker failed with exit code -9`**；
+   而 macOS 上的 integration 卡（`timeout_s=1.0`）是父进程先到，文案为 `sandboxed code timed out after 1.0s`。
+   **两种结果都安全**（代码确被终止，无无限等待），差异只在可观测性：`exit code -9` 不告诉运维「这是 CPU 上限」。
+   本期**不改**——改动会牵动已被测试冻结的错误文案，且属体验而非安全问题。**后续可选**：在 `_no_document_error`
+   中把负 returncode 映射为「killed by signal N（疑似资源上限）」，或让 `RLIMIT_CPU` 取 `ceil(timeout_s) + 1`
+   使父进程 timeout 稳定先到，从而始终给出「timed out」文案。
