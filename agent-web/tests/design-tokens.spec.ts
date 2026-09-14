@@ -46,6 +46,7 @@ describe('design tokens', () => {
     expect(stylesheet).toContain('--color-node-llm: var(--color-primary-500);')
     expect(stylesheet).toContain('--color-node-http: var(--color-accent-500);')
     expect(stylesheet).toContain('--color-node-python: var(--color-danger-600);')
+    expect(stylesheet).toContain('--color-node-subworkflow: var(--color-success-600);')
     expect(stylesheet).toContain('--color-edge-default: var(--color-border-default);')
     expect(stylesheet).toContain('--color-edge-conditional: var(--color-warning-600);')
     expect(stylesheet).toContain('--color-canvas-bg: var(--color-bg-canvas);')

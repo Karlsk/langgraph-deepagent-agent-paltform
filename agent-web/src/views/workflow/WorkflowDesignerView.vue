@@ -169,6 +169,7 @@ onMounted(async () => {
         v-if="selectedNode"
         :node="selectedNode"
         :readonly="!canEdit"
+        :workflow-id="meta.workflow_id"
         @update:node="handleUpdateNode"
         @remove-node="handleRemoveNode"
       />

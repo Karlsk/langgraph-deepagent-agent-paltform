@@ -93,6 +93,10 @@ function onClick(type: WorkflowNodeType) {
   border-color: var(--color-node-python);
 }
 
+.node-palette__item--subworkflow:hover:not([aria-disabled="true"]) {
+  border-color: var(--color-node-subworkflow);
+}
+
 .node-palette__item[aria-disabled="true"] {
   cursor: not-allowed;
 }

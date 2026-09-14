@@ -5,15 +5,19 @@ import type { WorkflowNodeType } from '@/api/workflow'
 import LlmNodeForm from './LlmNodeForm.vue'
 import HttpNodeForm from './HttpNodeForm.vue'
 import PythonNodeForm from './PythonNodeForm.vue'
+import SubWorkflowNodeForm from './SubWorkflowNodeForm.vue'
 
 interface Props {
   node: Node | null
   readonly?: boolean
+  /** 当前编辑的工作流 id：转给 SubWorkflowNodeForm 以排除自引用。 */
+  workflowId?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
   node: null,
   readonly: false,
+  workflowId: '',
 })
 
 const emit = defineEmits<{
@@ -91,6 +95,13 @@ function getNodeConfig(): Record<string, unknown> {
           v-else-if="getNodeType() === 'python'"
           :config="getNodeConfig()"
           :readonly="props.readonly"
+          @update:config="onConfigUpdate"
+        />
+        <SubWorkflowNodeForm
+          v-else-if="getNodeType() === 'subworkflow'"
+          :config="getNodeConfig()"
+          :readonly="props.readonly"
+          :exclude-workflow-id="props.workflowId"
           @update:config="onConfigUpdate"
         />
       </div>

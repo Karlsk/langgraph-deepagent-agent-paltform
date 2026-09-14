@@ -25,21 +25,29 @@ function mountPalette(extraProps: Record<string, unknown> = {}) {
 }
 
 describe('NodePalette 节点面板', () => {
-  it('渲染恰好 3 个可拖项（llm / http / python）', () => {
+  it('渲染恰好 4 个可拖项（llm / http / python / subworkflow）', () => {
     const wrapper = mountPalette()
     const items = wrapper.findAll('.node-palette__item')
-    expect(items).toHaveLength(3)
+    expect(items).toHaveLength(4)
   })
 
-  it('S18 白名单：palette 项为 llm / http / python（python 走沙箱路径，S22）', () => {
+  it('S18 白名单：palette 项为 llm / http / python / subworkflow', () => {
     const types = PALETTE_ITEMS.map(item => item.type)
-    expect(types).toEqual(['llm', 'http', 'python'])
+    expect(types).toEqual(['llm', 'http', 'python', 'subworkflow'])
   })
 
   it('DEFAULT_CONFIGS.python 只含 code，不含 entry / sandboxed（§5.1）', () => {
     expect(Object.keys(DEFAULT_CONFIGS.python!)).toEqual(['code'])
     expect(DEFAULT_CONFIGS.python).not.toHaveProperty('entry')
     expect(DEFAULT_CONFIGS.python).not.toHaveProperty('sandboxed')
+  })
+
+  it('DEFAULT_CONFIGS.subworkflow 为 workflow_id / input_map / inherit_input（§5.1）', () => {
+    expect(DEFAULT_CONFIGS.subworkflow).toEqual({
+      workflow_id: '',
+      input_map: {},
+      inherit_input: false,
+    })
   })
 
   it('拖拽项 dragstart → dataTransfer.setData 写入 type', async () => {
@@ -107,6 +115,17 @@ describe('NodePalette 节点面板', () => {
     ])
   })
 
+  it('点击 subworkflow 项 → emit add-node({ type: "subworkflow" })', async () => {
+    const wrapper = mountPalette()
+    const subItem = wrapper.findAll('.node-palette__item')[3]
+
+    await subItem.trigger('click')
+
+    expect(wrapper.emitted('add-node')![0]).toEqual([
+      { type: 'subworkflow', position: { x: 0, y: 0 } },
+    ])
+  })
+
   it('readonly=true → 点击不触发 emit', async () => {
     const wrapper = mountPalette({ readonly: true })
     const llmItem = wrapper.findAll('.node-palette__item')[0]
@@ -122,6 +141,7 @@ describe('nextNodeName 纯函数', () => {
     expect(nextNodeName('llm', [])).toBe('llm_1')
     expect(nextNodeName('http', [])).toBe('http_1')
     expect(nextNodeName('python', [])).toBe('python_1')
+    expect(nextNodeName('subworkflow', [])).toBe('subworkflow_1')
   })
 
   it('已有 type_1 → 返回 type_2', () => {

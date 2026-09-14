@@ -10,6 +10,7 @@ export const PALETTE_ITEMS: PaletteItem[] = [
   { type: 'llm', label: 'LLM 节点', icon: '🤖' },
   { type: 'http', label: 'HTTP 节点', icon: '🌐' },
   { type: 'python', label: 'Python 节点', icon: '🐍' },
+  { type: 'subworkflow', label: '子工作流节点', icon: '🧩' },
 ]
 
 export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
@@ -36,6 +37,12 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
   // 只有 code：entry 无法沙箱化、sandboxed 由后端强制，两者都不进提交体（S18 / §5.1）
   python: {
     code: '',
+  },
+  // 被引用工作流的存在性是运行期检查（S18），故 workflow_id 允许先留空、后保存
+  subworkflow: {
+    workflow_id: '',
+    input_map: {},
+    inherit_input: false,
   },
 }
 

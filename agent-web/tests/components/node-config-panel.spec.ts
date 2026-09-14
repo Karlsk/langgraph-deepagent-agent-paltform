@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 /**
  * NodeConfigPanel 组件测试（spec-12，S18/S22 修订）：
- * - 验证 type 驱动表单切换（llm → LlmNodeForm，http → HttpNodeForm，python → PythonNodeForm，null → 空态）；
+ * - 验证 type 驱动表单切换（llm → LlmNodeForm，http → HttpNodeForm，python → PythonNodeForm，
+ *   subworkflow → SubWorkflowNodeForm，null → 空态）；
  * - 验证 H6 守卫（LLM 表单不含 api_key 输入）；
  * - 验证 immutable patch（emit update:node 含新 config 对象，不修改原 props）；
  *   python 节点的 patch 额外不得携 entry / sandboxed 两键（§5.1 / §14）；
@@ -9,11 +10,18 @@
  * - 验证节点重命名（emit update:node({ name })）；
  * - 验证删除节点（emit remove-node(id)）。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import type { Component } from 'vue'
 
 import NodeConfigPanel from '@/views/workflow/panel/NodeConfigPanel.vue'
+
+// R7：SubWorkflowNodeForm 挂载即拉取工作流目录。本 spec 只验表单切换与 emit 转发，
+// 空目录足够；挡掉真实请求，避免测试期发起 HTTP。
+vi.mock('@/api/workflow', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/workflow')>()
+  return { ...actual, listWorkflows: () => Promise.resolve([]) }
+})
 
 const mockLlmNode = {
   id: 'node-1',
@@ -59,6 +67,20 @@ const mockPythonNode = {
   },
 }
 
+const mockSubworkflowNode = {
+  id: 'node-4',
+  type: 'workflow',
+  data: {
+    name: 'subworkflow_1',
+    type: 'subworkflow',
+    config: {
+      workflow_id: 'wf_inner',
+      input_map: { query: 'input' },
+      inherit_input: false,
+    },
+  },
+}
+
 function mountPanel(extraProps: Record<string, unknown> = {}) {
   return mount(NodeConfigPanel as Component, {
     props: {
@@ -92,6 +114,19 @@ describe('NodeConfigPanel 节点配置面板', () => {
       expect(wrapper.find('.python-node-form').exists()).toBe(true)
       expect(wrapper.find('.llm-node-form').exists()).toBe(false)
       expect(wrapper.find('.http-node-form').exists()).toBe(false)
+    })
+
+    it('node.type="subworkflow" → 渲染 SubWorkflowNodeForm（S23/S24）', () => {
+      const wrapper = mountPanel({ node: mockSubworkflowNode })
+      expect(wrapper.find('.subworkflow-node-form').exists()).toBe(true)
+      expect(wrapper.find('.python-node-form').exists()).toBe(false)
+      expect(wrapper.find('.llm-node-form').exists()).toBe(false)
+    })
+
+    it('把当前编辑的 workflow_id 传给子表单，供其排除自引用（§5.1）', () => {
+      const wrapper = mountPanel({ node: mockSubworkflowNode, workflowId: 'wf_outer' })
+      const form = wrapper.findComponent({ name: 'SubWorkflowNodeForm' })
+      expect(form.props('excludeWorkflowId')).toBe('wf_outer')
     })
   })
 
@@ -147,6 +182,22 @@ describe('NodeConfigPanel 节点配置面板', () => {
       expect(emitted.config).not.toBe(mockPythonNode.data.config)
       expect(emitted.config).not.toHaveProperty('entry')
       expect(emitted.config).not.toHaveProperty('sandboxed')
+    })
+
+    it('修改 workflow_id → emit update:node({ config }) 含新值', async () => {
+      const wrapper = mountPanel({ node: mockSubworkflowNode })
+      const form = wrapper.findComponent({ name: 'SubWorkflowNodeForm' })
+
+      await form.vm.$emit('update:config', {
+        workflow_id: 'wf_other',
+        input_map: {},
+        inherit_input: true,
+      })
+
+      expect(wrapper.emitted('update:node')).toHaveLength(1)
+      const emitted = wrapper.emitted('update:node')![0][0] as { config: Record<string, unknown> }
+      expect(emitted.config.workflow_id).toBe('wf_other')
+      expect(emitted.config).not.toBe(mockSubworkflowNode.data.config)
     })
   })
 

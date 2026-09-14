@@ -287,6 +287,52 @@ describe('validateGraph', () => {
     expect(validateGraph(def).some((e) => e.nodeId === 'a')).toBe(true)
   })
 
+  it('accepts a subworkflow node carrying a non-empty workflow_id (S18/S23)', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'wf_outer',
+      entry_point: 'sub_1',
+      nodes: [{ name: 'sub_1', type: 'subworkflow', config: { workflow_id: 'wf_inner' } }],
+      edges: [],
+      state_schema: {},
+    }
+    expect(validateGraph(def)).toEqual([])
+  })
+
+  it('reports error when a subworkflow node has no workflow_id', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'wf_outer',
+      entry_point: 'sub_1',
+      nodes: [{ name: 'sub_1', type: 'subworkflow', config: {} }],
+      edges: [],
+      state_schema: {},
+    }
+    const errors = validateGraph(def)
+    expect(errors.some((e) => e.field === 'nodes' && e.nodeId === 'sub_1' && e.message.includes('workflow_id'))).toBe(true)
+  })
+
+  it('reports error when a subworkflow node workflow_id is blank', () => {
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'wf_outer',
+      entry_point: 'sub_1',
+      nodes: [{ name: 'sub_1', type: 'subworkflow', config: { workflow_id: '   ' } }],
+      edges: [],
+      state_schema: {},
+    }
+    expect(validateGraph(def).some((e) => e.nodeId === 'sub_1')).toBe(true)
+  })
+
+  it('does NOT check that the referenced workflow exists (S18: existence is a runtime check)', () => {
+    // validateGraph is a pure function over one definition; it has no registry to ask.
+    const def: WorkflowDefinitionDTO = {
+      workflow_id: 'wf_outer',
+      entry_point: 'sub_1',
+      nodes: [{ name: 'sub_1', type: 'subworkflow', config: { workflow_id: 'wf_never_saved_yet' } }],
+      edges: [],
+      state_schema: {},
+    }
+    expect(validateGraph(def)).toEqual([])
+  })
+
   it('reports error when a python node carries entry (cannot be sandboxed, S18 ①)', () => {
     const def: WorkflowDefinitionDTO = {
       workflow_id: 'py_entry',
@@ -299,7 +345,7 @@ describe('validateGraph', () => {
     expect(errors.some((e) => e.field === 'nodes' && e.nodeId === 'a' && e.message.includes('entry'))).toBe(true)
   })
 
-  it('reports error when node type is unknown (not in the llm/http/python whitelist)', () => {
+  it('reports error when node type is unknown (not in the llm/http/python/subworkflow whitelist)', () => {
     const def: WorkflowDefinitionDTO = {
       workflow_id: 'bad_type',
       entry_point: 'a',
@@ -309,7 +355,7 @@ describe('validateGraph', () => {
     }
     const errors = validateGraph(def)
     expect(errors.some((e) => e.field === 'nodes' && e.nodeId === 'a')).toBe(true)
-    expect(errors[0].message).toContain('python')
+    expect(errors[0].message).toContain('subworkflow')
   })
 
   it('reports error for illegal condition: "a or b" (not S7 grammar)', () => {

@@ -13,7 +13,7 @@ export interface GraphValidationError {
   edgeId?: string
 }
 
-const VALID_NODE_TYPES = new Set<WorkflowNodeType>(['llm', 'http', 'python'])
+const VALID_NODE_TYPES = new Set<WorkflowNodeType>(['llm', 'http', 'python', 'subworkflow'])
 const END_NODE_ID = 'END'
 const GRID_SPACING = 200
 
@@ -112,7 +112,7 @@ export function validateGraph(def: WorkflowDefinitionDTO): GraphValidationError[
     if (!VALID_NODE_TYPES.has(node.type)) {
       errors.push({
         field: 'nodes',
-        message: `Invalid node type "${node.type}". Must be one of: llm, http, python.`,
+        message: `Invalid node type "${node.type}". Must be one of: llm, http, python, subworkflow.`,
         nodeId: node.name,
       })
     }
@@ -131,6 +131,18 @@ export function validateGraph(def: WorkflowDefinitionDTO): GraphValidationError[
         errors.push({
           field: 'nodes',
           message: `Python node "${node.name}" requires non-empty code.`,
+          nodeId: node.name,
+        })
+      }
+    }
+
+    // 只校验结构：被引用工作流是否存在是运行期检查（S18），前端无注册表可问
+    if (node.type === 'subworkflow') {
+      const ref = node.config.workflow_id
+      if (typeof ref !== 'string' || ref.trim() === '') {
+        errors.push({
+          field: 'nodes',
+          message: `Subworkflow node "${node.name}" requires a non-empty workflow_id.`,
           nodeId: node.name,
         })
       }

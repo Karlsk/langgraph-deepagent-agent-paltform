@@ -200,6 +200,11 @@ describe('WorkflowNode 自定义节点', () => {
     expect(wrapper.find('.workflow-node--python').exists()).toBe(true)
   })
 
+  it('type=subworkflow → 应用 workflow-node--subworkflow class（S23/S24）', () => {
+    const wrapper = mountNode({ name: 'SUB', type: 'subworkflow', config: { workflow_id: 'wf_inner' } })
+    expect(wrapper.find('.workflow-node--subworkflow').exists()).toBe(true)
+  })
+
   it('渲染 data.name 文本', () => {
     const wrapper = mountNode({ name: '我的节点', type: 'llm', config: {} })
     expect(wrapper.text()).toContain('我的节点')

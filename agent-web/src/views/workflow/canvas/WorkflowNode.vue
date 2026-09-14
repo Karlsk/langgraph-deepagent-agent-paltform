@@ -15,6 +15,7 @@ const props = defineProps<Props>()
       <span v-if="props.data.type === 'llm'">🤖</span>
       <span v-else-if="props.data.type === 'http'">🌐</span>
       <span v-else-if="props.data.type === 'python'">🐍</span>
+      <span v-else-if="props.data.type === 'subworkflow'">🧩</span>
     </div>
     <div class="workflow-node__name">{{ props.data.name }}</div>
     <Handle type="target" :position="Position.Top" />
@@ -44,6 +45,10 @@ const props = defineProps<Props>()
 
 .workflow-node--python {
   border-color: var(--color-node-python);
+}
+
+.workflow-node--subworkflow {
+  border-color: var(--color-node-subworkflow);
 }
 
 .workflow-node__icon {

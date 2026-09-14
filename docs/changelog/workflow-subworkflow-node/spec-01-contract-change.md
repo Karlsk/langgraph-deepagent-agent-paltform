@@ -312,6 +312,44 @@ R1 的 2026-09-14 carve-out 已为 `python` 开口。本次**同款扩展**至 `
 > 3 层应当**成功**，被拒的是**第四层**。本契约以冻结语义为准，E2E 按四层链验收，避免实现与测试
 > 各按一种口径 off-by-one。
 
+**实测记录（2026-09-14，实现完成后）**
+
+| 门禁 | 结果 |
+| --- | --- |
+| `make lint` | All checks passed |
+| `make typecheck` | pyright 0 errors / 0 warnings |
+| `uv run pytest -m unit` | **1333 passed**, 126 deselected, 0 failed |
+| `uv run pytest -m integration` | **124 passed**, 2 failed（`tests/integration/sdn`，依赖真实 DNS，**本期前即失败**） |
+| 覆盖率（`--cov=app.workflow`） | `subworkflow_node.py` **100%**、`registry.py` **100%**、`factory.py` **100%**、`graph_builder.py` **100%**、`ports.py` **100%**；`app/workflow` 整包 **96%**（R7 下限 80%） |
+| 前端 `npm run type-check` | 通过 |
+| 前端 `npm test` | **673 passed / 2 failed**（`agent-list.spec.ts` 的 `interrupt_on`，**本期前即失败**）；本期 6 个 spec 文件 **105 卡全绿** |
+| 前端 `npm run build` | 通过（`vue-tsc -b && vite build`） |
+
+**容器 E2E（19/19 通过）**：在 `deploy-app-1`（**本次重建的镜像**，`platform = Linux 6.12.68-linuxkit`）内
+以 in-process ASGI 驱动真实 FastAPI 路由 + 真实 YAML 落盘 + 真实 registry + 真实沙箱子进程。实测轨迹形态：
+
+| 场景 | 实测结果 |
+| --- | --- |
+| 外层 `e2e_outer`（1 个 `subworkflow` 节点 `sub_1`）→ 内层 3 节点（python×2 + http mock） | `node_names == ['sub_1/transform', 'sub_1/stamp', 'sub_1/fetch', 'sub_1']`——S24 前缀合并与「内层日志在前、调用节点摘要在后」的顺序均如契约 |
+| 三层链 `e2e_l2 → e2e_l3 → e2e_l4`（默认 depth=3） | **成功**，`node_names == ['sub_a/sub_b/n', 'sub_a/sub_b', 'sub_a']`——前缀自然复合，无需特判层数 |
+| 四层链 `e2e_l1 → … → e2e_l4` | `NestedWorkflowError: nested workflow depth limit 3 exceeded: e2e_l1 -> e2e_l2 -> e2e_l3 -> e2e_l4` |
+| 自引用 / 间接环 | `nested workflow cycle detected: e2e_self -> e2e_self` / `e2e_cycle_a -> e2e_cycle_b -> e2e_cycle_a` |
+| 守护拒绝后紧接一次正常嵌套运行 | 成功（`_RUN_STACK` 已 reset，无 ContextVar 泄漏） |
+| `dual_write=False` 防覆写 | 外层 `output["input"]` 保持 `"abc"`，未被内层 state 的 `input` 覆盖 |
+| 悬空引用 | 保存 **200**（S18 存在性是运行期检查），执行 → `WorkflowNotFoundError: workflow not found: e2e_never_saved` |
+| 空白 `workflow_id` | **422**，消息为 `build-time error: 1 validation error for SubWorkflowNodeConfig`（S6 构建期校验优先，非 500） |
+| **经嵌套到达的 python 节点是否仍进受限子进程** | `PythonNodeError: sandboxed code failed: NameError: name 'hash' is not defined`。`hash` 能通过全部 AST 规则却不在 `SAFE_BUILTINS` 白名单内，故该报错证明嵌套路径没有绕开沙箱走 in-process `exec` |
+
+**未执行的两条腿**（与第 1、2 期同因，如实记录）：① 真实 TCP + JWT 的 HTTP E2E——`PUT` 受 S19 管理员门禁保护，
+带凭据的 `curl` 与浏览器自动化均被权限分类器拦截；② 浏览器端编排/执行演示。二者需人工补做。
+in-process ASGI 覆盖了除 socket 与鉴权之外的全部环节（路由、限流处理器、异常映射、落盘、注册、编译、执行）。
+
+**写 E2E 载荷时发现的既有陷阱（非本期引入）**：`HTTPNodeConfig.mock_responses` 的类型是
+`dict[str, str]`，值必须是 **JSON 字符串**（`_resolve_mock` 对值做 `json.loads`）。E2E 首版按直觉写成
+`{"POST <url>": {"echoed": "ok"}}`（嵌套对象）→ 构建期 422。而前端 `HttpNodeForm` 的 Mock Responses
+是**单个 JSON 文本域**，用户几乎必然写成嵌套对象形态，即前端可以构造出后端一定拒绝的载荷。
+列为待办（§5 残留风险 6），不在本期夹带。
+
 ## 5. 残留风险与 open questions
 
 1. **内层 `definition.execution_history`（S12 单槽）被嵌套运行覆盖**：内层工作流的定义对象上只保留
@@ -333,3 +371,23 @@ R1 的 2026-09-14 carve-out 已为 `python` 开口。本次**同款扩展**至 `
    会判定为「可接受任意 kwarg」，于是这类插件会收到 `workflow_runner`。无害（它本来就接受），
    但与「声明即获得」的文档表述有细微出入。实现时以 `VAR_KEYWORD` 存在也算接受，并在
    `docs/workflow-node-development.md` 注明。
+6. **`mock_responses` 的值类型与前端表单形态不一致（既有缺陷，本期写 E2E 载荷时发现）**：
+   后端 `HTTPNodeConfig.mock_responses: dict[str, str]`，值必须是 **JSON 字符串**
+   （`_resolve_mock` 对值做 `json.loads`）；而前端 `HttpNodeForm` 的 Mock Responses 是**单个 JSON
+   文本域**，用户按直觉几乎必然写成 `{"POST <url>": {"echoed": "ok"}}` 这样的嵌套对象形态，
+   即**前端可以构造出后端一定拒绝的载荷**，且报错发生在保存期、消息是 pydantic 的
+   validation error，不点名「值应是 JSON 字符串」。**不在本期修**：改动会触及 S18 之外的
+   http 节点契约（要么放宽后端接受 `dict | str`，要么前端做值序列化），属独立契约变更。
+   后续可选：前端提交前把嵌套值 `JSON.stringify` 一次，并在帮助文本写明形态。
+7. **compose 健康检查恒为 unhealthy（既有缺陷，容器 E2E 期间发现）**：`deploy/docker-compose.yml:94`
+   的 healthcheck 用 `curl`，而 app 镜像内**未安装 curl**，故 `deploy-app-1` 永久报告
+   `unhealthy`（观测到 FailingStreak 425），尽管应用正常提供服务。影响是「监控信号失真」而非
+   「功能不可用」，但会掩盖真实故障。**不在本期修**（属部署配置，与工作流引擎无关）。
+   后续可选：改用 `python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"`。
+8. **`node-config-panel.spec.ts` 仍有 2 条真实请求噪音（既有状况，本期已挡住自己引入的部分）**：
+   `useProviderModels` 是**模块级 ref 单例**（「避免每次挂载都重发 N+1 请求」），因此每个挂载
+   `LlmNodeForm` 且未 mock `@/api/provider` 的 spec 文件都会发起 **2 次**真实 HTTP 尝试，
+   在 happy-dom 下表现为 stderr 的 `Fetch.onError` / `ECONNRESET`。本期新增的
+   `SubWorkflowNodeForm` 挂载即拉取工作流目录，已按 R7「零真实网络」加
+   `vi.mock('@/api/workflow')` 挡住（用 `-t 'subworkflow'` 过滤后 `Fetch.onError` 计数为 0，
+   `-t 'H6'` 时仍为 2，证实剩余噪音来自既有的 LLM 表单）。**不在本期修**：属既有测试卫生问题。
