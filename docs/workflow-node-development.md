@@ -53,8 +53,9 @@ L0  nodes/base.py ──► utils.py ──────────────�
 | `llm` / `LLM` | `LLMNode` | factory 内置分支 + 模块底部 `register_node_type("llm", ...)` | 多供应商对话调用，env 密钥，tenacity 退避重试 |
 | `http` / `HTTP` | `HTTPNode` | factory 内置分支 + 模块底部 `register_node_type("http", ...)` | 模板渲染请求，`response_path` 提取，显式 retry/mock |
 | `python` | `PythonNode` | 纯插件路径（模块底部 `register_node_type("python", ...)`，factory **无**内置分支） | 代码执行：`code` 模式按 `sandboxed` 二选一（子进程沙箱 / 进程内受信 `exec`），`entry` 模式加载仓库模块函数且不可沙箱化。经 `PUT` 注册者由服务端强制 `sandboxed=true`（S18），详见 §5.5 |
+| `subworkflow` | `SubWorkflowNode` | 纯插件路径（模块底部 `register_node_type("subworkflow", ...)`，factory **无**内置分支） | 引用另一个已注册工作流；runner 由 registry 自注入，环与深度守护见 S23、内层日志前缀合并见 S24，详见 §6 |
 
-> `NodeType` 枚举刻意只含 `LLM`/`HTTP` 两个成员（C8/R1）；`python` 是**插件类型**，以任意字符串注册，
+> `NodeType` 枚举刻意只含 `LLM`/`HTTP` 两个成员（C8/R1）；`python` 与 `subworkflow` 都是**插件类型**，以任意字符串注册，
 > 不受枚举约束。`NodeDefinition.type` 保持 `str`（非枚举）正是为了让插件类型透传（R4）。
 
 ---
@@ -330,9 +331,110 @@ CONTRACT §8 R1 已就此追加 carve-out。它能否经 `PUT /api/v1/workflows/
 
 ---
 
-## 6. 插件式注册流程（R4）
+## 6. SubWorkflowNode 插件（嵌套，S23 / S24）
 
-### 6.1 factory 解析顺序（方案 A）
+`subworkflow` 让一个工作流引用另一个已注册工作流。它与 `python` 同为 **K5 插件类型**
+（模块底部 `register_node_type("subworkflow", SubWorkflowNode)`，factory **无**内置分支，不入 `NodeType` 枚举 C8）。
+
+嵌套能力初版被 defer，理由是 **H5**（构建期快照：节点若持有 registry 引用，编译出的图会钉死当时的注册表）
+与 **H3**（日志收集：内外层日志交错无法区分来源）。二者根因相同——「节点直接认识注册表」。
+本实现把能力以**不透明 callable** 沿构造链注入（与 S20 的 `ChatModelFactory` 同款），节点只持有一个
+`WorkflowRunner`，不知道它背后是 registry、测试替身还是远端服务，H5 因此不成立；H3 由 S24 正面解决。
+
+冻结签名见 CONTRACT §4.15。
+
+### 6.1 配置字段（`SubWorkflowNodeConfig`，`extra="forbid"`，S14）
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `workflow_id` | `str` | **必填** | 被引用工作流 id。**存在性是运行期检查**（未注册 → `WorkflowNotFoundError`），注册期只校验「非空 str」（S18） |
+| `input_map` | `dict[str, str]` | `{}` | `{内层 state 键: 外层 state 点路径}`，路径语法同 S7。**外层路径不存在则跳过该键**（让内层按 S14 走声明默认值），不抛 `KeyError`——与 `{input}` 占位符渲染的既有容错口径一致 |
+| `inherit_input` | `bool` | `False` | 为真则先把外层 state **全量**传给内层，再叠加 `input_map` 解析结果；**`input_map` 优先** |
+
+**为什么不做注册期存在性校验**：`PUT wf_outer` 可能先于 `PUT wf_inner` 到达（前端逐个保存、脚本批量导入、
+或 inner 被删而 outer 仍在盘上）。注册期校验会强制拓扑序保存，把「顺序」变成隐性契约，比运行期报错更难排查。
+
+### 6.2 执行语义（R3 管线不变）
+
+```
+convert_state_to_dict 进
+  → 组装内层输入（inherit_input 全量拷贝 → input_map 覆盖，后者优先）
+  → workflow_runner(workflow_id, inner_input, self.name)
+  → 输出摘要（§6.4）
+  → map_output_to_state 出
+```
+
+`workflow_runner` 为 `None` → **`ConfigError`**（CONTRACT §5）。这与 S20 的
+「`provider_ref` 非空但工厂为 `None`」是同一处置口径：**不静默降级、不返回空 dict**。
+静默降级会让「忘了注入 runner」表现为「子工作流什么都没做」，比直接失败难查得多。
+
+生产装配路径（**组合根零改动**）：`WorkflowRegistry.__init__` 以 bound method `self._run_nested`
+作为 runner 构造 `GraphBuilder` → `_add_nodes` 透传给 `create_node` → 插件分支按签名探测传给本节点。
+详见 §7.1。
+
+### 6.3 嵌套守护（S23）
+
+`registry.py` 模块级 `_RUN_STACK: ContextVar[tuple[str, ...]]`（default `()`）记录当前运行栈。
+`execute_workflow` 进入即 `set(_RUN_STACK.get() + (workflow_id,))`，`finally` 中 `reset(token)`——
+与 `_RUN_COLLECTOR` 同款的 S11 配对纪律，故 ContextVar 永不泄漏、线程/协程间互不串栈。
+
+`_run_nested` 在**递归之前**过两道守护（「调用前拒绝」而非「进入后炸栈」）：
+
+| 守护 | 条件 | 异常 |
+| --- | --- | --- |
+| 环检测 | `workflow_id in _RUN_STACK.get()` | `NestedWorkflowError`，消息含**完整栈**（`a -> b -> a`）。同 id 自引用（A→A）**先被这里拒**，不会走到 RLock 重入 |
+| 深度上限 | `len(_RUN_STACK.get()) >= max_nesting_depth` | `NestedWorkflowError`，消息含栈与上限值 |
+
+**`max_nesting_depth` 语义（冻结）**：运行栈中允许**同时存在**的工作流数量上限，**含最外层**。
+默认 `3` ⇒ `A→B→C` 可运行（栈深恰为 3），`C` 再引用 `D` 被拒。它是 **registry 级**配置
+（`WorkflowRegistry(max_nesting_depth=...)`），**不做 per-node 覆盖**——per-node 会让「全局最深」不可推断，
+守护形同虚设。
+
+**绝不依赖 `RecursionError` 兜底**：它不属 `WorkflowEngineError` 家族，会穿透 CLI 的
+`except WorkflowEngineError` 落到 catch-all，运维只看到「unexpected error」。
+
+**死锁**：单线程嵌套是**同线程递归**，各持自己的 per-id `RLock`（可重入），无死锁。
+**跨线程 AB-BA 在理论上可达**——两个线程分别执行 `A→B` 与 `B→A`（这是两个不同的外层工作流互相引用，
+各自栈内无重复 id，故环检测**不拦**）：线程 1 持 A 锁等 B 锁、线程 2 持 B 锁等 A 锁。
+`execute_workflow` 全程无超时（既有状况），故死锁表现为挂住而非报错。本期不做全局锁序；
+生产若出现互相引用的工作流对，应在评审期禁止该拓扑。
+
+### 6.4 内层日志合并（S24）与摘要输出
+
+内层 `execute_workflow` 自带独立 `RunLogCollector`（S11 既有行为，**零改动**）。因是同线程 ContextVar
+嵌套 set/reset，内层 collector 在外层看来是**临时遮蔽**，内层 `finally` reset 后外层自动恢复。
+
+内层返回后，`_run_nested` 取 `result.execution_logs`，逐条
+
+```python
+log.model_copy(update={"node_name": f"{caller_label}/{log.node_name}"})
+```
+
+后 `add` 进**外层** collector（经 `nodes/base.py` 既有的 `get_run_collector()` 取得，无需新增访问器）。
+外层轨迹因此形如 `sub_1/classify`、`sub_1/fetch`。
+
+**前缀自然复合**，无需特判层数：C 的日志并入 B 时成 `sub_c/xxx`，B 的日志（已含该条）并入 A 时成
+`sub_b/sub_c/xxx`。
+
+**子节点自身的 `ExecutionLog.output_data` 只记摘要**：
+
+```python
+{"output_keys": [...], "run_id": ..., "duration_ms": ..., "inner_log_count": ...}
+```
+
+**不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍，且前后端都要去重）。
+内层业务数据经 R3 出口 `map_output_to_state` 正常写入外层 state，**不丢失**。
+
+前端 `WorkflowTraceDrawer` **零改动**：前缀名是普通字符串，直接展示即可读出层级。
+
+**已知取舍**：内层工作流定义对象上的 `execution_history`（S12 单槽）会被嵌套运行覆盖其此前的独立运行记录。
+外层 `RunResult` 才是本次运行的权威轨迹，内层单槽历史只是调试便利；要保留需改成多槽有界队列，属 S12 契约变更。
+
+---
+
+## 7. 插件式注册流程（R4）
+
+### 7.1 factory 解析顺序（方案 A）
 
 `nodes/factory.py` 的 `create_node` 按固定顺序解析节点类型：
 
@@ -347,13 +449,27 @@ def create_node(definition, operator_log=None) -> BaseNode:
     # 2. 插件注册表（generic BaseNode interface）
     if definition.type in _NODE_REGISTRY:
         node_class = _NODE_REGISTRY[definition.type]
-        return node_class(name=..., node_type=definition.type, config=definition.config, operator_log=op_log)
+        # 可选注入参数按签名探测传递（见下方「插件可选注入参数」）
+        return node_class(name=..., node_type=definition.type, config=definition.config, operator_log=op_log,
+                          **({"workflow_runner": workflow_runner} if _accepts(node_class, "workflow_runner") else {}))
     # 3. 未知类型
     raise ValueError(f"Unknown node type '{definition.type}'. Registered types: {list_node_types()}. "
                      "Use register_node_type() to add custom types.")
 ```
 
-### 6.2 register_node_type 契约（CONTRACT §4.5）
+**插件可选注入参数（2026-09-14，S23/S24；用户拍板方案 A）**：`SubWorkflowNode` 需要第 5 个构造参数
+`workflow_runner`，但插件分支原本是固定 4-kwarg 调用。**不改 `BaseNode` 冻结签名（CONTRACT §4.4）**，
+而是在插件分支用 `inspect.signature(node_class.__init__)` 探测：
+
+- 声明了 `workflow_runner` 形参，**或**声明了 `VAR_KEYWORD`（`**kwargs`）→ 传该 kwarg；
+- 否则按原 4-kwarg 形态调用。
+
+收益：`PythonNode` 等既有插件与任何第三方插件**零改动**（不接受就收不到），R4「内置分支恰 2 个」守护不破。
+代价：这是**隐式契约**——插件作者不读文档不会知道自己的 `__init__` 可以声明这个参数，故本段即为该契约的
+正式出处。被否决的两案（给 `BaseNode.__init__` 加可选参 / 节点从 ContextVar 自取）及影响面对比见
+`docs/changelog/workflow-subworkflow-node/spec-01-contract-change.md` §3。
+
+### 7.2 register_node_type 契约（CONTRACT §4.5）
 
 ```python
 _NODE_REGISTRY: dict[str, type[BaseNode]] = {}
@@ -368,8 +484,10 @@ def list_node_types() -> list[str]:
 - 注册前校验 `node_class` 是 `BaseNode` 子类，否则抛 `TypeError`。
 - 插件经 **generic BaseNode 接口**构造：`node_class(name=..., node_type=..., config=..., operator_log=...)`——
   因此插件节点的 `__init__` 签名必须兼容这四个关键字参数（与内置节点的专用构造器不同）。
+  这四个是**必须兼容**的下限；额外的**可选注入参数**（如 `workflow_runner`）由 factory 按签名探测追加，
+  声明即获得、不声明则不收（见 §7.1「插件可选注入参数」）。
 
-### 6.3 R4 红线：严禁在 create_node 堆叠 if/elif
+### 7.3 R4 红线：严禁在 create_node 堆叠 if/elif
 
 - 内置分支**恰好 2 个**（`("llm","LLM")` / `("http","HTTP")`），新增节点类型**一律走 `register_node_type`**，
   **禁止**在 `create_node` 里加 `elif definition.type == "my_node":` 之类的领域分支。
@@ -378,7 +496,7 @@ def list_node_types() -> list[str]:
   置于 `factory.py` **文件底部**（模块形态导入），使节点模块自注册时能先拿到 `register_node_type`，
   同时属性访问推迟到 `create_node` 调用期，对任意导入顺序均安全。
 
-### 6.4 注册时机
+### 7.4 注册时机
 
 `register_node_type` 必须在 **registry 构建之前**执行。模块底部自注册 + factory 底部 import 的组合保证了：
 只要 `app.workflow.nodes.factory` 被导入，三个自带节点类型即已注册。宿主自定义节点应在装配前显式 import 其模块
@@ -386,7 +504,7 @@ def list_node_types() -> list[str]:
 
 ---
 
-## 7. 新节点开发代码模板
+## 8. 新节点开发代码模板
 
 以 `python_node.py` 为蓝本的最小可用骨架。假设要新增一个 `my_node` 类型：
 
@@ -492,7 +610,7 @@ def do_something(state_dict: dict[str, Any], cfg: MyNodeConfig) -> Any:
 register_node_type("my_node", MyNode)
 ```
 
-### 7.1 模板要点对照
+### 8.1 模板要点对照
 
 | 步骤 | 契约 | 编号 |
 | --- | --- | --- |
@@ -504,7 +622,7 @@ register_node_type("my_node", MyNode)
 | `wrap_runnable` | 自动打 `tags=[name]` | K4 |
 | 底部 `register_node_type` | 插件路径，不改 factory 内置分支 | R4/K5 |
 
-### 7.2 TDD 要求（R7）
+### 8.2 TDD 要求（R7）
 
 - **严格 RED → GREEN → REFACTOR**：测试先于实现提交。
 - 测试落位 `tests/unit/workflow/nodes/`（单元）与 `tests/integration/workflow/`（跨模块）（AD-08）。
@@ -513,7 +631,7 @@ register_node_type("my_node", MyNode)
 - `restore_node_registry` autouse fixture 保证注册表在测试间隔离（D7）；测试内注册的类型不泄漏到其它测试。
 - 覆盖率 ≥ 80%（`uv run pytest --cov=app.workflow --cov-report=term-missing --cov-fail-under=80`）。
 
-### 7.3 命名与结构（R8）
+### 8.3 命名与结构（R8）
 
 - 文件小（< 400 行）、函数小（< 50 行）、按领域组织、单一职责。
 - 日志事件名 `lowercase_with_underscores`（如 `my_node_execution_failed`），kwargs 传参**禁 f-string**（S15/AD-02）。
@@ -521,25 +639,25 @@ register_node_type("my_node", MyNode)
 
 ---
 
-## 8. 红线约束对照表（R1-R10）
+## 9. 红线约束对照表（R1-R10）
 
 引自 [02-开发规范.md §0](workflow-reimpl-plan/02-开发规范.md)（一票否决项），附对**节点开发者**的具体含义与机器检查。
 
 | 编号 | 一句话 | 对节点开发者的含义 | 机器检查（CONTRACT §10） |
 | --- | --- | --- | --- |
-| **R1** | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增**内置**节点类型或领域逻辑（carve-out：`python` 为 K5 插件类型，不入 `NodeType`、不加 factory 内置分支，见 §5.5） | 本期节点范围冻结；确需新内置类型走 CONTRACT §11 变更流程，不得夹带领域逻辑 | `ls app/workflow/nodes/` 对白名单；`NodeType` 成员数守护测试（**恰 2，不因 python 改变**） |
+| **R1** | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增**内置**节点类型或领域逻辑（carve-out：`python` 与 `subworkflow` 均为 K5 插件类型，不入 `NodeType`、不加 factory 内置分支，见 §5.5 / §6） | 本期节点范围冻结；确需新内置类型走 CONTRACT §11 变更流程，不得夹带领域逻辑 | `ls app/workflow/nodes/` 对白名单；`NodeType` 成员数守护测试（**恰 2，不因 python/subworkflow 改变**） |
 | **R2** | reducer 只来自 YAML 显式声明，禁止硬编码业务字段名 | 节点 `func` 内**不得**出现 `circle_`/`planner_`/`worker_`/`reflector_`/`current_node` 等领域字面量 | `grep -rnE "circle_\|planner_\|worker_\|reflector_\|current_node" app/workflow/` 零命中；`test_no_hardcoded_field_names` |
 | **R3** | 节点 `convert_state_to_dict` 进 / `map_output_to_state` 出，禁止 mutate 输入 state | 见 §2.4；`func` 只读使用 state_dict，输出经 `map_output_to_state` | 节点 func 代码审查；R3 进出管线契约测试 |
-| **R4** | 新节点必须经 `register_node_type` 注册，`create_node` 内置分支恰好 2 个 | 见 §6.3；禁止在 factory 堆 if/elif | `test_builtin_branch_count_is_two`；`grep -n "elif" app/workflow/nodes/factory.py` |
+| **R4** | 新节点必须经 `register_node_type` 注册，`create_node` 内置分支恰好 2 个 | 见 §7.3；禁止在 factory 堆 if/elif | `test_builtin_branch_count_is_two`；`grep -n "elif" app/workflow/nodes/factory.py` |
 | **R5** | 密钥 env-only，禁止硬编码，禁止完整 state/密钥写日志 | Config 无明文密钥字段；`_log` 只记摘要 | `grep -rniE "(api[_-]?key\|token\|secret\|password)\s*[:=]" app/workflow/ tests/` 人工确认；`test_execution_log_no_secret_leak`（LLM/HTTP 各一） |
 | **R6** | 禁止死 try/except，错误必须显式处理 | `func` 的 except 分支必须记录后重抛或降级（且有测试） | ruff `BLE`；`grep -rn "except.*:\s*pass" app/workflow/` 零命中 |
-| **R7** | 严格 TDD，覆盖率 ≥ 80% | 见 §7.2；测试先行，零真实网络/LLM | `uv run pytest --cov=app.workflow --cov-report=term-missing --cov-fail-under=80` |
+| **R7** | 严格 TDD，覆盖率 ≥ 80% | 见 §8.2；测试先行，零真实网络/LLM | `uv run pytest --cov=app.workflow --cov-report=term-missing --cov-fail-under=80` |
 | **R8** | 小文件（< 400 行）、小函数（< 50 行）、单一职责 | 业务逻辑抽为纯函数（如 `do_something`）便于单测 | `wc -l app/workflow/**/*.py`；review 抽查 |
 | **R9** | pydantic v2 全量类型标注，边界处校验 fail fast | Config 用 pydantic 模型；`__init__` 边界校验 | `make typecheck`（pyright standard）零错误；ruff `D` docstring 规则 |
 | **R10** | 任何缓存必须有上限 + 失效 + 开关（本期默认无缓存） | 节点**禁止**模块级 dict 缓存 / `lru_cache`；跨运行复用由宿主组装点显式持有并构造传入 | `grep -rn "cache\|lru_cache" app/workflow/` 零命中 |
 | **R-EXP** | 1.x API 未探索闭环禁止编码 | 涉及 langgraph/langchain 1.x 行为的节点逻辑，对应 EXP 项须先在 `api-exploration-1x.md` 闭环 | `api-exploration-1x.md` 全部 EXP 项"实测结果"非空 |
 
-### 8.1 节点相关守护测试（CONTRACT §10）
+### 9.1 节点相关守护测试（CONTRACT §10）
 
 | 守护测试 | 守护对象 | 落点 |
 | --- | --- | --- |
@@ -551,7 +669,7 @@ register_node_type("my_node", MyNode)
 
 ---
 
-## 9. 相关文档
+## 10. 相关文档
 
 - 编码契约（接口冻结 §4.4/§4.5/§4.7/§4.8）：[spec/CONTRACT.md](workflow-reimpl-plan/spec/CONTRACT.md)
 - 开发规范（R1-R10 正反例全文）：[02-开发规范.md](workflow-reimpl-plan/02-开发规范.md)

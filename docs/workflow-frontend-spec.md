@@ -53,7 +53,7 @@
 | **In** | `/workflow` 路由与侧边栏菜单项；`src/api/workflow.ts`；`views/workflow/*` 列表页 + 画布设计器 + 面板 / 对话框；画布 ↔ DSL 序列化 composable；对应 Vitest 测试 |
 | **In（依赖后端）** | 列表 / 查定义 / 全量保存注册 / 删除端点（§4.2）；execute 响应内嵌 `execution_logs`（§7.1 方案 A）；YAML 落盘持久化 |
 | **Out** | 引擎内核改动；SSE 流式执行；多 run 历史回溯（`workflow-api-and-trace.md` §7.2 方案 B）；workflow 版本管理 / diff / 协同编辑 |
-| **Out** | `python` 节点的 `entry` 模式与任何客户端可控的 `sandboxed` 开关（S18：`entry` 无法沙箱化、`sandboxed` 由后端强制，见 §5.1）；引入 Pinia / SSR / monorepo（前端红线） |
+| **Out** | `python` 节点的 `entry` 模式与任何客户端可控的 `sandboxed` 开关（S18：`entry` 无法沙箱化、`sandboxed` 由后端强制，见 §5.1）；`subworkflow` 的前端环检测（S23 运行栈才是权威，前端只排除自引用这一体验层便利）；引入 Pinia / SSR / monorepo（前端红线） |
 
 ### 2.2 分阶段（建议按此顺序交付，每阶段可独立验收）
 
@@ -128,10 +128,11 @@
 
 在线编辑 YAML 并注册 = **允许远程定义可执行图**，风险面显著。以下为前端 + 后端协同必须落实的门禁：
 
-### 5.1 节点类型白名单（S18 / S22 / C8，2026-09-14 修订）
+### 5.1 节点类型白名单（S18 / S22 / S23 / S24 / C8，2026-09-14 两次修订）
 
-- **画布 palette 提供 `llm` / `http` / `python` 三类**。`llm`/`http` 是 `NodeType` 枚举内置集（C8）；
-  `python` 是 K5 插件类型，自 S22 起有真沙箱执行路径，故可经画布编排。
+- **画布 palette 提供 `llm` / `http` / `python` / `subworkflow` 四类**。`llm`/`http` 是 `NodeType` 枚举内置集（C8）；
+  `python` 与 `subworkflow` 是 K5 插件类型，分别自 S22（真沙箱执行路径）与 S23/S24（环与深度守护 + 内层日志前缀合并）
+  起可经画布编排。
 - **`python` 节点前端约束**：
   - 只暴露 `code` 模式，**绝不提供 `entry` 输入**（`entry` 可加载任意仓库模块、无法沙箱化，后端一律拒绝）；
   - **不发送 `sandboxed` 字段**——它是安全属性而非用户偏好，由后端强制覆写为 `true`（S18 ③）。前端即使发了也会被忽略；
@@ -139,7 +140,17 @@
     校验与报错以后端 422 的 `message`（行号 + 规则名）为准，前端只展示、不二次解释；
   - 面板须明示沙箱限制：无 import、无文件/网络、无 `open`/`exec`/`getattr` 等内建、须 `return` dict、
     超时与内存有上限（S22 细则）。
-- 后端 `PUT` 须**服务端二次校验** `node.type ∈ {llm, http, python}` 及上述三条注册期条件，拒绝未知类型
+- **`subworkflow` 节点前端约束**：
+  - 被引用工作流用 `el-select` 从 **`listWorkflows()` 已注册列表**中选，**客户端排除当前正在编辑的 id**
+    （自引用是最常见的误操作）。这是**体验层**便利，**不是边界**：后端的 S23 运行栈环检测才是权威，
+    间接环（A→B→A）前端看不出来也不该试图看出来；
+  - **不在保存时校验被引用工作流是否存在**——存在性是**运行期**检查（S18：注册期只校验 `workflow_id` 为非空 str）。
+    理由：`wf_outer` 可能先于 `wf_inner` 保存，前端若强制存在性就等于强制拓扑序保存；
+  - `inherit_input`（switch）+ `input_map`（kv 编辑器，复用 http 节点 headers/mock 的编辑模式）；
+    `input_map` 的值是**外层 state 的点路径**（S7 语法），可用 `deriveStateChannels` 给键名下拉做提示；
+  - 轨迹抽屉对嵌套**零改动**：内层日志的 `node_name` 已被后端前缀化为 `"{调用节点}/{内层节点}"`（S24），
+    直接展示即可读出层级。前端**不得**自行解析或重组该前缀。
+- 后端 `PUT` 须**服务端二次校验** `node.type ∈ {llm, http, python, subworkflow}` 及上述注册期条件，拒绝未知类型
   （**不依赖前端约束**：安全边界始终在后端）。
 
 ### 5.2 SSRF 与外呼（http 节点）
@@ -202,7 +213,7 @@ export interface StateFieldDTO {
   reducer?: 'add' | 'last' | null
 }
 
-/** 节点（对应 NodeDefinition；type 仅 'llm' | 'http' | 'python'，见 §5.1） */
+/** 节点（对应 NodeDefinition；type 仅 'llm' | 'http' | 'python' | 'subworkflow'，见 §5.1） */
 export interface NodeDTO {
   name: string
   type: string
@@ -307,7 +318,7 @@ export function executeWorkflow(id: string, input: Record<string, unknown>): Pro
 | `workflow_id` | 设计器顶部输入 / 路由参数 | 新建时用户填写，须匹配 `[A-Za-z0-9_-]`（§4.3 文件名安全） |
 | `entry_point` | 标记为「入口」的节点 | 画布上唯一节点打入口标记（如起始徽标）；无入口 → 前端校验拦截 |
 | `nodes[].name` | Vue Flow `node.id` | 唯一性前端校验（对应 `_validate_nodes` 去重） |
-| `nodes[].type` | Vue Flow `node.type`（限 `llm`/`http`/`python`） | §5.1 白名单 |
+| `nodes[].type` | Vue Flow `node.type`（限 `llm`/`http`/`python`/`subworkflow`） | §5.1 白名单 |
 | `nodes[].config` | 节点配置面板表单值 | 按 type 驱动的表单（§10.3） |
 | `edges[].source/target` | Vue Flow `edge.source/target` | 终止边 target = 特殊 `END` 端点节点 |
 | `edges[].condition` | 条件边编辑器（结构化控件生成） | §5.5 文法约束；无条件 = 普通顺序边 |
@@ -327,7 +338,8 @@ export function validateGraph(def: WorkflowDefinitionDTO): string[]   // 前端�
 - **`END` 端点**：画布渲染一个不可删除的 `END` 终止节点；指向它的边 `target='END'`。
 - **前端预校验**（`validateGraph`，提交前拦截，减轻后端往返）：至少 1 个节点、节点名唯一、`entry_point` 存在、
   边的 source/target 均指向真实节点或 `END`、条件边文法合法、`llm` 节点密钥仅 env 引用、
-  `node.type ∈ {llm, http, python}`，且 `python` 节点须携非空 `code`、**不得含 `entry`**（§5.1）。
+  `node.type ∈ {llm, http, python, subworkflow}`；`python` 节点须携非空 `code`、**不得含 `entry`**；
+  `subworkflow` 节点须携非空 `workflow_id`（**不校验被引用工作流是否存在**——存在性是运行期检查，见 §5.1）。
   **后端仍独立校验**（前端校验仅 UX，不作为安全边界，S6 构建期校验为最终真相；AST 预检只在后端做）。
 
 ---
@@ -343,7 +355,7 @@ views/workflow/
 ├── YamlPreviewDrawer.vue             # 只读 YAML 预览（D5，取后端 yaml_text）
 ├── canvas/
 │   ├── nodeCatalog.ts                # 节点类型目录 + DEFAULT_CONFIGS（§5.1 白名单的前端镜像）
-│   ├── NodePalette.vue               # 左侧节点面板：llm/http/python 可拖拽项（§5.1 白名单）
+│   ├── NodePalette.vue               # 左侧节点面板：llm/http/python/subworkflow 可拖拽项（§5.1 白名单）
 │   ├── WorkflowCanvas.vue            # Vue Flow 画布封装（节点/边/END/连线/minimap/controls）
 │   ├── WorkflowNode.vue              # 自定义 Vue Flow 节点渲染（图标 + 名称 + 类型 + 入口徽标）
 │   ├── EndNode.vue                   # 不可删除的 END 终止节点
@@ -353,6 +365,7 @@ views/workflow/
     ├── LlmNodeForm.vue               # llm 配置：provider_ref 分组下拉/temperature/system_prompt（无明文密钥）
     ├── HttpNodeForm.vue              # http 配置：url/method/body_template/response_path/timeout/max_retries/mock
     ├── PythonNodeForm.vue            # python 配置：**仅** code（等宽 textarea）+ 沙箱限制说明；无 entry、无 sandboxed 开关（§5.1）
+    ├── SubWorkflowNodeForm.vue       # subworkflow 配置：已注册工作流下拉（排除当前 id）+ inherit_input + input_map kv 编辑器（§5.1）
     ├── StateSchemaPanel.vue          # state_schema 字段增删改（type/default/description/reducer）
     └── ExecuteInputFields.vue        # 简单模式输入字段（按 state_schema 类型映射控件，保留键除外）
 ```
@@ -446,8 +459,8 @@ views/workflow/
 - **覆盖点**：
   1. 列表页挂载渲染 + `listWorkflows` 调用 + 空态；
   2. 画布 ↔ DSL 序列化往返一致（`definitionToGraph(graphToDefinition(x)) == x`）；
-  3. `validateGraph` 各失败分支（无节点 / 重名 / 缺入口 / 悬空边 / 非法条件 / 类型不在 `{llm,http,python}` /
-     `python` 缺 `code` / `python` 含 `entry` / 明文密钥）；
+  3. `validateGraph` 各失败分支（无节点 / 重名 / 缺入口 / 悬空边 / 非法条件 / 类型不在 `{llm,http,python,subworkflow}` /
+     `python` 缺 `code` / `python` 含 `entry` / `subworkflow` 缺 `workflow_id` / 明文密钥）；
   4. 保存：前端校验拦截不发请求；通过则 `saveWorkflow` 全量提交；422 回显；
   5. 执行：JSON 输入解析、成功展示、`execution_logs` 轨迹渲染、缺失降级、404/500 分支。
 - 范例参照 `tests/components/provider-list.spec.ts` 与 `tests/design-tokens.spec.ts`。
@@ -476,6 +489,10 @@ views/workflow/
 - 画布可拖拽 `python` 节点，面板只暴露 `code`（无 `entry` 输入、无 `sandboxed` 开关）；提交体不含 `entry`/`sandboxed`
   两键（§5.1）；后端对 `entry` 模式与 AST 非法代码仍 422，且 `message` 含规则名不含代码正文；
   `llm` 节点无明文密钥输入（§5.3）；写端点非管理员 403。
+- 画布可拖拽 `subworkflow` 节点，下拉只列已注册工作流且排除当前编辑 id；执行外层后**轨迹抽屉零改动**即可读出
+  `"{调用节点}/{内层节点}"` 前缀层级（S24）；子节点自身条目只显摘要（output_keys / run_id / duration_ms /
+  inner_log_count），不重复内嵌内层输出。反例：自引用执行 → 500 信封含 `NestedWorkflowError` 与完整环栈（S23）；
+  四层链在默认 `max_nesting_depth=3` 下第四层 → 同异常。
 - 全部新增前端测试通过；`npm run type-check` 零错误；不违反前端红线（无 Pinia/SSR，JSON 配置无注释）。
 
 ---

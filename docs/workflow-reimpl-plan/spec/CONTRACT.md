@@ -31,7 +31,7 @@ CONTRACT.md（本文件） > spec-00..09 > 规划文档（00-03） > 原 workflo
 
 ### 2.1 本期允许创建/修改的文件全集（白名单）
 
-**`app/workflow/`（22 个模块，多一个即违规）：**
+**`app/workflow/`（23 个模块，多一个即违规）：**
 
 ```
 app/workflow/
@@ -52,12 +52,13 @@ app/workflow/
   sandbox.py             # validate_code_ast + SandboxLimits + run_sandboxed（S22，< 400 行）
   sandbox_worker.py      # 子进程入口；**非 importable API**，只被 sandbox.py 以 sys.executable -I 拉起（S22，< 400 行）
   nodes/
-    __init__.py          # 导出 BaseNode/register_node_type/create_node/LLMNode/HTTPNode
+    __init__.py          # 导出 BaseNode/register_node_type/create_node/LLMNode/HTTPNode/SubWorkflowNode
     base.py              # BaseNode + RunLogCollectorLike + _RUN_COLLECTOR（< 200 行）
     factory.py           # _NODE_REGISTRY + register/list/create（< 120 行）
     llm_node.py          # LLMNode + LLMConfig（< 250 行）
     http_node.py         # HTTPNode + HTTPNodeConfig（< 280 行）
     python_node.py       # PythonNode 插件（K5 范例，R4 守护不变：factory 无内置分支）
+    subworkflow_node.py  # SubWorkflowNode 插件（S23/S24，K5 路径，< 250 行）
   config/examples/
     minimal.yaml         # Phase 1
     http_demo.yaml       # Phase 9
@@ -67,6 +68,7 @@ app/workflow/
 > **计数说明（2026-09-14）**：原表记 15 个模块，但 `auth.py` / `ports.py` / `security.py` / `store.py` / `nodes/python_node.py`
 > 早已随 spec-17..20 与 K5 插件范例落地却未回写白名单（文档漂移）。本次按第 11 章流程一并补录，
 > 并新增 S22 所需的 `sandbox.py` / `sandbox_worker.py`。补录不改变任何代码，只使白名单与实际仓库一致。
+> 同日第二次变更（S23/S24）新增 `nodes/subworkflow_node.py`，计数 22 → 23。
 
 **测试（镜像结构，`tests/` 目录本仓库新建）：**
 
@@ -99,6 +101,13 @@ tests/integration/workflow/           # test_state_channels / test_graph_e2e / t
 
 - 17 种领域节点（plan/worker/reflection/llm_reflection/agent/tool/merge/extract/dispatcher/collector/subgraph/triage/device_work/controller_work/aggregate/score/output）及 `NodeType` 领域枚举。
 - 子图嵌套、`langgraph.types.Send` 并行扇出、Neo4j 计划生成、MCP client、`game_agent/`、`node4j/`。
+  > **解禁令注解（2026-09-14，S23/S24）**：本条的「子图嵌套」指 **langgraph 原生 subgraph 编译**，
+  > 它**仍然禁止**；`langgraph.types.Send` 并行扇出**依然不做**（并行嵌套的日志合并与深度计数需另立契约）。
+  > 本期新增的 `subworkflow` 节点是 **registry 注入式**嵌套：节点经不透明 `WorkflowRunner` callable
+  > 回调 `WorkflowRegistry.execute_workflow`，编译产物仍是**扁平 `StateGraph`**，不使用 langgraph 的
+  > subgraph 能力。二者机制不同——禁止前者不等于禁止后者。
+  > **为什么必须写清**：不解注则实现者要么以为自己在违规（不敢写），要么顺手用 langgraph subgraph
+  > （真的违规，且把 H5 构建期快照问题带回来）。
 - `LLMHelper` 单例、`invoke_with_tools`、`auto_generate_operator_logs` 领域 schema 分支、`prompt_template.py`、`extract_json_block`。
 - 任何领域字段名特判：`circle_conclusions` / `planner_result` / `worker_result` / `reflector_result` / `circle_meta` / `circle_index` / `step` / `current_node` / `device` / `cmd` / `short_memory` 等字面量**不得出现**在 `app/workflow/` 代码中（"未来扩展"说明性注释除外）。
 - 任何缓存（H4：本期默认无缓存）。
@@ -130,7 +139,7 @@ L0  nodes/base.py ──► utils.py ──────────────�
 1. `models.py` 不得 import 任何引擎模块（只依赖 pydantic / 标准库 / `yaml`）。
 2. `nodes/*` 不得 import `registry` / `graph_builder`（节点不知道图与注册表的存在，同时根除 H5）。
 3. `utils.py` 不得 import LLM/HTTP 客户端库（C7）。
-4. 引擎自包含：`app/workflow/` 任何模块**不得 import `app.core.*` / `app.api.*` / `app.services.*`**（AD-02；反向集成时由外部装配）。**唯一例外是入口层 `api.py`**（及为其服务的 `auth.py` / `security.py`），它可 import `app.core.limiter` / `app.core.config` / `app.api.v1.auth` / `app.services.llm.provider_service`（S20 注册期校验 `provider_ref`）；引擎内核模块（`models` / `nodes/*` / `graph_builder` / `registry` / `store` / `ports` / `utils` / `cli`）**一律不得**跨线。宿主经构造参数注入的**不透明 callable**（如 `ChatModelFactory`）不构成依赖——引擎只持有类型别名 `app/workflow/ports.py`，不感知其实现，装配责任在组合根（`app/main.py`）。
+4. 引擎自包含：`app/workflow/` 任何模块**不得 import `app.core.*` / `app.api.*` / `app.services.*`**（AD-02；反向集成时由外部装配）。**唯一例外是入口层 `api.py`**（及为其服务的 `auth.py` / `security.py`），它可 import `app.core.limiter` / `app.core.config` / `app.api.v1.auth` / `app.services.llm.provider_service`（S20 注册期校验 `provider_ref`）；引擎内核模块（`models` / `nodes/*` / `graph_builder` / `registry` / `store` / `ports` / `utils` / `cli`）**一律不得**跨线。宿主经构造参数注入的**不透明 callable**（如 `ChatModelFactory`）不构成依赖——引擎只持有类型别名 `app/workflow/ports.py`，不感知其实现，装配责任在组合根（`app/main.py`）。**第二类不透明 callable（2026-09-14，S23/S24）**：`WorkflowRunner`，同样定义于 `ports.py`。它与 `ChatModelFactory` 的关键差异是**实现方**——`ChatModelFactory` 由宿主装配（闭包 provider 服务），`WorkflowRunner` 由**引擎自身**提供（`WorkflowRegistry._run_nested` 的 bound method 自注入），故**组合根 `main.py` / `cli.py` 零改动**。放 `ports.py` 的理由与前者相同：红线 2 禁止 `nodes/*` import `registry`/`graph_builder`，节点要回调注册表就只能持有一个类型别名标注的 callable。
 
 ## 4. 接口冻结清单
 
@@ -276,11 +285,18 @@ def create_node(
     definition: NodeDefinition,
     operator_log: OperatorLog | None = None,
     chat_model_factory: ChatModelFactory | None = None,
+    workflow_runner: WorkflowRunner | None = None,
 ) -> BaseNode:
     """插件注册表优先；内置兜底恰好 2 个分支：("llm","LLM")→LLMNode、("http","HTTP")→HTTPNode；
     未知类型 ValueError 列出 list_node_types() 并提示 register_node_type()；
     无 workflow_registry 参数（H5）。chat_model_factory 仅透传给 llm 分支（S20），
-    是不透明 callable 而非注册表，故不违反 H5。"""
+    是不透明 callable 而非注册表，故不违反 H5。
+
+    workflow_runner（S23/S24，2026-09-14 新增）同为不透明 callable，故亦不违反 H5。
+    **签名探测规则（冻结）**：插件分支以 inspect.signature(node_class.__init__) 探测形参，
+    仅当声明了 workflow_runner 形参、或声明了 VAR_KEYWORD（**kwargs）时才传该 kwarg；
+    否则按原 4-kwarg 形态调用。目的：不给 BaseNode 冻结签名（§4.4）加参，
+    且既有插件（PythonNode 等）与第三方插件零改动。内置分支恒 2 个（R4 守护不破）。"""
 ```
 
 【AD-04】factory 及节点模块一律**顶层导入**（覆盖原文档"函数内延迟导入"口径）；langchain-anthropic 为正式依赖。
@@ -395,6 +411,7 @@ class GraphBuilder:
         *,
         no_match_policy: Literal["raise", "default"] = "raise",
         chat_model_factory: ChatModelFactory | None = None,
+        workflow_runner: WorkflowRunner | None = None,
     ) -> None: ...
     def build_graph(
         self,
@@ -423,7 +440,7 @@ class GraphBuilder:
     def _resolve_path(state_dict: dict[str, Any], path: str) -> Any: ...
 ```
 
-七步顺序（K6，代码注释逐步标注 1..7）：`_validate_definition` → `create_state_model` → `StateGraph(state)` → `_add_nodes` → `_add_edges` → `set_entry_point` → `compile()`。构造器**无 registry 参数**（H5 签名形态防线）。
+七步顺序（K6，代码注释逐步标注 1..7）：`_validate_definition` → `create_state_model` → `StateGraph(state)` → `_add_nodes` → `_add_edges` → `set_entry_point` → `compile()`。构造器**无 registry 参数**（H5 签名形态防线）。`_add_nodes` 把两个注入的不透明 callable（`chat_model_factory` S20、`workflow_runner` S23/S24）一并透传给 `create_node`——正因它们是 callable 而非注册表，H5 的签名形态防线才得以保住。
 
 ### 4.10 `app/workflow/registry.py`
 
@@ -451,7 +468,13 @@ class WorkflowRegistry:
         *,
         no_match_policy: Literal["raise", "default"] = "raise",
         chat_model_factory: ChatModelFactory | None = None,
-    ) -> None: ...
+        max_nesting_depth: int = 3,
+    ) -> None:
+        """max_nesting_depth（S23，2026-09-14 新增）= 运行栈中允许同时存在的工作流数量上限（含最外层）。
+        默认 3 ⇒ A→B→C 可运行（栈深 3），C 再引用 D 被拒。**registry 级配置，不做 per-node 覆盖**
+        （per-node 会让「全局最深」不可推断，守护形同虚设）。
+        registry 以 **bound method self._run_nested** 作为 workflow_runner 构造 GraphBuilder
+        → **自注入，组合根 main.py / cli.py 零改动**（§3 红线 4 第二类不透明 callable）。"""
     def register_workflow(
         self,
         definition: WorkflowDefinition,
@@ -463,6 +486,14 @@ class WorkflowRegistry:
     def has_workflow(self, workflow_id: str) -> bool: ...
     def list_workflows(self) -> list[str]: ...
     def execute_workflow(self, workflow_id: str, input_data: dict[str, Any]) -> RunResult: ...
+    # 嵌套执行（S23/S24，2026-09-14 新增）。**私有方法**，作为 WorkflowRunner 注入给 subworkflow 节点；
+    # execute_workflow 自身签名不变（冻结面），变化只在其内部（运行栈 set/reset）与本方法。
+    def _run_nested(self, workflow_id: str, input_data: dict[str, Any], caller_label: str) -> dict[str, Any]:
+        """栈检查（S23）→ 递归 self.execute_workflow（自动获得 per-id RLock、独立 collector、S21 输入合成）
+        → 内层日志按 "{caller_label}/" 前缀并入外层 collector（S24）→ 返回内层输出摘要。
+        环或深度超限 → NestedWorkflowError（消息含完整栈）；被引用 id 未注册 → WorkflowNotFoundError。
+        检查在递归**之前**（调用前拒绝），绝不依赖 RecursionError 兜底——它不属 WorkflowEngineError 家族，
+        会穿透 CLI 的异常分类。"""
     # 查询接口
     def get_workflow_definition(self, workflow_id: str) -> WorkflowDefinition | None: ...
     def get_operator_logs(self, workflow_id: str) -> dict[str, OperatorLog]: ...
@@ -471,6 +502,11 @@ class WorkflowRegistry:
     def get_node_execution_history(self, workflow_id: str, node_name: str) -> list[ExecutionLog]: ...
     def get_node_by_name(self, workflow_id: str, node_name: str) -> BaseNode | None: ...
     def get_registry_stats(self) -> dict[str, Any]: ...
+
+# 运行栈（S23，2026-09-14 新增）。模块级 ContextVar，与 nodes/base.py 的 _RUN_COLLECTOR 同款纪律：
+# execute_workflow 进入时 set(_RUN_STACK.get() + (workflow_id,))，finally 中 reset(token)（S11 配对），
+# 故 ContextVar 永不泄漏、协程/线程间互不串栈。
+_RUN_STACK: ContextVar[tuple[str, ...]]
 
 def load_definitions_from_dir(directory: str | Path) -> list[WorkflowDefinition]: ...
 
@@ -629,6 +665,55 @@ def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = Sand
   协议为 stdin/stdout 各恰好一个 JSON 文档（详见 S22）。
 - **R8**：两模块各 < 400 行，函数 < 50 行；AST 规则表与 `SAFE_BUILTINS` 为模块级常量，便于守护测试直接断言。
 
+### 4.15 `app/workflow/nodes/subworkflow_node.py` — 子工作流节点（S23/S24，2026-09-14 新增）
+
+```python
+# app/workflow/ports.py 新增（引擎内部端口，零 app.* 依赖）
+WorkflowRunner = Callable[[str, dict[str, Any], str], dict[str, Any]]
+"""(workflow_id, input_data, caller_label) -> 内层运行的输出摘要。
+
+第三参 caller_label 是发起调用的节点名，供被调方做日志前缀（S24）。
+引擎不感知其实现：生产为 WorkflowRegistry._run_nested 的 bound method，测试为 FakeRunner。
+与 ChatModelFactory 的差异见 §3 红线 4——本 callable 由**引擎自身**提供，组合根零改动。
+"""
+
+class SubWorkflowNodeConfig(BaseModel, extra="forbid"):
+    """引用另一个已注册工作流（S14 forbid extras）。"""
+
+    workflow_id: str                   # 非空；被引用工作流的存在性是**运行期**检查（注册期只校验结构，S18）
+    input_map: dict[str, str] = {}     # {内层 state 键: 外层 state 点路径}，路径语法同 S7
+    inherit_input: bool = False        # 为真则先把外层 state 全量传给内层，再叠加 input_map 结果
+
+class SubWorkflowNode(BaseNode):
+    """K5 插件类型（模块底部 register_node_type("subworkflow", SubWorkflowNode)，factory 无内置分支）。"""
+
+    def __init__(
+        self,
+        name: str,
+        config: dict[str, Any] | SubWorkflowNodeConfig,
+        node_type: str = "subworkflow",
+        operator_log: OperatorLog | None = None,
+        workflow_runner: WorkflowRunner | None = None,
+    ) -> None: ...
+    def validate_config(self) -> bool: ...
+    def build_runnable(self) -> Runnable: ...
+```
+
+**执行语义（R3 管线不变）**：`convert_state_to_dict` 进 → 组装内层输入（`inherit_input` 为真则先全量拷贝外层
+state，再叠加 `input_map` 解析结果，**后者优先**）→ `workflow_runner(workflow_id, inner_input, self.name)` →
+输出摘要（S24）→ `map_output_to_state` 出。
+
+**约束**：
+
+- `workflow_runner` 为 `None` → **`ConfigError`**（S20 分支②同款处置：**不静默降级**、不返回空 dict）。
+  静默降级会让「忘了注入 runner」表现为「子工作流什么都没做」，比直接失败难查得多。
+- `input_map` 的外层路径**不存在时跳过该键**（不写入内层输入，让内层按 S14 走声明默认值），
+  而非抛 `KeyError`——与 `{input}` 占位符渲染的既有容错口径一致。须有测试固定，否则易被写成报错。
+- **不得 import `registry` / `graph_builder`**（§3 红线 2）；只 import `ports` 的类型别名。
+- 节点自身 `ExecutionLog.output_data` **只记摘要**（S24），不内嵌内层完整输出与日志。
+- **R8**：< 250 行，函数 < 50 行。
+- 守护不变：`NodeType` 成员数恒 2（C8），`create_node` 内置分支恒 2（R4）。
+
 ## 5. 异常族契约
 
 **单点定义于 `app/workflow/models.py`**；其它模块与文档只引用，**不得各自另行定义**：
@@ -650,6 +735,8 @@ class PythonNodeError(WorkflowEngineError):
     """python 节点执行失败（inline code 编译/返回契约、entry 解析，以及 S22 沙箱超时/非零退出/输出非 dict）。"""
 class WorkflowValidationError(WorkflowEngineError):
     """注册期定义校验失败 → HTTP 422（S6 构建期优先）。承载 SSRF（spec-20）与沙箱 AST 预检（S22）两类原因。"""
+class NestedWorkflowError(WorkflowEngineError):
+    """嵌套执行守护触发（S23）：引用环（含自引用）或超过 max_nesting_depth。消息含完整运行栈。"""
 ```
 
 **规范化说明（2026-09-14）**：`WorkflowValidationError` 原定义于 `app/workflow/security.py`（spec-20 引入），
@@ -679,6 +766,10 @@ SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支�
 | python 节点（S22 沙箱）：超时 / 非零退出 / worker 报 `ok=false` / AST 执行期复检失败 | `PythonNodeError` | spec-22 |
 | HTTP 节点 URL 落入私网/环回/元数据段（SSRF） | `WorkflowValidationError` → 422 | spec-20 |
 | python 节点代码 AST 预检拒绝（import / dunder / 危险调用 / 超长） | `WorkflowValidationError` → 422 | spec-22 |
+| `subworkflow` 节点引用环（含自引用 A→A） | `NestedWorkflowError`（消息含完整栈，如 `a -> b -> a`） | S23 |
+| 嵌套深度超过 `max_nesting_depth` | `NestedWorkflowError`（消息含栈与上限值） | S23 |
+| `subworkflow` 节点未注入 `workflow_runner` | `ConfigError`（**不静默降级**，同 S20 分支②） | §4.15 |
+| 被引用的 `workflow_id` 未注册 | `WorkflowNotFoundError`（**沿用既有异常，不新增**） | §4.10 |
 
 ## 6. 行为语义契约
 
@@ -701,11 +792,13 @@ SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支�
 | S15 | 日志形态 | structlog；事件名 lowercase_with_underscores；kwargs 传参禁 f-string；`logger.exception()` 留 traceback；ExecutionLog/日志只记摘要（消息条数、method/url、配置摘要），**不含密钥与完整 state**（H6）【AD-02】 |
 | S16 | YAML 安全 | 全引擎只允许 `yaml.safe_load`（D6） |
 | S17 | YAML 落盘持久化（2026-09-07 新增） | 用户定义目录 `app/workflow/config/user/`（与只读 `examples/` 分离）；`PUT` 全量覆盖写 + 原子替换（对齐 S13 原子替换语义）；文件名 `workflow_id` 白名单校验 `^[A-Za-z0-9_-]{1,64}$`（防路径穿越）；`build_registry` 启动扫描 `examples/` + `user/`（S16 fail-fast 不变）；`DELETE` 同步删除对应 YAML 文件。落盘失败 → 500（message 携脱敏原因，H6） |
-| S18 | 节点类型 API 白名单（2026-09-07 新增，**2026-09-14 修订**） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http, python}`（`llm`/`http` 为 `NodeType` 枚举内置集 C8；`python` 为 K5 插件类型，见 §8 R1 carve-out）；未知类型 → HTTP 422。**修订要点**：`python` 由「一律拒绝（S15 非沙箱 RCE）」改为**有条件接受**，三条注册期条件全部满足方可通过：① **只允许 `code` 模式**——`config` 含 `entry` 即拒（`entry` 可 `importlib` 加载任意仓库模块，无法沙箱化）；② **AST 预检通过**——`validate_code_ast(config["code"])`（§4.14），失败 → 422（S6 构建期优先），`message` 携**行号 + 规则名**、不携代码正文（H6）；③ **服务端强制 `sandboxed=true`**——忽略并覆写客户端传入值，落盘 YAML 与注册进 registry 的定义中该字段恒为 `true`（`sandboxed` 是**安全属性**而非用户偏好，交给客户端等于把 RCE 开关暴露给请求方）。`ALLOWED_NODE_TYPES` 仍为 `frozenset`；无新端点，限流键复用 `workflows_save`。前端画布 palette 增列 `python`（体验层），但**安全边界始终在后端** |
+| S18 | 节点类型 API 白名单（2026-09-07 新增，**2026-09-14 两次修订**） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http, python, subworkflow}`（`llm`/`http` 为 `NodeType` 枚举内置集 C8；`python`/`subworkflow` 为 K5 插件类型，见 §8 R1 carve-out）；未知类型 → HTTP 422。**第一次修订要点**：`python` 由「一律拒绝（S15 非沙箱 RCE）」改为**有条件接受**，三条注册期条件全部满足方可通过：① **只允许 `code` 模式**——`config` 含 `entry` 即拒（`entry` 可 `importlib` 加载任意仓库模块，无法沙箱化）；② **AST 预检通过**——`validate_code_ast(config["code"])`（§4.14），失败 → 422（S6 构建期优先），`message` 携**行号 + 规则名**、不携代码正文（H6）；③ **服务端强制 `sandboxed=true`**——忽略并覆写客户端传入值，落盘 YAML 与注册进 registry 的定义中该字段恒为 `true`（`sandboxed` 是**安全属性**而非用户偏好，交给客户端等于把 RCE 开关暴露给请求方）。另：`code` 缺失/为空/纯空白 → 422（设计器默认 config 即空 code，前端预校验**不是**边界）。**第二次修订要点**：白名单加 `subworkflow`，注册期**仅结构校验**——`config["workflow_id"]` 须为非空 `str`，否则 422；**被引用工作流的存在性为运行期检查**（未注册 → `WorkflowNotFoundError`）。理由：`PUT wf_outer` 可能先于 `PUT wf_inner` 到达（前端逐个保存、脚本批量导入、或 inner 被删而 outer 仍在盘上），注册期存在性校验会强制拓扑序保存，把「顺序」变成隐性契约，比运行期报错更难排查。`ALLOWED_NODE_TYPES` 仍为 `frozenset`；无新端点，限流键复用 `workflows_save`。前端画布 palette 增列 `python`/`subworkflow`（体验层），但**安全边界始终在后端** |
 | S19 | 写端点鉴权（2026-09-07 新增） | `PUT` / `DELETE` 写端点须 `Depends(get_current_user)` + **管理员角色**校验；未授权 → HTTP 403。现状 `execute` 端点无鉴权（仅 slowapi 限流），本期不改动；写端点鉴权策略由后端联动任务补齐（前端按角色禁用写按钮，`docs/workflow-frontend-spec.md` §5.4） |
 | S20 | LLM 凭据解析（2026-09-11 新增） | `LLMConfig.provider_ref` 非空时，客户端由宿主注入的 `ChatModelFactory` 构建：`factory(provider_ref, overrides)`，`overrides` 携节点级 `temperature`（及 `max_tokens`，若设置），**节点配置优先于** `ModelConfig.extra_params`。凭据（api_key/base_url/model_id）全部来自 provider 表，**config 与 YAML 永不落密钥**（H6）。`_get_llm_instance()` 三分支：① `provider_ref` + 工厂 → 工厂路径；② `provider_ref` 但工厂为 `None` → **`ConfigError`**（消息含节点名与 ref，**不静默回退 env**——用错端点/密钥比直接失败更危险）；③ `provider_ref` 为空 → 现有 env 路径（`llm_type` 分支）逐字不变（向后兼容既有 YAML）。K10 memoize 不变：客户端按节点实例缓存，provider 换密钥需重新注册工作流方生效。`provider_ref` 存在性/enabled 校验在**注册期**完成（S6 构建期优先）：`PUT` 对每个携 `provider_ref` 的 llm 节点校验，失败 → HTTP 422 |
 | S21 | 运行输入合成（2026-09-11 新增） | `execute_workflow` 在 `graph.invoke` 前调用纯函数 `synthesize_run_input(definition, input_data)`（§4.10），规则按序：① `input_data["messages"]` 真值 → 原样透传（显式消息优先，向后兼容）；② 否则 `input_data["input"]` 为非空 `str` → **附加式**注入 `messages=[{"role":"user","content":<input>}]`（不删改任何用户键，`input` 键仍写入 state 供 `{input}` 占位符使用）；③ `input` 缺失/非 `str`/空白 → 不合成（缺失 channel 按 S14 走声明默认值，LLMNode 空 messages 仍按现状 `ValueError`）；④ 对**所有**工作流生效，不按节点类型特判（R2）；无 llm 节点时多余 `messages` 键被 langgraph 静默丢弃（S14）。wire 双形态兼容：`{"input":"hi"}` 与 `{"input":{"input":"hi",...}}` 均命中合成（`api.py` 解包逻辑不变）。本语义约束**运行入口的输入预处理**，不改变 `state.py`「状态模型构建不做字段名特判」原则 |
 | S22 | 沙箱执行（2026-09-14 新增） | `sandboxed=true` 的 python 节点，其代码**必须**在子进程中执行（`sandbox.run_sandboxed`，§4.14），**禁止任何形式的进程内 `exec`**；`sandboxed=false` 的既有受信仓库路径逐字不变。执行前复跑 `validate_code_ast`（纵深防御：调用方可能绕过 S18 注册期校验）。失败一律包 `PythonNodeError`（§5）。进程/协议/资源/日志细则见下方「S22 细则」表，均为**冻结约定**，实现不得自行放宽 |
+| S23 | 嵌套执行守护（2026-09-14 新增） | `subworkflow` 节点经注入的 `WorkflowRunner`（§4.15）回调 `WorkflowRegistry._run_nested`，后者递归调用 `execute_workflow`。递归**之前**必须过两道守护：① **环检测**——目标 id 已在运行栈中 → `NestedWorkflowError`（含完整栈）；② **深度上限**——`len(栈) >= max_nesting_depth` → `NestedWorkflowError`。绝不依赖 `RecursionError` 兜底（不属 `WorkflowEngineError` 家族，会穿透 CLI 异常分类）。细则见下方「S23 细则」表，均为**冻结约定** |
+| S24 | 内层日志合并（2026-09-14 新增） | 内层运行持**独立** `RunLogCollector`（S11 既有行为，零改动）；内层返回后，其 `execution_logs` 逐条以 `"{caller_label}/"` 前缀改写 `node_name` 后并入**外层** collector，使外层轨迹完整可读（形如 `sub_1/classify`）。`subworkflow` 节点自身的 `output_data` **只记摘要**，不内嵌内层完整输出与日志（否则同一份数据在轨迹里出现两次）。细则见下方「S24 细则」表，均为**冻结约定** |
 
 **S22 细则（冻结）：**
 
@@ -721,7 +814,29 @@ SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支�
 | 无网络 | stdlib 无法做 seccomp 级 syscall 过滤，本期防线是**能力剥夺**：AST 全禁 import + builtins 无 `__import__`/`open`/`getattr` + 空 env，使沙箱内代码在语言层面拿不到 `socket`/`urllib`/`http.client` 任何入口。生产建议叠加容器网络策略 |
 | 输出上限 | 父进程校验 `len(stdout) <= limits.max_output_bytes`，超限 → `PythonNodeError` |
 | 日志 | 只记摘要（`sandboxed` 布尔、代码长度、退出码、耗时），**绝不记代码正文与完整 state**（H6/S15）；事件名 lowercase_with_underscores，kwargs 传参禁 f-string（S15/AD-02） |
-| R3 不变 | 沙箱是 `PythonNode` 的内部执行策略：入口 `convert_state_to_dict` / 出口 `map_output_to_state` 管线、`_ensure_dict` 返回契约、`graph_builder.py` / `registry.py` / `state.py` / `factory.py` **全部零改动** |
+| R3 不变 | 沙箱是 `PythonNode` 的内部执行策略：入口 `convert_state_to_dict` / 出口 `map_output_to_state` 管线、`_ensure_dict` 返回契约、`graph_builder.py` / `registry.py` / `state.py` / `factory.py` **全部零改动**。**本行只约束 S22 沙箱变更**；S23/S24 因嵌套需要改动 `registry.py`（运行栈 + `_run_nested`）与 `factory.py`（`workflow_runner` 透传），见该两节，不构成本行的反例 |
+
+**S23 细则（冻结）：**
+
+| 维度 | 约定 |
+| --- | --- |
+| 运行栈 | `registry.py` 模块级 `_RUN_STACK: ContextVar[tuple[str, ...]]`，default `()`。`execute_workflow` 进入即 `set(_RUN_STACK.get() + (workflow_id,))`，`finally` 中 `reset(token)`——严格遵循 S11 配对纪律（与 `_RUN_COLLECTOR` 同款），故 ContextVar 永不泄漏、线程/协程间互不串栈 |
+| 环检测 | `_run_nested` 中 `workflow_id in _RUN_STACK.get()` → `NestedWorkflowError`，消息含**完整栈**（`" -> ".join(stack + (workflow_id,))`）。同 id 嵌套（A→A 自引用）**先被环检测拒**，不会走到 RLock 重入 |
+| 深度上限 | `len(_RUN_STACK.get()) >= max_nesting_depth` → `NestedWorkflowError`，消息含栈与上限值。**语义冻结：`max_nesting_depth` = 运行栈中允许同时存在的工作流数量上限（含最外层）**。默认 3 ⇒ `A→B→C` 可运行（栈深 3），`C` 再引用 `D` 被拒。**registry 级配置，不做 per-node 覆盖**（per-node 会让「全局最深」不可推断，守护形同虚设） |
+| 检查时机 | 环与深度检查都在 `_run_nested` **递归之前**，即「调用前拒绝」而非「进入后炸栈」。绝不依赖 Python `RecursionError` 兜底——它不属 `WorkflowEngineError` 家族，会穿透 CLI 的 `except WorkflowEngineError` 落到 catch-all，运维只见「unexpected error」 |
+| 死锁 | 同 id 嵌套被环检测先拒；不同 id 的嵌套是**同线程递归**，各持自己的 per-id `RLock`（可重入），故单线程无死锁。**跨线程 AB-BA 在理论上可达**（两个线程分别执行 `A→B` 与 `B→A`，各自栈内无重复 id，环检测不拦）：见 changelog §5 残留风险 2，本期不做全局锁序 |
+| 继承既有语义 | `_run_nested` 走的就是 `execute_workflow` 本身，不是另写一条执行路径，故内层**完整继承** S11（run-scoped 日志）、S12（definition execution_history 单槽）、S21（输入合成）。这是本设计最重要的性质：**嵌套不新增执行语义，只新增守护与日志编排** |
+
+**S24 细则（冻结）：**
+
+| 维度 | 约定 |
+| --- | --- |
+| 内层收集 | 内层 `execute_workflow` 自带独立 `RunLogCollector` 并绑定 `_RUN_COLLECTOR`（S11 既有行为，**零改动**）。同线程 ContextVar 嵌套 set/reset ⇒ 内层 collector 在外层看来是**临时遮蔽**，内层 `finally` reset 后外层 collector 自动恢复 |
+| 前缀合并 | 内层返回后，`_run_nested` 取 `result.execution_logs`，逐条 `model_copy(update={"node_name": f"{caller_label}/{原 node_name}"})` 后 `add` 进**外层** collector（经 `nodes/base.py` 既有的 `get_run_collector()` 取得，无需新增访问器）。外层轨迹因此形如 `sub_1/classify`、`sub_1/fetch` |
+| 多层复合 | 前缀**自然复合**，无需特判层数：C 的日志并入 B 时成 `sub_c/xxx`，B 的日志（已含该条）并入 A 时成 `sub_b/sub_c/xxx` |
+| 子节点自身 output | `SubWorkflowNode` 的 `ExecutionLog.output_data` **只记摘要** `{output_keys: [...], run_id, duration_ms, inner_log_count}`，**不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍且前后端都要去重）。内层业务数据经 R3 出口 `map_output_to_state` 正常写入外层 state，不丢失 |
+| 前端影响 | `WorkflowTraceDrawer` **零改动**：前缀名是普通字符串，直接展示即可读出层级 |
+| H6 | 合并的是既有 `ExecutionLog`（脱敏在 `api.py` 投影时由 `redact` 统一做），前缀化不引入新泄漏面；`caller_label` 是节点名（YAML 自有），非用户数据 |
 
 ## 7. 探索先行规则（R-EXP）
 
@@ -740,7 +855,7 @@ SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支�
 
 | 编号 | 一句话 | 机器检查方法 |
 | --- | --- | --- |
-| R1 | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增**内置**节点类型或领域逻辑。**carve-out（2026-09-14）**：`python` 是 K5 **插件类型**（`register_node_type` 任意字符串注册、factory 无内置分支、不入 `NodeType` 枚举 C8），不构成 R1 意义上的新增内置节点类型；其 API 可达性由 S18/S22 单独约束 | `ls app/workflow/nodes/` 对白名单；`grep -rn "plan\|worker\|dispatcher" app/workflow/` 仅出现于"未来扩展"注释；`NodeType` 成员数守护测试（**恒为 2，不因 python 改变**） |
+| R1 | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增**内置**节点类型或领域逻辑。**carve-out（2026-09-14）**：`python` 与 `subworkflow` 均是 K5 **插件类型**（`register_node_type` 任意字符串注册、factory 无内置分支、不入 `NodeType` 枚举 C8），不构成 R1 意义上的新增内置节点类型；`python` 的 API 可达性由 S18/S22 约束，`subworkflow` 的由 S18 结构校验与 S23 执行守护约束 | `ls app/workflow/nodes/` 对白名单；`grep -rn "plan\|worker\|dispatcher" app/workflow/` 仅出现于"未来扩展"注释；`NodeType` 成员数守护测试（**恒为 2，不因 python/subworkflow 改变**） |
 | R2 | reducer 只来自 YAML 显式声明，禁止硬编码业务字段名 | `grep -nE "circle_\|planner_\|worker_\|reflector_\|current_node" app/workflow/state.py` 零命中；守护测试 `test_no_hardcoded_field_names` |
 | R3 | 节点 convert_state_to_dict 进 / map_output_to_state 出，禁止 mutate 输入 state | 节点 func 代码审查；R3 进出管线测试（spec-04/05 契约测试） |
 | R4 | 新节点必须经 register_node_type 注册，create_node 内置分支恰好 2 个 | 守护测试断言内置分支数 == 2 且为 `("llm","LLM")` / `("http","HTTP")` 大小写集合；`grep -n "elif" app/workflow/nodes/factory.py` 人工核对 |
@@ -840,6 +955,7 @@ grep -rni "dispatcher\|triage\|subgraph" app/workflow/
 | 2026-09-11 | 运行输入合成：§4.10 新增模块级纯函数 `synthesize_run_input(definition, input_data)`；§6 新增 S21（`execute_workflow` 在 `graph.invoke` 前把非空 `input` str 附加式合成为 `messages=[{"role":"user","content":...}]`；`messages` 已存在则透传；对所有工作流生效、不按节点类型特判） | §4.10 / §6（S21） | `docs/changelog/workflow-input-synthesis/spec-01-contract-change.md` | 纯契约变更，提交 `docs:`；引擎仅 registry 一行接线，`api.py`/`cli.py`/`state.py`/`llm_node.py` 零改动。**动机**：执行含 LLM 节点的工作流须手写完整 langchain 消息结构，`messages` 实为引擎内置通道而非业务字段 |
 | 2026-09-14 | Python 节点真沙箱：§2.1 新增 `app/workflow/sandbox.py`、`app/workflow/sandbox_worker.py`（并补录 5 个早已落地却漏记的模块 `auth.py`/`ports.py`/`security.py`/`store.py`/`nodes/python_node.py`，计数 15→22）；新增 §4.14 冻结 `validate_code_ast` / `SandboxLimits` / `run_sandboxed`；§5 异常族规范化（`PythonNodeError` 补入冻结块；`WorkflowValidationError` 从 `security.py` **迁入 `models.py`** 并改挂 `WorkflowEngineError`）；**S18 修订**（白名单 `{llm,http}` → `{llm,http,python}`，`python` 须 code-only + AST 通过 + 服务端强制 `sandboxed=true`）；§6 新增 S22（子进程沙箱执行）及其「S22 细则」冻结表（进程隔离 `-I` / 单 JSON 文档协议 / 退出码 0-2-3 / 超时 kill / POSIX rlimit / 空 env / `SAFE_BUILTINS` / 输出上限 / 摘要日志）；§8 R1 追加 K5 插件 carve-out（`NodeType` 恒 2 成员、R4 内置分支恒 2，守护测试不动） | §2.1 / §4.13 / §4.14 / §5 / §6（S18 修订、S22 新增）/ §8（R1） | `docs/changelog/workflow-python-sandbox/spec-01-contract-change.md`；同步 `docs/workflow-node-development.md` §5.1-5.5 与红线表 R1；同步 `docs/workflow-frontend-spec.md` §2.1（Out 行）/ §5.1（节点类型白名单）/ §7（NodeDTO type）/ §8（`validateGraph` 预校验）/ §9（组件树 + `PythonNodeForm.vue`）/ §13（测试覆盖点）/ §14（验收） | 纯契约变更，提交 `docs:`；下游代码提交用 `refactor!`（`PythonNodeConfig` 新增 `sandboxed` + 互斥校验扩展）。**动机**：`PythonNode` 现为进程内非沙箱 `exec`，S18 因此把 `python` 挡在 HTTP 之外——代价是设计器画不出 python 节点，用户做一点数据加工只能塞进 LLM 提示词或外部 HTTP 服务。S18 挡住的是**实现方式**，不是节点类型的价值 |
 | 2026-09-14 | **S22 rlimit 机制修订（§7.5 实测触发）**：资源上限由「父进程 `preexec_fn` 施加」改为「**worker 启动后自我施加**，逐项容错 + `applied`/`refused` 报告」；通信协议 stdin 文档新增 `limits` 入参、stdout 文档新增 `limits` 报告；父进程明确**禁用 `preexec_fn`**，`sandbox_rlimit_partial` warning 改由 worker 的 `refused` 派生 | §6（S22 细则：通信协议、资源上限） | `docs/changelog/workflow-python-sandbox/spec-01-contract-change.md` §2.2/§5；`docs/workflow-node-development.md` §5.2/§5.5 | **实测**：darwin 25.3.0 / CPython 3.13 上 `setrlimit(RLIMIT_AS, ...)` 抛 `ValueError: current limit exceeds maximum limit`，而 `preexec_fn` 内抛异常使 `subprocess.run` 整体失败 → macOS 上**每一次**沙箱调用都会失败（原备注假设「macOS 常忽略 `RLIMIT_AS`，不阻断执行」，与实测不符）。**备选方案对比**：① 保留 `preexec_fn` 但整体 try/except 吞掉 —— 内存上限静默失效且无可观测性，且 `preexec_fn` 在多线程宿主（FastAPI）中官方标注不安全，未解决根因；② **worker 自我施加（采纳）** —— 修复 macOS 全量失败，去掉 `preexec_fn` 线程安全隐患，逐项容错换来 `applied`/`refused` 一等可观测性；代价是协议多一个 `limits` 键（双向），属冻结行变更；③ 完全放弃 rlimit，只留 timeout + 容器策略 —— Linux 生产同样失去内存/fork 进程级防线，削弱纵深防御，不采纳。**动机**：契约冻结的机制在目标平台上不可运行，编码前必须先改契约（§11.3「禁止先改代码后补契约」） |
+| 2026-09-14 | 子工作流（嵌套）节点：§2.1 新增 `nodes/subworkflow_node.py`（计数 22→23）；§2.2「子图嵌套」禁止条目加**解禁令注解**（langgraph 原生 subgraph 与 `Send` 仍禁，registry 注入式嵌套解禁）；§3 红线 4 补 `WorkflowRunner` 为第二类不透明 callable（**引擎自注入**，组合根零改动）；新增 §4.15 冻结 `WorkflowRunner` / `SubWorkflowNodeConfig` / `SubWorkflowNode`；§4.5 `create_node`、§4.9 `GraphBuilder.__init__` 各新增可选 `workflow_runner`，§4.10 `WorkflowRegistry.__init__` 新增 `max_nesting_depth=3` 并冻结私有 `_run_nested` 与模块级 `_RUN_STACK`（`execute_workflow` 签名不变）；§5 新增 `NestedWorkflowError` + 4 行场景映射；**S18 第二次修订**（白名单加 `subworkflow`，注册期仅结构校验，被引用存在性为运行期检查）；§6 新增 **S23 嵌套执行守护** 与 **S24 内层日志合并** 及两张冻结细则表；§8 R1 carve-out 扩展至 `subworkflow` | §2.1 / §2.2 / §3 / §4.5 / §4.9 / §4.10 / §4.15（新增）/ §5 / §6（S18 修订、S23-S24 新增）/ §8（R1） | `docs/changelog/workflow-subworkflow-node/spec-01-contract-change.md`；同步 `docs/workflow-node-development.md`（§1.3 节点清单加行、**新增 §6 SubWorkflowNode 章节**、§7.1「插件可选注入参数」+ §7.2 构造契约、§9 红线表 R1 行；原 §6-§9 顺延为 §7-§10，两处自引用 §6.3/§7.2 同步改为 §7.3/§8.2）与 `docs/workflow-frontend-spec.md` §2.1（Out 行）/ §5.1（白名单 + subworkflow 前端约束）/ §7（NodeDTO type）/ §8（映射表 + `validateGraph`）/ §9（组件树 + `SubWorkflowNodeForm.vue`）/ §12（测试覆盖点）/ §14（验收） | 纯契约变更，提交 `docs:`；下游代码提交用 `refactor!`（三处构造签名新增带默认值的可选参，向后兼容）。**动机**：工作流无法组合，复用只能复制 YAML，两份定义各自漂移正是 H 系列隐患的常见来源。嵌套初版被 defer 的理由是 H5（构建期快照）与 H3（日志收集），二者根因都是「节点直接认识注册表」——改用不透明 callable 注入后 H5 不成立，H3 由 S24 正面解决。**拍板记录**：`workflow_runner` 从 factory 传到插件节点的方式，用户 2026-09-14 选定**方案 A `inspect.signature` 探测**（否决 B「给 `BaseNode.__init__` 加可选参」——触碰 §4.4 冻结签名且三个既有节点构造全受影响；否决 C「节点从 ContextVar 自取」——把装配期依赖藏进全局态，与 H5 精神相悖）。三案影响面对比见 changelog §3 |
 
 ## 12. 每 Phase 交付自检表
 
