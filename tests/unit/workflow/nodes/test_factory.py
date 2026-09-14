@@ -95,3 +95,82 @@ def test_registry_isolated_between_tests() -> None:
     """The autouse snapshot-restore fixture keeps registrations from leaking (D7/AD-08)."""
     assert "fake" not in list_node_types()
     assert "fake" not in factory._NODE_REGISTRY  # noqa: SLF001 — asserting isolation per AD-08
+
+
+# --- optional injected parameters: signature probing (CONTRACT §4.5, node-development §7.1) ---
+
+
+class _RunnerAwareNode(FakeNode):
+    """Plugin that declares the optional injected parameter."""
+
+    received_runner: object = None
+
+    def __init__(self, *args: object, workflow_runner: object = None, **kwargs: object) -> None:
+        _RunnerAwareNode.received_runner = workflow_runner
+        super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType] — test double wiring
+
+
+class _PlainNode(FakeNode):
+    """Plugin that knows nothing about workflow_runner (the PythonNode situation)."""
+
+
+class _KwargsNode(FakeNode):
+    """Plugin swallowing arbitrary kwargs — probing must treat VAR_KEYWORD as accepting."""
+
+    seen: dict[str, object] = {}
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        _KwargsNode.seen = dict(kwargs)
+        # BaseNode.__init__ has no such parameter, so a real **kwargs plugin must consume it itself
+        kwargs.pop("workflow_runner", None)
+        super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType] — test double wiring
+
+
+def _fake_runner() -> object:
+    return lambda workflow_id, input_data, caller_label: {"output": {}, "run_id": "r", "inner_log_count": 0}
+
+
+@pytest.mark.unit
+def test_plugin_declaring_workflow_runner_receives_it() -> None:
+    """Probing finds the declared parameter and passes the injected callable."""
+    register_node_type("runner_aware", _RunnerAwareNode)
+    runner = _fake_runner()
+    node = create_node(NodeDefinition(name="n1", type="runner_aware", config={}), workflow_runner=runner)
+    assert isinstance(node, _RunnerAwareNode)
+    assert _RunnerAwareNode.received_runner is runner
+
+
+@pytest.mark.unit
+def test_plugin_without_the_parameter_is_unaffected() -> None:
+    """Probing must not pass the kwarg to a class that cannot accept it (no TypeError)."""
+    register_node_type("plain", _PlainNode)
+    node = create_node(NodeDefinition(name="n1", type="plain", config={}), workflow_runner=_fake_runner())
+    assert isinstance(node, _PlainNode)
+
+
+@pytest.mark.unit
+def test_plugin_with_var_keyword_receives_it() -> None:
+    """A **kwargs plugin is treated as accepting, per the frozen probing rule."""
+    register_node_type("kwargs_node", _KwargsNode)
+    runner = _fake_runner()
+    create_node(NodeDefinition(name="n1", type="kwargs_node", config={}), workflow_runner=runner)
+    assert _KwargsNode.seen.get("workflow_runner") is runner
+
+
+@pytest.mark.unit
+def test_no_runner_passed_when_none() -> None:
+    """Probing still runs when the value is None, so a declaring plugin gets an explicit None."""
+    register_node_type("runner_aware", _RunnerAwareNode)
+    _RunnerAwareNode.received_runner = "stale"
+    create_node(NodeDefinition(name="n1", type="runner_aware", config={}))
+    assert _RunnerAwareNode.received_runner is None
+
+
+@pytest.mark.unit
+def test_builtin_branches_ignore_workflow_runner() -> None:
+    """The two built-in branches keep their specialized constructors; R4 count stays 2."""
+    node = create_node(
+        NodeDefinition(name="http_a", type="http", config={"url": "https://api.example.com/v1"}),
+        workflow_runner=_fake_runner(),
+    )
+    assert isinstance(node, HTTPNode)

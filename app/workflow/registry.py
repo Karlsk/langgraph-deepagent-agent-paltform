@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,15 +29,26 @@ from pydantic import ValidationError
 from app.workflow.graph_builder import GraphBuilder
 from app.workflow.models import (
     ExecutionLog,
+    NestedWorkflowError,
     OperatorLog,
     WorkflowDefinition,
     WorkflowNotFoundError,
     load_definition_from_yaml,
 )
-from app.workflow.nodes.base import _RUN_COLLECTOR, BaseNode, set_run_collector  # noqa: SLF001 — token reset per S11
+from app.workflow.nodes.base import (  # noqa: SLF001 — token reset per S11
+    _RUN_COLLECTOR,
+    BaseNode,
+    get_run_collector,
+    set_run_collector,
+)
 from app.workflow.ports import ChatModelFactory
 
 logger = structlog.get_logger(__name__)
+
+# Workflows currently executing, outermost first (S23). Pushed by execute_workflow
+# and reset in its finally, the same paired discipline as _RUN_COLLECTOR (S11), so
+# it never leaks between runs and never crosses threads or coroutines.
+_RUN_STACK: ContextVar[tuple[str, ...]] = ContextVar("workflow_run_stack", default=())
 
 
 @dataclass(frozen=True)
@@ -121,16 +133,29 @@ class WorkflowRegistry:
         *,
         no_match_policy: Literal["raise", "default"] = "raise",
         chat_model_factory: ChatModelFactory | None = None,
+        max_nesting_depth: int = 3,
     ) -> None:
-        """Create an empty registry with the given condition-router no-match policy."""
+        """Create an empty registry with the given condition-router no-match policy.
+
+        ``max_nesting_depth`` (S23) counts the workflows allowed on the run stack
+        **at once, outermost included**, so the default 3 runs ``a -> b -> c`` and
+        rejects a fourth. It is registry-level on purpose: a per-node override
+        would make the global maximum uninferrable and the guard worthless.
+
+        The builder receives this registry's own bound ``_run_nested`` as its
+        ``workflow_runner`` — self-injection, which is why the composition root
+        (``app/main.py``, ``cli.py``) needs no wiring for nesting.
+        """
         self._registry: dict[str, Any] = {}
         self._definitions: dict[str, WorkflowDefinition] = {}
         self._nodes_map: dict[str, dict[str, BaseNode]] = {}
         self._run_locks: dict[str, threading.RLock] = {}
         self._meta_lock = threading.RLock()
+        self._max_nesting_depth = max_nesting_depth
         self._builder = GraphBuilder(
             no_match_policy=no_match_policy,
             chat_model_factory=chat_model_factory,
+            workflow_runner=self._run_nested,
         )
 
     # -- registration ---------------------------------------------------------
@@ -194,33 +219,106 @@ class WorkflowRegistry:
         ContextVar never leaks. Node exceptions propagate to the caller
         unchanged (EXP-G7). The definition's execution_history keeps only the
         latest run (S12, bounded).
+
+        The workflow id is also pushed onto ``_RUN_STACK`` for the duration of the
+        run and popped in the finally (S23), which is what lets a nested call see
+        its callers and reject cycles or excess depth before recursing.
         """
         workflow = self.get_workflow(workflow_id)
         definition = self._definitions[workflow_id]
         run_lock = self._get_run_lock(workflow_id)
-        with run_lock:
-            run_id = uuid.uuid4().hex
-            collector = RunLogCollector(run_id)
-            started_at = datetime.now()
-            token = set_run_collector(collector)
-            try:
-                output = workflow.invoke(synthesize_run_input(definition, input_data))
-            except Exception:
-                logger.exception("workflow_execution_failed", workflow_id=workflow_id, run_id=run_id)
-                raise
-            finally:
-                _RUN_COLLECTOR.reset(token)  # noqa: SLF001 — paired set/reset (S11)
-            finished_at = datetime.now()
-            logs = collector.collect()
-            definition.execution_history = logs
-            return RunResult(
-                workflow_id=workflow_id,
-                run_id=run_id,
-                output=output,
-                execution_logs=logs,
-                started_at=started_at,
-                finished_at=finished_at,
-            )
+        stack_token = _RUN_STACK.set((*_RUN_STACK.get(), workflow_id))
+        try:
+            with run_lock:
+                run_id = uuid.uuid4().hex
+                collector = RunLogCollector(run_id)
+                started_at = datetime.now()
+                token = set_run_collector(collector)
+                try:
+                    output = workflow.invoke(synthesize_run_input(definition, input_data))
+                except Exception:
+                    logger.exception("workflow_execution_failed", workflow_id=workflow_id, run_id=run_id)
+                    raise
+                finally:
+                    _RUN_COLLECTOR.reset(token)  # noqa: SLF001 — paired set/reset (S11)
+                finished_at = datetime.now()
+                logs = collector.collect()
+                definition.execution_history = logs
+                return RunResult(
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    output=output,
+                    execution_logs=logs,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
+        finally:
+            _RUN_STACK.reset(stack_token)  # paired set/reset (S11/S23)
+
+    # -- nesting (S23/S24) ----------------------------------------------------
+
+    def _run_nested(self, workflow_id: str, input_data: dict[str, Any], caller_label: str) -> dict[str, Any]:
+        """Execute a referenced workflow on behalf of a ``subworkflow`` node.
+
+        This bound method is the ``WorkflowRunner`` the builder injects, so the
+        node never learns what a registry is (red line 2) and the compiled graph
+        holds no registry snapshot (H5).
+
+        Guards run **before** recursing, so a cycle or excess depth is refused
+        rather than discovered as a ``RecursionError`` — which is not part of the
+        ``WorkflowEngineError`` family and would escape the CLI's classification.
+        Recursing through ``execute_workflow`` means the inner run inherits its
+        own per-id RLock, its own log collector and S21 input synthesis: nesting
+        adds guards and log orchestration, never a second execution path.
+
+        Returns:
+            The frozen three-key envelope ``{"output", "run_id", "inner_log_count"}``
+            (CONTRACT §4.15). ``output`` is the inner workflow's whole final state.
+
+        Raises:
+            NestedWorkflowError: If the id is already on the run stack (a cycle,
+                self-reference included) or the depth limit is reached.
+            WorkflowNotFoundError: If the referenced workflow is not registered —
+                existence is deliberately a runtime check (S18), so saving an
+                outer workflow before its inner one is allowed.
+        """
+        stack = _RUN_STACK.get()
+        path = " -> ".join((*stack, workflow_id))
+        if workflow_id in stack:
+            msg = f"nested workflow cycle detected: {path}"
+            raise NestedWorkflowError(msg)
+        if len(stack) >= self._max_nesting_depth:
+            msg = f"nested workflow depth limit {self._max_nesting_depth} exceeded: {path}"
+            raise NestedWorkflowError(msg)
+
+        result = self.execute_workflow(workflow_id, input_data)
+        self._merge_inner_logs(result.execution_logs, caller_label)
+        logger.debug(
+            "nested_workflow_completed",
+            workflow_id=workflow_id,
+            caller=caller_label,
+            inner_run_id=result.run_id,
+            inner_log_count=len(result.execution_logs),
+            depth=len(stack) + 1,
+        )
+        return {
+            "output": result.output,
+            "run_id": result.run_id,
+            "inner_log_count": len(result.execution_logs),
+        }
+
+    @staticmethod
+    def _merge_inner_logs(inner_logs: list[ExecutionLog], caller_label: str) -> None:
+        """Copy the inner logs into the outer collector, prefixed with the caller (S24).
+
+        Prefixes compose naturally, so no per-layer special-casing is needed: C's
+        log reaches B as ``sub_c/c1`` and then reaches A as ``sub_b/sub_c/c1``.
+        """
+        outer = get_run_collector()
+        # Narrowing for pyright: inside a run the outer collector always exists (S11).
+        if outer is not None:
+            for log in inner_logs:
+                outer.add(log.model_copy(update={"node_name": f"{caller_label}/{log.node_name}"}))
 
     # -- queries --------------------------------------------------------------
 

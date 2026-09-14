@@ -13,6 +13,7 @@ from app.workflow.models import (
     ConfigError,
     HTTPNodeError,
     LLMNodeError,
+    NestedWorkflowError,
     NodeType,
     PythonNodeError,
     WorkflowDefinition,
@@ -172,6 +173,7 @@ def test_exception_hierarchy() -> None:
         HTTPNodeError,
         PythonNodeError,
         WorkflowValidationError,
+        NestedWorkflowError,
     ):
         assert issubclass(exc_type, WorkflowEngineError)
         assert issubclass(exc_type, Exception)

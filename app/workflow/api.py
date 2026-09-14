@@ -122,7 +122,13 @@ def _serialize_execution_logs(logs: list[ExecutionLog]) -> list[dict[str, Any]]:
     return [redact(log.model_dump(mode="json"), max_len=500) for log in logs]
 
 
-ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http", "python"})
+ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http", "python", "subworkflow"})
+# `subworkflow` needs no check of its own here (S18 structural validation):
+# SubWorkflowNodeConfig already rejects a missing/blank/non-string workflow_id, and
+# that runs during register_workflow below — inside this same handler, so the 422
+# S18 requires still comes from one source of truth instead of two.
+# `python` does need _enforce_python_node_policy because PythonNodeConfig accepts
+# any code string, and because sandboxed must be forced regardless of the body.
 
 
 def _enforce_python_node_policy(node: NodeDefinition) -> None:

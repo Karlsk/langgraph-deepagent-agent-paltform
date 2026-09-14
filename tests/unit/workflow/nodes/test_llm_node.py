@@ -609,13 +609,27 @@ def test_provider_ref_factory_client_is_used_for_invocation() -> None:
 
 @pytest.mark.unit
 def test_engine_modules_stay_free_of_host_imports() -> None:
-    """Red line 4 guard: the injection port and llm_node import nothing from app.core/app.services.
+    """Red line 4 guard: engine modules import nothing from app.core/app.services/app.api.
 
-    The ChatModelFactory exists precisely so the engine can consume provider-backed
-    credentials without acquiring a host dependency (CONTRACT §3, S20).
+    The injection ports exist precisely so the engine can consume host capability
+    without acquiring a host dependency (CONTRACT §3, S20/S23).
+
+    This walks the package rather than enumerating files: the original hand-written
+    list had already silently missed ``python_node.py``, ``sandbox.py`` and
+    ``sandbox_worker.py``, so any newly added module escaped the guard by default.
+    Only the three entry-layer modules §3 exempts are skipped.
     """
+    entry_layer = {"api.py", "auth.py", "security.py"}
     pattern = re.compile(r"^\s*(?:from|import)\s+app\.(?:core|services|api)\b", re.MULTILINE)
     root = Path(__file__).resolve().parents[4] / "app" / "workflow"
-    for relative in ("ports.py", "nodes/llm_node.py", "nodes/factory.py", "graph_builder.py", "registry.py"):
-        source = (root / relative).read_text(encoding="utf-8")
+    scanned: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        if path.name in entry_layer:
+            continue
+        relative = str(path.relative_to(root))
+        scanned.add(relative)
+        source = path.read_text(encoding="utf-8")
         assert not pattern.search(source), f"{relative} must not import app.core/app.services/app.api"
+    # Guards against a broken path calculation making the loop above vacuously pass.
+    assert {"registry.py", "graph_builder.py", "nodes/subworkflow_node.py"} <= scanned
+    assert len(scanned) >= 20

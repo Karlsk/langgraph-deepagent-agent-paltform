@@ -761,6 +761,67 @@ def test_save_workflow_python_sandboxed_flag_is_forced(save_client: TestClient) 
     assert mock_save.call_args[0][0].nodes[0].config["sandboxed"] is True
 
 
+def _subworkflow_payload(config: dict[str, Any], workflow_id: str = "wf_outer") -> dict[str, Any]:
+    """A minimal single-node definition carrying one ``subworkflow`` node."""
+    return {
+        "workflow_id": workflow_id,
+        "entry_point": "call_inner",
+        "nodes": [{"name": "call_inner", "type": "subworkflow", "config": config}],
+        "edges": [{"source": "call_inner", "target": "END"}],
+        "state_schema": {"input": {"type": "str", "description": "x"}},
+    }
+
+
+def test_save_workflow_subworkflow_node_accepted(save_client: TestClient) -> None:
+    """S18 second revision: subworkflow is whitelisted, and its config passes through untouched."""
+    payload = _subworkflow_payload({"workflow_id": "wf_inner", "inherit_input": True})
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        mock_save.return_value = Path("/fake/wf_outer.yaml")
+        response = save_client.put("/workflows/wf_outer", json=payload)
+
+    assert response.status_code == 200
+    config = response.json()["data"]["nodes"][0]["config"]
+    assert config == {"workflow_id": "wf_inner", "inherit_input": True}
+    assert save_client.app.state.workflow_registry.has_workflow("wf_outer")
+
+
+def test_save_workflow_subworkflow_dangling_reference_accepted(save_client: TestClient) -> None:
+    """S18: referential existence is a *runtime* check, so saving the outer first must work.
+
+    A registration-time existence check would force topological save order and turn
+    ordering into an implicit contract; the run reports WorkflowNotFoundError instead.
+    """
+    payload = _subworkflow_payload({"workflow_id": "wf_not_registered_yet"}, workflow_id="wf_dangling")
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        mock_save.return_value = Path("/fake/wf_dangling.yaml")
+        response = save_client.put("/workflows/wf_dangling", json=payload)
+
+    assert response.status_code == 200
+    assert save_client.app.state.workflow_registry.has_workflow("wf_dangling")
+
+
+@pytest.mark.parametrize("config", [{}, {"workflow_id": ""}, {"workflow_id": "   "}, {"workflow_id": 123}])
+def test_save_workflow_subworkflow_bad_id_rejected(save_client: TestClient, config: dict[str, Any]) -> None:
+    """S18 structural validation: workflow_id must be a non-empty string, else 422."""
+    payload = _subworkflow_payload(config, workflow_id="wf_bad")
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        response = save_client.put("/workflows/wf_bad", json=payload)
+
+    assert response.status_code == 422
+    assert "workflow_id" in response.json()["message"]
+    assert not save_client.app.state.workflow_registry.has_workflow("wf_bad")
+    mock_save.assert_not_called()
+
+
 def test_save_workflow_dangling_edge_returns_422(save_client: TestClient) -> None:
     """S6: dangling edge (target not in nodes, not END) → 422."""
     from unittest.mock import patch

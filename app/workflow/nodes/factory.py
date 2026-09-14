@@ -6,14 +6,22 @@ plugin registry (generic BaseNode interface), then ValueError for unknown
 types. Built-in classes are top-level imported (AD-04); the llm/http imports
 sit at the bottom of this module to break the self-registration import cycle.
 
+Optional injected parameters reach plugins by **signature probing** (CONTRACT
+§4.5, node-development §7.1): the plugin branch passes ``workflow_runner`` only
+to classes whose ``__init__`` declares it or accepts ``**kwargs``. That keeps
+``BaseNode``'s frozen signature (§4.4) free of a parameter most nodes would
+never use, and leaves every existing plugin untouched.
+
 Dependency red-line 2: never import registry / graph_builder here.
 """
 
 from __future__ import annotations
 
+import inspect
+
 from app.workflow.models import NodeDefinition, OperatorLog
 from app.workflow.nodes.base import BaseNode
-from app.workflow.ports import ChatModelFactory
+from app.workflow.ports import ChatModelFactory, WorkflowRunner
 
 _NODE_REGISTRY: dict[str, type[BaseNode]] = {}
 
@@ -31,14 +39,29 @@ def list_node_types() -> list[str]:
     return list(_NODE_REGISTRY)
 
 
+def _accepts_kwarg(node_class: type[BaseNode], kwarg: str) -> bool:
+    """Whether the plugin's ``__init__`` can take ``kwarg`` (§7.1 probing rule).
+
+    A class swallowing ``**kwargs`` counts as accepting: it can receive the value
+    whether or not it names it, and withholding it would silently drop an
+    injection such a plugin asked for by accepting arbitrary keywords.
+    """
+    parameters = inspect.signature(node_class.__init__).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return kwarg in parameters
+
+
 def create_node(
     definition: NodeDefinition,
     operator_log: OperatorLog | None = None,
     chat_model_factory: ChatModelFactory | None = None,
+    workflow_runner: WorkflowRunner | None = None,
 ) -> BaseNode:
     """内置优先（恰好 2 分支）→ 插件注册表兜底 → 未知 ValueError（R4，方案 A）.
 
-    ``chat_model_factory`` 仅透传给 llm 分支（S20）：它是不透明 callable 而非注册表，
+    ``chat_model_factory`` 仅透传给 llm 分支（S20）；``workflow_runner`` 按签名探测
+    透传给声明了它的插件（S23/S24）。两者都是不透明 callable 而非注册表，
     故不违反 H5「factory 无 workflow_registry 参数」。
     """
     op_log = operator_log or OperatorLog(node_name=definition.name, input_schema={}, output_schema={})
@@ -52,14 +75,18 @@ def create_node(
         )
     if definition.type in ("http", "HTTP"):
         return _http_node.HTTPNode(name=definition.name, config=definition.config, operator_log=op_log)
-    # 2. 插件注册表（generic BaseNode interface）
+    # 2. 插件注册表（generic BaseNode interface）+ 可选注入参数按签名探测
     if definition.type in _NODE_REGISTRY:
         node_class = _NODE_REGISTRY[definition.type]
+        injected: dict[str, WorkflowRunner | None] = (
+            {"workflow_runner": workflow_runner} if _accepts_kwarg(node_class, "workflow_runner") else {}
+        )
         return node_class(
             name=definition.name,
             node_type=definition.type,
             config=definition.config,
             operator_log=op_log,
+            **injected,
         )
     # 3. 未知类型
     registered = list_node_types()
@@ -77,3 +104,4 @@ def create_node(
 import app.workflow.nodes.http_node as _http_node  # noqa: E402
 import app.workflow.nodes.llm_node as _llm_node  # noqa: E402
 import app.workflow.nodes.python_node  # noqa: E402, F401 — 触发 "python" 插件类型自注册（K5）
+import app.workflow.nodes.subworkflow_node  # noqa: E402, F401 — 触发 "subworkflow" 插件类型自注册（K5，S23/S24）

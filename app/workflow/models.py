@@ -54,6 +54,16 @@ class WorkflowValidationError(WorkflowEngineError):
     """
 
 
+class NestedWorkflowError(WorkflowEngineError):
+    """Nesting guard tripped (S23): a reference cycle, or ``max_nesting_depth`` exceeded.
+
+    The message always carries the full run stack (``a -> b -> a``) so the offending
+    YAML can be found without re-running. Raised before recursing, never as a
+    ``RecursionError`` — that is not part of this family and would escape the CLI's
+    ``except WorkflowEngineError`` classification.
+    """
+
+
 class NodeType(str, Enum):
     """Built-in node types for this phase (trimmed set, C8).
 
