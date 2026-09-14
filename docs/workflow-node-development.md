@@ -318,8 +318,9 @@ CONTRACT §8 R1 已就此追加 carve-out。它能否经 `PUT /api/v1/workflows/
 3. **服务端强制 `sandboxed=true`**：忽略并覆写客户端传值。`sandboxed` 是**安全属性**而非用户偏好，
    交给客户端等于把 RCE 开关暴露给请求方。
 
-沙箱本身的冻结约定（子进程 `sys.executable -I`、单 JSON 文档协议、退出码 0/2/3、`timeout` kill、
-POSIX rlimit、`env={"PATH":"/usr/bin:/bin"}` 不继承宿主环境、`SAFE_BUILTINS` 白名单、输出上限、摘要日志）
+沙箱本身的冻结约定（子进程 `sys.executable -I`、单 JSON 文档协议（含 `limits` 入参与 `applied`/`refused` 回报）、
+退出码 0/2/3、`timeout` kill、**worker 自我施加**的 POSIX rlimit（逐项容错，父进程禁用 `preexec_fn`）、
+`env={"PATH":"/usr/bin:/bin"}` 不继承宿主环境、`SAFE_BUILTINS` 白名单、输出上限、摘要日志）
 见 CONTRACT §6「S22 细则」表。两点必须记住：
 
 - **沙箱不是绝对安全**，而是把「经 HTTP 注册的代码」从*等价 RCE* 降到*受限于纯计算 + 有限资源*；

@@ -49,7 +49,7 @@ def validate_code_ast(code: str) -> None:
 
 @dataclass(frozen=True)
 class SandboxLimits:
-    """沙箱资源上限（POSIX best-effort，见 §5 残留风险）。"""
+    """沙箱资源上限（由 worker 逐项自我施加，失败项经 applied/refused 回报，见 §5 残留风险 1）。"""
 
     timeout_s: float = 10.0
     max_memory_mb: int = 256
@@ -100,10 +100,10 @@ def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = Sand
 | 维度 | 冻结约定 |
 | --- | --- |
 | 进程隔离 | `subprocess.run([sys.executable, "-I", <sandbox_worker.py 绝对路径>], ...)`。`-I`（isolated）忽略 `PYTHON*` 环境变量与 user site-packages，防止宿主路径污染沙箱 |
-| 通信协议 | stdin/stdout 各**恰好一个** JSON 文档。入：`{"code": str, "state": dict}`；出：`{"ok": true, "output": dict}` 或 `{"ok": false, "error": str}`。worker 内**替换 `sys.stdout`** 为丢弃器，用户代码的 `print` 不得污染协议流；结果经 `os.write(1, ...)` 单次写出 |
+| 通信协议 | stdin/stdout 各**恰好一个** JSON 文档。入：`{"code": str, "state": dict, "limits": {"timeout_s": float, "max_memory_mb": int, "max_output_bytes": int}}`；出：`{"ok": true, "output": dict, "limits": {"applied": [str], "refused": [str]}}` 或 `{"ok": false, "error": str, "limits": {...}}`。worker 内**替换 `sys.stdout`** 为丢弃器，用户代码的 `print` 不得污染协议流；结果经 `os.write(1, ...)` 单次写出 |
 | 退出码 | `0` = 正常（含 `ok=false` 的业务失败）；`2` = SyntaxError；`3` = 运行期异常。非零退出 → 父进程包 `PythonNodeError` |
 | 超时 | `subprocess.run(timeout=limits.timeout_s)`，到期由 stdlib kill 子进程 → `TimeoutExpired` → `PythonNodeError`。**禁止无限等待** |
-| 资源上限 | `preexec_fn` 内设 `RLIMIT_AS`（= `max_memory_mb`）、`RLIMIT_CPU`（= `ceil(timeout_s)`）、`RLIMIT_FSIZE = 0`（禁写任何文件）、`RLIMIT_NPROC = 0`（禁 fork 子进程）。**POSIX best-effort**：macOS 常忽略 `RLIMIT_AS`，此时 `logger.warning("sandbox_rlimit_partial", platform=...)`，不阻断执行（生产为 Linux 容器） |
+| 资源上限 | rlimit 由 **worker 自我施加**（解释器启动完成、`exec` 用户代码之前），按 stdin `limits` 依次设 `RLIMIT_AS`（= `max_memory_mb`）、`RLIMIT_CPU`（= `ceil(timeout_s)`）、`RLIMIT_FSIZE = 0`（禁写任何文件）、`RLIMIT_NPROC = 0`（禁 fork 子进程）。**逐项独立容错**：单项失败记入 `refused` 并继续，不阻断执行；父进程**禁用 `preexec_fn`**，`refused` 非空 → `logger.warning("sandbox_rlimit_partial", refused=..., platform=...)`。见 §5 实测修订记录 |
 | 环境变量 | 子进程 `env={"PATH": "/usr/bin:/bin"}`。**不继承宿主环境**——API 密钥、DB DSN 一律不进沙箱（H6） |
 | 内建白名单 | worker 以 `SAFE_BUILTINS` 作为 `__builtins__`：仅纯计算类（`len/range/sorted/min/max/sum/abs/round/divmod/pow`、`str/int/float/bool/list/dict/set/tuple/frozenset/bytes`、`enumerate/zip/map/filter/reversed/isinstance/issubclass/print`、`chr/ord/hex/oct/bin/format/repr`、`True/False/None`）+ 常用异常类（`Exception/ValueError/TypeError/KeyError/IndexError/AttributeError/ZeroDivisionError/ArithmeticError/LookupError/RuntimeError/StopIteration/NotImplementedError`）。**不含** `open/exec/eval/compile/__import__/globals/locals/vars/dir/getattr/setattr/delattr/type/input/breakpoint/exit/quit/help` |
 | 输出上限 | 父进程校验 `len(stdout) <= limits.max_output_bytes`，超限 → `PythonNodeError`（见 §5 残留风险 3） |
@@ -181,7 +181,7 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
 
 **新增测试**
 
-- `tests/unit/workflow/test_sandbox.py`：AST 拒 `import` / dunder / `open`+`exec` / 超长；接受纯计算代码；`run_sandboxed` 返回 output；运行期异常包 `PythonNodeError`；输出非 dict 报错；无网络双断言（沙箱内既无 `socket` 也无 import 能力）。超时 kill 与内存超限标 `integration`（依赖真实子进程与 rlimit）。
+- `tests/unit/workflow/test_sandbox.py`：AST 拒 `import` / dunder / `open`+`exec` / 超长；接受纯计算代码；`run_sandboxed` 返回 output；运行期异常包 `PythonNodeError`；输出非 dict 报错；无网络双断言（沙箱内既无 `socket` 也无 import 能力）。**rlimit 修订项**：断言父进程调用 kwargs **不含 `preexec_fn`**；stdin 文档含 `limits`（`timeout_s`/`max_memory_mb`/`max_output_bytes`）；worker 回报 `refused` 非空 → `sandbox_rlimit_partial` warning，`refused` 为空 → 不告警。超时 kill 与内存超限标 `integration`（依赖真实子进程与 rlimit）。
 - `tests/unit/workflow/nodes/test_python_node.py` 追加：`sandboxed=true` 路由到 `run_sandboxed`（monkeypatch 计数）；`sandboxed=false` 仍走进程内 `exec`（回归保护）；`entry` + `sandboxed=true` → `ValidationError`；日志摘要含 `sandboxed` 且不含代码正文。
 
 **门禁**：`uv run pytest -m unit`、`uv run pytest -m integration`、`make lint`、`make typecheck` 全绿；前端 `npm run type-check`、`npm test`、`npm run build` 全绿。
@@ -190,9 +190,20 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
 
 ## 5. 残留风险与 open questions
 
-1. **`RLIMIT_AS` 在 macOS 常被忽略** → 开发机上内存上限可能不生效。契约措辞已定为「POSIX best-effort」，并要求 `logger.warning("sandbox_rlimit_partial", platform=...)`；生产为 Linux 容器，`RLIMIT_AS` 有效。超时 kill 是跨平台的兜底。
-2. **`preexec_fn` 在多线程进程中非线程安全**（Python 官方文档明示）。本方案中 fork 与 exec 之间只调用 `setrlimit`（async-signal-safe 的纯 syscall，无 Python 层分配），窗口极窄；但 FastAPI 是多线程/多协程宿主，此风险**已知且被接受**。彻底消除需改用 `posix_spawn` 的 `setsid`/`setrlimit` 扩展或 fork-server 架构，超出本期范围。
-3. **`max_output_bytes` 为捕获后校验，非流式限流**：`subprocess.run(capture_output=True)` 会先把 stdout 全量读进父进程内存再判长度。子进程的输出量受 `RLIMIT_AS` 与 `timeout_s` 双重约束，但父进程侧的峰值内存未被硬性封顶。彻底解决需流式读 + 超限即 kill，列为后续迭代项。
+1. **~~`RLIMIT_AS` 在 macOS 常被忽略~~ → 实测推翻，已按 §7.5 修订契约**（2026-09-14，darwin 25.3.0 / arm64 / CPython 3.13）：`resource.setrlimit(RLIMIT_AS, (64MB, 64MB))` **抛 `ValueError: current limit exceeds maximum limit`**（当前软硬限均为 `INT64_MAX`），不是「被忽略」。原设计把施加放进父进程 `preexec_fn`，而 `preexec_fn` 内抛异常会让 `subprocess.run` 整体失败（`SubprocessError: Exception occurred in preexec_fn`）——后果是 macOS 上**每一次**沙箱调用都失败，而不只是内存上限失效。`RLIMIT_CPU` / `RLIMIT_FSIZE` 可施加；`RLIMIT_NPROC` 当前 `(2666, 4000)`，降至 `(0,0)` 可施加。
+   **修订后契约**：rlimit 改由 **worker 自我施加**（解释器启动完成、`exec` 用户代码之前），逐项独立容错，施加结果以 `applied`/`refused` 回报在 stdout 文档中；父进程**禁用 `preexec_fn`**，`refused` 非空时 `logger.warning("sandbox_rlimit_partial", refused=..., platform=...)`。实测 worker 输出：`{"applied": ["RLIMIT_CPU","RLIMIT_FSIZE","RLIMIT_NPROC"], "refused": ["RLIMIT_AS:ValueError"], "ok": true, "output": {...}}`。
+   **残余**：macOS 开发机上仍无内存硬上限（平台限制，不可绕开）；Linux 生产容器四项均可施加。超时 kill 是跨平台兜底。
+2. **~~`preexec_fn` 在多线程进程中非线程安全~~ → 风险已消除**：修订后父进程不再传 `preexec_fn`，多线程宿主（FastAPI）下的 fork-exec 安全隐患随之消失。原「窗口极窄、已知且被接受」的论证不再需要。备选方案对比见 CONTRACT §11 变更记录 2026-09-14 第二行。
+3. **`max_output_bytes` 为捕获后校验，非流式限流**：`subprocess.run(capture_output=True)` 会先把 stdout 全量读进父进程内存再判长度。子进程的输出量受 `RLIMIT_AS` 与 `timeout_s` 双重约束，但 `RLIMIT_AS` 在 macOS 上施加失败（见风险 1），故该双重约束**仅在 Linux 生产成立**；且父进程侧的峰值内存始终未被硬性封顶。彻底解决需流式读 + 超限即 kill，列为后续迭代项。
 4. **「无网络」不是硬保证**：stdlib 无法做 seccomp/namespace 级 syscall 过滤。本期防线是**能力剥夺**——AST 全禁 import + builtins 无 `__import__`/`open`/`getattr` + 空 env，使沙箱内代码在语言层面**拿不到** `socket`/`urllib`/`http.client` 任何入口。残余风险（例如未来若放开某个携 I/O 能力的 builtin）记录在案；生产建议叠加容器网络策略。
 5. **dunder 规则只作用于标识符，不作用于字符串常量**：`getattr(obj, "__class__")` 里的 `"__class__"` 是字符串字面量，规则 3 拦不住。因此 `getattr`/`setattr`/`delattr`/`vars`/`dir`/`type` 被**同时**从 AST 允许名单（规则 2）与 `SAFE_BUILTINS` 中剔除——两道防线互为冗余，缺一不可。
 6. **`sandboxed=false` 的 YAML 仍是进程内 `exec`**：这是受信仓库路径的向后兼容前提（`examples/` 与既有用户 YAML）。它的安全性依赖「能写这些文件的人已经能改代码」这一既有信任边界，**不因本期变更而改变**；S18 只保证经 HTTP 进入的定义必为 `sandboxed=true`。
+7. **dunder 规则（规则 3）只有一道防线，且实测确认**：直接拉起 worker（绕过 AST 预检）执行
+   `return {"x": str(().__class__.__bases__)}` → `{"ok": true, "output": {"x": "(<class 'object'>,)"}}`。
+   即**属性式** dunder 内省在沙箱内可正常解析——`SAFE_BUILTINS` 白名单只能剥夺*名字*，剥夺不了属性访问语法。
+   因此规则 1（import）与规则 2（危险调用）各有两道防线（AST + 无 `__import__`/`getattr`），
+   而规则 3 **只有 AST 预检一道**；一旦被绕过，`().__class__.__bases__[0].__subclasses__()` 这类经典逃逸链在语言层面是可达的。
+   **实际暴露面**：`validate_code_ast` 在注册期（S18）与每次 `run_sandboxed` 生成子进程前**各跑一次**，
+   要绕过必须能直接以 `sys.executable -I sandbox_worker.py` 拉起子进程——而此时攻击者已能在宿主上执行任意命令，沙箱已非边界。
+   **补第二道防线的代价**（本期不做）：AST 层改写属性访问（插入运行时守卫）会破坏「代码逐字执行」的可预期性；
+   或改用 `__class_getitem__`/audit hook（`sys.addaudithook` 可拦 `object.__getattribute__`，但开销与误伤面均需评估）。
