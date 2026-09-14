@@ -28,6 +28,11 @@ evals/reports/
 # SDN real-credential workflow config (template committed instead)
 app/sdn/config/sdn_alert_inspection.yaml
 
+# Runtime-saved workflow definitions (S17): the user/ directory is written by
+# PUT /workflows/{id} at run time, so its YAMLs are host data, not source. Only
+# .gitkeep is tracked. Curated, reviewable workflows belong in config/examples/.
+app/workflow/config/user/*.yaml
+
 # Frontend
 node_modules/
 *.tsbuildinfo
