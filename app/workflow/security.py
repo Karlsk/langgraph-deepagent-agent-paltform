@@ -10,12 +10,7 @@ import socket
 from urllib.parse import urlparse
 
 from app.core.config import settings
-
-
-class WorkflowValidationError(Exception):
-    """工作流定义校验失败（spec-20：SSRF 防护）。."""
-
-    pass
+from app.workflow.models import WorkflowValidationError
 
 
 # 私网/保留段（spec-20 §3）

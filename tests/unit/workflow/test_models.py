@@ -1,5 +1,6 @@
 """Unit tests for app.workflow.models (spec-01 TC3, CONTRACT §4.2/§5)."""
 
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,11 @@ from app.workflow.models import (
     HTTPNodeError,
     LLMNodeError,
     NodeType,
+    PythonNodeError,
     WorkflowDefinition,
     WorkflowEngineError,
     WorkflowNotFoundError,
+    WorkflowValidationError,
     load_definition_from_yaml,
     parse_definition,
 )
@@ -159,7 +162,7 @@ def test_load_invalid_yaml_syntax(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_exception_hierarchy() -> None:
-    """All five engine exceptions subclass WorkflowEngineError (and Exception)."""
+    """Every exception in the CONTRACT §5 frozen block subclasses WorkflowEngineError."""
     assert issubclass(WorkflowEngineError, Exception)
     for exc_type in (
         ConfigError,
@@ -167,9 +170,21 @@ def test_exception_hierarchy() -> None:
         ConditionNotMatchedError,
         LLMNodeError,
         HTTPNodeError,
+        PythonNodeError,
+        WorkflowValidationError,
     ):
         assert issubclass(exc_type, WorkflowEngineError)
         assert issubclass(exc_type, Exception)
+
+
+@pytest.mark.unit
+def test_validation_error_single_point_of_definition() -> None:
+    """Guard (CONTRACT §5): WorkflowValidationError is defined in models.py, not re-defined in security.py."""
+    assert WorkflowValidationError.__module__ == "app.workflow.models"
+
+    security = import_module("app.workflow.security")
+    assert security.WorkflowValidationError is WorkflowValidationError
+    assert "class WorkflowValidationError" not in Path(str(security.__file__)).read_text(encoding="utf-8")
 
 
 @pytest.mark.unit

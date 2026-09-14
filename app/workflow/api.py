@@ -29,11 +29,16 @@ from app.core.limiter import limiter
 from app.models.user import User
 from app.schemas.base import ApiResponse as HostApiResponse
 from app.services.llm.provider_service import validate_reference
-from app.workflow.security import WorkflowValidationError
 from app.workflow.auth import require_workflow_admin
 from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact, redact_processor
-from app.workflow.models import ExecutionLog, WorkflowDefinition, WorkflowEngineError, WorkflowNotFoundError
+from app.workflow.models import (
+    ExecutionLog,
+    WorkflowDefinition,
+    WorkflowEngineError,
+    WorkflowNotFoundError,
+    WorkflowValidationError,
+)
 from app.workflow.registry import WorkflowRegistry
 from app.workflow.store import delete_definition_yaml, save_definition_yaml
 

@@ -14,7 +14,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
-from app.workflow.security import validate_http_url, WorkflowValidationError
+from app.workflow.models import WorkflowValidationError
+from app.workflow.security import validate_http_url
 
 
 pytestmark = pytest.mark.unit

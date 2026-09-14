@@ -46,6 +46,14 @@ class PythonNodeError(WorkflowEngineError):
     """Python code node failure: bad config, entry loading or non-dict output."""
 
 
+class WorkflowValidationError(WorkflowEngineError):
+    """Registration-time definition validation failure, mapped to HTTP 422 (S6).
+
+    Carries two causes: SSRF-rejecting HTTP node URLs (spec-20) and sandbox AST
+    pre-check rejections (S22).
+    """
+
+
 class NodeType(str, Enum):
     """Built-in node types for this phase (trimmed set, C8).
 
