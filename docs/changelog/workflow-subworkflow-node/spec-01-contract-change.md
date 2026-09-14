@@ -37,7 +37,7 @@ H3 则由 S24 正面解决：内层持独立 collector，完成后按 `"{caller}
 
 | 位置 | 变更 |
 | --- | --- |
-| `app/workflow/nodes/subworkflow_node.py` | **新增**：`SubWorkflowNodeConfig` + `SubWorkflowNode`，K5 插件路径（模块底部 `register_node_type("subworkflow", ...)`，factory **无**内置分支），< 250 行（R8） |
+| `app/workflow/nodes/subworkflow_node.py` | **新增**：`SubWorkflowNodeConfig` + `SubWorkflowNode`，K5 插件路径（模块底部 `register_node_type("subworkflow", ...)`，factory **无**内置分支），< 250 行（R8）。R3 出口以 **`dual_write=False`** 调用 `map_output_to_state`（理由见 §2.4） |
 
 §2.1 模块计数 22 → **23**。`nodes/__init__.py` 导出行同步加 `SubWorkflowNode`。
 
@@ -104,8 +104,15 @@ class SubWorkflowNode(BaseNode):
 ```
 
 **执行语义（R3 管线不变）**：`convert_state_to_dict` 进 → 组装内层输入（`inherit_input` 全量 +
-`input_map` 覆盖，后者优先）→ `workflow_runner(workflow_id, inner_input, self.name)` →
-输出摘要（见 S24）→ `map_output_to_state` 出。
+`input_map` 覆盖，后者优先）→ `workflow_runner(workflow_id, inner_input, self.name)` 得三键信封 →
+**只取 `envelope["output"]`** 交 `map_output_to_state(..., dual_write=False)` 出 → 节点自身记 S24 摘要。
+
+**`dual_write=False` 是本节点对 R3 出口的唯一偏离，且是必要的**（写测试时发现，已回填契约）：
+runner 回传的是内层的**整个最终 state**（`input`、各 `{node}_result`、`history`…），不是「一个节点的输出」。
+按默认平铺会让内层 channel **静默覆写**外层同名 channel——最典型的是 `input`：**每个**工作流都声明 `input`，
+内层的 `input`（可能只是声明默认值）会盖掉外层真正的 `input`，外层后续节点全部读到错值且**无任何报错**。
+`history` 同理。关掉平铺后数据不丢失：外层经 `sub_1_result.<path>`（S7 点路径）读取，条件边与 `{...}`
+模板均可引用。
 
 `workflow_runner` 为 `None` → **`ConfigError`**，**在 `__init__` 抛出**（时机已冻结，见下方澄清）。
 处置口径同 S20 分支②：**不静默降级**、不返回空 dict——静默降级会让「忘了注入 runner」表现为
@@ -206,7 +213,24 @@ R1 的 2026-09-14 carve-out 已为 `python` 开口。本次**同款扩展**至 `
 - `test_models.py` 的 `NodeType` 成员数 == 2 **不变**（C8：枚举刻意只含 `LLM`/`HTTP`）；
 - R4 的 `create_node` 内置分支数 == 2 **不变**（`subworkflow` 走插件路径，factory 不加 `elif`/`if` 类型分支）。
 
-### 2.9 不变更项（显式声明）
+### 2.9 实现期回填的两处精确化
+
+1. **§2.1 `registry.py` 行数注记 `< 350` → `< 400`（= R8 红线上限）**：350 是该模块更小时的估值，
+   S21 已加入 `synthesize_run_input`，S23/S24 再加入 `_RUN_STACK` 与 `_run_nested`，实测 **397 行**。
+   拆分（把 `RunResult`/`RunLogCollector`/`synthesize_run_input` 移出）会同时改动 §4.10 的冻结归属与全仓
+   import，代价远高于放宽注记，且模块职责仍单一（注册表运行时），故不拆。
+   **顺带发现**：`api.py` 现为 **497 行**，已超 R8 的 400 行红线——**本期之前即如此**（Phase 2 开始时为 462 行），
+   非本次引入，列为待办拆分项，不在本期夹带。
+2. **S18「`subworkflow` 注册期结构校验」的落点是节点 config 模型，不是 `api.py`**：
+   `SubWorkflowNodeConfig` 的 `workflow_id` 字段校验（必填 + strip 后非空）在 `register_workflow` →
+   `build_graph` → `create_node` 期间执行，而该调用就在 `PUT` handler 内、且被
+   `except (ValueError, WorkflowEngineError)` 捕获（pydantic `ValidationError` 是 `ValueError` 子类）→ **422**。
+   故 S18 要求的可观测结果完全成立，而校验只有**一个**出处。`api.py` 只把 `subworkflow` 加进白名单，
+   **不**再手写一遍同款检查——那会造出第二个真相来源，两处口径迟早漂移。
+   这与 `python` 的处理并不矛盾：`python` 的 `code` 非空检查必须写在 `api.py`，因为 `PythonNodeConfig`
+   本身接受任意字符串；而 `sandboxed` 强制覆写更是只能在服务端做。
+
+### 2.10 不变更项（显式声明）
 
 - **组合根 `main.py` / `cli.py` 零改动**：runner 由 registry 自注入（§2.3）。这是选择「registry bound
   method」而非「宿主注入」的直接收益。
@@ -252,13 +276,23 @@ R1 的 2026-09-14 carve-out 已为 `python` 开口。本次**同款扩展**至 `
   输出为摘要形态且经 R3 双写；插件注册可被 `create_node` 解析。用 `FakeRunner` + conftest
   `restore_node_registry`（既有 autouse 夹具）。**须加 `pytestmark = pytest.mark.unit`**
   （`tests/unit/workflow/nodes/` 历史缺该标记，见 2026-09-14 记录）。
-- `tests/unit/workflow/test_registry.py`（5 卡）：前缀日志合并（含两层复合）；`A→B→A` 环 → `NestedWorkflowError`
-  且消息含完整栈；`A→A` 自环同上；深度超限（默认 3 ⇒ 第 4 层被拒）；`_RUN_STACK` 在异常路径也 reset
-  （ContextVar 不泄漏）。
-- `tests/integration/workflow/test_nested_concurrency.py`（1 卡）：异 id 并发嵌套无死锁（带超时断言）。
-- `tests/unit/workflow/nodes/test_factory.py`（2 卡）：签名探测——声明 `workflow_runner` 的插件类收到它、
-  未声明的（如 `PythonNode`）**收不到**且不报错。
-- `tests/unit/workflow/test_api.py`（2 卡）：`PUT` 接受 `subworkflow` 节点；缺 `workflow_id` / 非 str → 422。
+- `tests/unit/workflow/test_registry_nesting.py`（**新增独立文件**，13 卡；`test_registry.py` 已 427 行，
+  再塞进去会牺牲可读性，故 S23/S24 语义单独成文）：前缀日志合并 + 三层复合（`sub_b/sub_c/c1`）+ 子节点摘要；
+  `A→B→A` 环与 `A→A` 自环 → `NestedWorkflowError` 且消息含完整栈；深度语义三卡（默认 3 ⇒ `A→B→C` **成功**、
+  第 4 层被拒、`max_nesting_depth=1` 禁一切嵌套）；`_RUN_STACK` 在成功/失败路径都 reset 且拒绝后下一次运行正常；
+  悬空引用 → `WorkflowNotFoundError`。
+- `tests/integration/workflow/test_nested_concurrency.py`（**新增**，2 卡）：异 id 并发嵌套（各 5 轮）无死锁、
+  轨迹前缀正确；同一 outer id 双线程并发被 RLock 串行化且日志条数一致（无交错）。
+  **刻意不测** AB-BA 互引拓扑——那会真的挂住（残留风险 2），挂住的测试不是测试。
+- `tests/unit/workflow/nodes/test_factory.py`（5 卡）：签名探测——声明 `workflow_runner` 的插件收到它、
+  未声明的（`PythonNode` 情形）**收不到**且不报错、`**kwargs` 插件按规则收到、未传 runner 时得到显式 `None`、
+  两个内置分支不受新参影响（R4 恒 2）。
+- `tests/unit/workflow/test_api.py`（3 卡）：`PUT` 接受 `subworkflow` 且 config 原样透传；**悬空引用也被接受**
+  （存在性是运行期检查，钉住这一刻意决定）；`workflow_id` 缺失/空/纯空白/非 str → 422（参数化 4 例）。
+- **守护测试扩展**：`test_llm_node.py::test_engine_modules_stay_free_of_host_imports` 原为**手写文件清单**，
+  已静默漏掉 `python_node.py`/`sandbox.py`/`sandbox_worker.py`——即新增模块默认逃过红线 4 守护。
+  改为遍历 `app/workflow/**/*.py` 并只排除 §3 豁免的三个入口层模块，另断言若干已知文件确被扫到，
+  防止路径计算失效导致空转通过。
 - 前端：新 `tests/components/subworkflow-node-form.spec.ts`；扩 `node-palette.spec.ts`（4 项）、
   `node-config-panel.spec.ts`（分派 + patch）、`workflow-canvas.spec.ts`（token class）、
   `use-workflow-graph.spec.ts`（接受 `subworkflow` / 缺 `workflow_id` 报错）。零真实网络（`vi.mock('@/api/workflow')`）。

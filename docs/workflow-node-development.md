@@ -360,9 +360,16 @@ CONTRACT §8 R1 已就此追加 carve-out。它能否经 `PUT /api/v1/workflows/
 convert_state_to_dict 进
   → 组装内层输入（inherit_input 全量拷贝 → input_map 覆盖，后者优先）
   → workflow_runner(workflow_id, inner_input, self.name) 得到三键结果信封
-  → 只取 envelope["output"] 交 map_output_to_state 出（meta 键不入外层 state）
+  → 只取 envelope["output"] 交 map_output_to_state(..., dual_write=False) 出
   → 节点自身 ExecutionLog 记摘要（§6.4）
 ```
+
+**`dual_write=False` 是本节点对 R3 出口的唯一偏离，必须如此**：runner 回传的是内层的**整个最终 state**
+（`input`、各 `{node}_result`、`history`…），不是「一个节点的输出」。按默认平铺会让内层 channel
+**静默覆写**外层同名 channel——最典型的是 `input`：**每个**工作流都声明 `input`，内层的 `input`
+（可能只是声明默认值）会盖掉外层真正的 `input`，外层后续节点全部读到错值且**无任何报错**；`history` 同理。
+关掉平铺后数据**不丢失**：内层结果落在 `{node_name}_result`，外层经 `sub_1_result.<path>`（S7 点路径）读取，
+条件边与 `{...}` 模板均可引用。`history_increment` 保持默认 `True`（只追加一条增量）。
 
 **结果信封（CONTRACT §4.15 冻结，恰三键）**：`{"output": dict, "run_id": str, "inner_log_count": int}`。
 `output` 是内层 `RunResult.output`；`run_id` 与 `inner_log_count` 只存在于内层 `RunResult` 上，
@@ -430,7 +437,7 @@ log.model_copy(update={"node_name": f"{caller_label}/{log.node_name}"})
 ```
 
 字段来源：`output_keys` 取自信封 `output` 的键，`run_id`/`inner_log_count` 取自 runner 回传的信封，
-`duration_ms` 由节点自行计时。
+`duration_ms` 由节点自行计时。摘要**不含**内层输出本体，也不含内层日志（后者已按前缀单独并入，见上）。
 
 **不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍，且前后端都要去重）。
 内层业务数据经 R3 出口 `map_output_to_state` 正常写入外层 state，**不丢失**。

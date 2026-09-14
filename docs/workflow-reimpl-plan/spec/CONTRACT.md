@@ -39,7 +39,7 @@ app/workflow/
   models.py              # DSL 模型 + 精简 NodeType + 异常族（单点）
   state.py               # StateModelFactory（< 150 行）
   graph_builder.py       # GraphBuilder + BuildResult（< 300 行，只含 GraphBuilder）
-  registry.py            # WorkflowRegistry + RunResult + RunLogCollector + load_definitions_from_dir + synthesize_run_input（< 350 行）
+  registry.py            # WorkflowRegistry + RunResult + RunLogCollector + load_definitions_from_dir + synthesize_run_input + _run_nested/_RUN_STACK（< 400 行，即 R8 上限）
   utils.py               # 仅 convert_state_to_dict / map_output_to_state（< 150 行）
   logging_conf.py        # setup_logging + redact + 脱敏 processor
   cli.py                 # ApiResponse + build_registry + build_parser + main（< 200 行）
@@ -52,13 +52,16 @@ app/workflow/
   sandbox.py             # validate_code_ast + SandboxLimits + run_sandboxed（S22，< 400 行）
   sandbox_worker.py      # 子进程入口；**非 importable API**，只被 sandbox.py 以 sys.executable -I 拉起（S22，< 400 行）
   nodes/
-    __init__.py          # 导出 BaseNode/register_node_type/create_node/LLMNode/HTTPNode/SubWorkflowNode
+    __init__.py          # 导出 BaseNode/register_node_type/create_node/LLMNode/HTTPNode（**不含插件节点类**）
     base.py              # BaseNode + RunLogCollectorLike + _RUN_COLLECTOR（< 200 行）
     factory.py           # _NODE_REGISTRY + register/list/create（< 120 行）
     llm_node.py          # LLMNode + LLMConfig（< 250 行）
     http_node.py         # HTTPNode + HTTPNodeConfig（< 280 行）
     python_node.py       # PythonNode 插件（K5 范例，R4 守护不变：factory 无内置分支）
-    subworkflow_node.py  # SubWorkflowNode 插件（S23/S24，K5 路径，< 250 行）
+    subworkflow_node.py  # SubWorkflowNode 插件（S23/S24，K5 路径，< 250 行）。
+                         # 插件节点类**不由 nodes/__init__.py 导出**（PythonNode 同此）：
+                         # 调用方经 register_node_type/create_node 取得，导出会诱导绕过注册表直接 import。
+                         # 自注册由 factory.py 底部 import 触发（AD-04 同款）
   config/examples/
     minimal.yaml         # Phase 1
     http_demo.yaml       # Phase 9
@@ -68,7 +71,12 @@ app/workflow/
 > **计数说明（2026-09-14）**：原表记 15 个模块，但 `auth.py` / `ports.py` / `security.py` / `store.py` / `nodes/python_node.py`
 > 早已随 spec-17..20 与 K5 插件范例落地却未回写白名单（文档漂移）。本次按第 11 章流程一并补录，
 > 并新增 S22 所需的 `sandbox.py` / `sandbox_worker.py`。补录不改变任何代码，只使白名单与实际仓库一致。
-> 同日第二次变更（S23/S24）新增 `nodes/subworkflow_node.py`，计数 22 → 23。
+> 同日第二次变更（S23/S24）新增 `nodes/subworkflow_node.py`，计数 22 → 23；并把 `registry.py` 的行数注记
+> 由 `< 350` 放宽到 `< 400`（= R8 红线上限）。**理由**：350 是该模块更小时的估值，S21 已加入
+> `synthesize_run_input`，S23/S24 再加入 `_RUN_STACK` 与 `_run_nested`（含守护与日志合并），实测 397 行。
+> 拆分（把 `RunResult`/`RunLogCollector`/`synthesize_run_input` 移出）会同时改动 §4.10 的冻结归属与
+> 全仓 import，代价远高于放宽注记，且模块职责仍单一（注册表运行时），故不拆。**注：`api.py` 现为 497 行，
+> 已超 R8 的 400 行红线（本期之前即如此，非本次引入），列为待办拆分项。**
 
 **测试（镜像结构，`tests/` 目录本仓库新建）：**
 
@@ -709,9 +717,21 @@ class SubWorkflowNode(BaseNode):
 
 **执行语义（R3 管线不变）**：`convert_state_to_dict` 进 → 组装内层输入（`inherit_input` 为真则先全量拷贝外层
 state，再叠加 `input_map` 解析结果，**后者优先**）→ `workflow_runner(workflow_id, inner_input, self.name)`
-得到结果信封 → **只取 `envelope["output"]`** 交 `map_output_to_state` 出（信封 meta 键不入外层 state）；
+得到结果信封 → **只取 `envelope["output"]`** 交 `map_output_to_state`（信封 meta 键不入外层 state）；
 节点自身 `ExecutionLog.output_data` 记 S24 摘要（`output_keys` 取自 `output`，`run_id`/`inner_log_count`
 取自信封，`duration_ms` 由节点自行计时）。
+
+**`dual_write=False`（冻结，本节点是 R3 出口的唯一例外）**：调用
+`map_output_to_state(self.name, envelope["output"], state_dict, dual_write=False)`，即内层数据**只落在
+`{node_name}_result`**，**不**平铺进外层同名 channel。
+
+理由：runner 回传的是内层的**整个最终 state**（含 `input`、各 `{node}_result`、`history` 等），
+不是「一个节点的输出」。按默认 `dual_write=True` 平铺会让内层 channel **静默覆写**外层同名 channel——
+最典型的是 `input`：**每个**工作流都声明 `input`，内层的 `input`（可能是声明默认值）会盖掉外层真正的
+`input`，且外层后续节点全部读到错值而无任何报错。`history` 同理会被内层历史覆盖。
+`dual_write=False` 下数据**不丢失**：外层经 `sub_1_result.<path>`（S7 点路径）读取，条件边与
+`{...}` 模板均可引用；这与其它节点的 `{node}_result` 约定一致，只是少了平铺那一半。
+`history_increment` 保持默认 `True`（只追加一条 `"{node}: ..."` 增量，不覆盖）。
 
 **约束**：
 
@@ -847,7 +867,7 @@ SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支�
 | 内层收集 | 内层 `execute_workflow` 自带独立 `RunLogCollector` 并绑定 `_RUN_COLLECTOR`（S11 既有行为，**零改动**）。同线程 ContextVar 嵌套 set/reset ⇒ 内层 collector 在外层看来是**临时遮蔽**，内层 `finally` reset 后外层 collector 自动恢复 |
 | 前缀合并 | 内层返回后，`_run_nested` 取 `result.execution_logs`，逐条 `model_copy(update={"node_name": f"{caller_label}/{原 node_name}"})` 后 `add` 进**外层** collector（经 `nodes/base.py` 既有的 `get_run_collector()` 取得，无需新增访问器）。外层轨迹因此形如 `sub_1/classify`、`sub_1/fetch` |
 | 多层复合 | 前缀**自然复合**，无需特判层数：C 的日志并入 B 时成 `sub_c/xxx`，B 的日志（已含该条）并入 A 时成 `sub_b/sub_c/xxx` |
-| 子节点自身 output | `SubWorkflowNode` 的 `ExecutionLog.output_data` **只记摘要** `{output_keys: [...], run_id, duration_ms, inner_log_count}`，**不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍且前后端都要去重）。字段来源：`output_keys` 取自信封 `output` 的键、`run_id`/`inner_log_count` 取自 runner 回传的信封（§4.15，二者只存在于内层 `RunResult` 上，节点无从自知）、`duration_ms` 由节点自行计时。内层业务数据（信封 `output`）经 R3 出口 `map_output_to_state` 正常写入外层 state，**不丢失**；信封的 meta 键**不得**写入外层 state |
+| 子节点自身 output | `SubWorkflowNode` 的 `ExecutionLog.output_data` **只记摘要** `{output_keys: [...], run_id, duration_ms, inner_log_count}`，**不内嵌内层完整输出与日志**——否则同一份数据在轨迹里出现两次（体积翻倍且前后端都要去重）。字段来源：`output_keys` 取自信封 `output` 的键、`run_id`/`inner_log_count` 取自 runner 回传的信封（§4.15，二者只存在于内层 `RunResult` 上，节点无从自知）、`duration_ms` 由节点自行计时。内层业务数据（信封 `output`）经 R3 出口写入外层 state 时 **`dual_write=False`**（见 §4.15：runner 回传的是内层**整个 state**，平铺会静默覆写外层同名 channel，尤以每个工作流都有的 `input` 为甚），即只落 `{node_name}_result`，数据不丢失、经 S7 点路径读取；信封的 meta 键**不得**写入外层 state |
 | 前端影响 | `WorkflowTraceDrawer` **零改动**：前缀名是普通字符串，直接展示即可读出层级 |
 | H6 | 合并的是既有 `ExecutionLog`（脱敏在 `api.py` 投影时由 `redact` 统一做），前缀化不引入新泄漏面；`caller_label` 是节点名（YAML 自有），非用户数据 |
 
