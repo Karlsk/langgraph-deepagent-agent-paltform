@@ -52,7 +52,7 @@ L0  nodes/base.py ──► utils.py ──────────────�
 | --- | --- | --- | --- |
 | `llm` / `LLM` | `LLMNode` | factory 内置分支 + 模块底部 `register_node_type("llm", ...)` | 多供应商对话调用，env 密钥，tenacity 退避重试 |
 | `http` / `HTTP` | `HTTPNode` | factory 内置分支 + 模块底部 `register_node_type("http", ...)` | 模板渲染请求，`response_path` 提取，显式 retry/mock |
-| `python` | `PythonNode` | 纯插件路径（模块底部 `register_node_type("python", ...)`，factory **无**内置分支） | 进程内受信代码执行（`code` 内联或 `entry` 模块函数） |
+| `python` | `PythonNode` | 纯插件路径（模块底部 `register_node_type("python", ...)`，factory **无**内置分支） | 代码执行：`code` 模式按 `sandboxed` 二选一（子进程沙箱 / 进程内受信 `exec`），`entry` 模式加载仓库模块函数且不可沙箱化。经 `PUT` 注册者由服务端强制 `sandboxed=true`（S18），详见 §5.5 |
 
 > `NodeType` 枚举刻意只含 `LLM`/`HTTP` 两个成员（C8/R1）；`python` 是**插件类型**，以任意字符串注册，
 > 不受枚举约束。`NodeDefinition.type` 保持 `str`（非枚举）正是为了让插件类型透传（R4）。

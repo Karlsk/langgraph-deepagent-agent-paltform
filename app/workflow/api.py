@@ -34,12 +34,15 @@ from app.workflow.cli import ApiResponse
 from app.workflow.logging_conf import redact, redact_processor
 from app.workflow.models import (
     ExecutionLog,
+    NodeDefinition,
     WorkflowDefinition,
     WorkflowEngineError,
     WorkflowNotFoundError,
     WorkflowValidationError,
 )
 from app.workflow.registry import WorkflowRegistry
+from app.workflow.sandbox import validate_code_ast
+from app.workflow.security import validate_http_url
 from app.workflow.store import delete_definition_yaml, save_definition_yaml
 
 logger = structlog.get_logger(__name__)
@@ -119,19 +122,45 @@ def _serialize_execution_logs(logs: list[ExecutionLog]) -> list[dict[str, Any]]:
     return [redact(log.model_dump(mode="json"), max_len=500) for log in logs]
 
 
-ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http"})
+ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http", "python"})
+
+
+def _enforce_python_node_policy(node: NodeDefinition) -> None:
+    """S18: admit a python node over HTTP only as sandboxed, statically-checked code.
+
+    Mutates ``node.config`` to force ``sandboxed=true`` so both the registry
+    entry and the persisted YAML carry it — the flag is a security property,
+    not a user preference, so the request body never decides it.
+
+    Raises:
+        ValueError: If the node uses ``entry`` mode or has no usable ``code``.
+        WorkflowValidationError: If the code fails the sandbox AST pre-check.
+    """
+    config = node.config
+    if "entry" in config:
+        msg = f"node '{node.name}': python 'entry' mode cannot be registered over HTTP; use 'code'"
+        raise ValueError(msg)
+    code = config.get("code")
+    if not isinstance(code, str) or not code.strip():
+        msg = f"node '{node.name}': python node requires a non-empty 'code' string"
+        raise ValueError(msg)
+    validate_code_ast(code)
+    config["sandboxed"] = True
 
 
 def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> WorkflowDefinition:
-    """Parse and validate a PUT body: pydantic → id match → node-type whitelist → SSRF guard (S15, spec-20).
+    """Parse and validate a PUT body: pydantic → id match → node-type whitelist → per-type guards.
+
+    Per-type guards are the SSRF check for http nodes (spec-20) and the sandbox
+    policy for python nodes (S18).
 
     Raises:
         ValidationError: If pydantic model validation fails.
-        ValueError: If workflow_id mismatches or a node type is not whitelisted.
-        WorkflowValidationError: If an HTTP node URL fails SSRF validation (spec-20).
+        ValueError: If workflow_id mismatches, a node type is not whitelisted,
+            or a python node violates the S18 code-only rule.
+        WorkflowValidationError: If an HTTP node URL fails SSRF validation (spec-20)
+            or python node code fails the AST pre-check (S18/S22).
     """
-    from app.workflow.security import validate_http_url
-
     definition = WorkflowDefinition.model_validate(payload)
     if definition.workflow_id != workflow_id:
         msg = f"body workflow_id '{definition.workflow_id}' does not match path id '{workflow_id}'"
@@ -147,6 +176,8 @@ def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> W
                 url = config.get("url")
                 if url:
                     validate_http_url(url)
+        elif node.type == "python":
+            _enforce_python_node_policy(node)
     return definition
 
 
@@ -376,9 +407,9 @@ async def save_workflow(
 ) -> JSONResponse:
     """Full-replace register a workflow definition (spec-16, S13 atomic replacement).
 
-    Processing order: parse → id match → whitelist → provider_ref → register →
-    persist → return. On persist failure the registry entry is rolled back to
-    keep registry = disk.
+    Processing order: parse → id match → whitelist → per-type guards (http SSRF,
+    python sandbox policy) → provider_ref → register → persist → return. On
+    persist failure the registry entry is rolled back to keep registry = disk.
     """
     try:
         definition = _validate_definition_payload(payload, workflow_id)
@@ -389,13 +420,11 @@ async def save_workflow(
         )
     except ValueError as exc:
         logger.warning("api_save_workflow_id_mismatch_or_blocked", workflow_id=workflow_id)
-        return _project_to_host_envelope(
-            ApiResponse(success=False, error=_redacted_summary(str(exc))), 422
-        )
+        return _project_to_host_envelope(ApiResponse(success=False, error=_redacted_summary(str(exc))), 422)
     except WorkflowValidationError as exc:
-        logger.warning("api_save_workflow_ssrf_blocked", workflow_id=workflow_id)
+        logger.warning("api_save_workflow_definition_rejected", workflow_id=workflow_id)
         return _project_to_host_envelope(
-            ApiResponse(success=False, error=_redacted_summary(f"SSRF guard: {exc}")), 422
+            ApiResponse(success=False, error=_redacted_summary(f"definition rejected: {exc}")), 422
         )
 
     try:

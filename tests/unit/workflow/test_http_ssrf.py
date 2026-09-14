@@ -189,8 +189,9 @@ class TestRegistrationTimeValidation:
         with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
             response = client.put("/workflows/ssrf_test", json=payload)
         assert response.status_code == 422
-        assert "private|loopback|reserved|link-local" in response.json()["message"].lower() or \
-               "ssrf" in response.json()["message"].lower()
+        # api.py 的 WorkflowValidationError 分支自 S18 起为原因中立（SSRF + 沙箱 AST 共用），
+        # 故断言异常自身携带的原因文本，而非已被移除的 "SSRF guard:" 前缀
+        assert "private/loopback/link-local/reserved" in response.json()["message"].lower()
 
     def test_put_with_mock_enabled_true_skips_validation(self, client):
         """PUT 含私网 url 但 mock_enabled=true → 通过（零网络，S9）."""

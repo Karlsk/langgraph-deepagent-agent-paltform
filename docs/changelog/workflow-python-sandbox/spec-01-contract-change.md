@@ -171,6 +171,11 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
 - `tests/unit/workflow/test_models.py::test_exception_hierarchy`：正向列表**扩展**至含 `PythonNodeError` 与
   `WorkflowValidationError`（§2.5）。
 - `tests/unit/workflow/test_models.py` 的 `NodeType` 成员数 == 2、R4 内置分支 == 2：**不动**（§2.6）。
+- `tests/unit/workflow/test_http_ssrf.py::test_put_with_private_url_rejected_422`（实现期发现的**第三处**必改断言）：
+  原断言为 `"private|loopback|reserved|link-local" in message or "ssrf" in message`。前半段把正则写成了字面量
+  管道串，**永远匹配不上**（既有隐性失效），实际只靠后半段的 `"SSRF guard:"` 前缀通过；§4「错误分支泛化」移除该前缀后即红。
+  改为断言异常自身携带的原因文本 `"private/loopback/link-local/reserved"`（`security.py:76-78`），与「message 前缀原因中立、
+  区分靠异常自身消息」的修订意图一致。
 
 **`api.py` 错误分支泛化（随 S18 修订必做）**
 
@@ -182,7 +187,8 @@ R1 原文「只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型」。
 **新增测试**
 
 - `tests/unit/workflow/test_sandbox.py`：AST 拒 `import` / dunder / `open`+`exec` / 超长；接受纯计算代码；`run_sandboxed` 返回 output；运行期异常包 `PythonNodeError`；输出非 dict 报错；无网络双断言（沙箱内既无 `socket` 也无 import 能力）。**rlimit 修订项**：断言父进程调用 kwargs **不含 `preexec_fn`**；stdin 文档含 `limits`（`timeout_s`/`max_memory_mb`/`max_output_bytes`）；worker 回报 `refused` 非空 → `sandbox_rlimit_partial` warning，`refused` 为空 → 不告警。超时 kill 与内存超限标 `integration`（依赖真实子进程与 rlimit）。
-- `tests/unit/workflow/nodes/test_python_node.py` 追加：`sandboxed=true` 路由到 `run_sandboxed`（monkeypatch 计数）；`sandboxed=false` 仍走进程内 `exec`（回归保护）；`entry` + `sandboxed=true` → `ValidationError`；日志摘要含 `sandboxed` 且不含代码正文。
+- `tests/unit/workflow/nodes/test_python_node.py` 追加：`sandboxed=true` 路由到 `run_sandboxed`（monkeypatch 计数）；`sandboxed=false` 仍走进程内 `exec`（回归保护）；`entry` + `sandboxed=true` → `ValidationError`；日志摘要含 `sandboxed` 且不含代码正文。该文件原**缺 `pytestmark = pytest.mark.unit`**（`tests/unit/workflow/nodes/` 全目录同此历史漂移），本次补上使其真正进入 `-m unit` 门禁。
+- `tests/integration/workflow/test_python_sandbox_pipeline.py`（**新增**，5 卡）：真实落盘 YAML + 真实子进程，覆盖 `PUT → 持久化 → registry 执行` 这条两个单测套件都看不见的接缝——`test_python_node.py` stub 掉 `run_sandboxed`（不起子进程）、`test_sandbox.py` stub 掉 `subprocess.run`（不起 worker），故「服务端强制的 `sandboxed=true` 是否真的活到执行期」在单测里**结构上无法证伪**（与 #131 漏掉 `stdin`/`input` 冲突同类盲点）。判别手法：用 `hash("x")`——它通过全部 AST 规则，却不在 `SAFE_BUILTINS` 内，故进程内路径会返回值、沙箱路径必抛 `NameError`，比超时探针更快且确定。
 
 **门禁**：`uv run pytest -m unit`、`uv run pytest -m integration`、`make lint`、`make typecheck` 全绿；前端 `npm run type-check`、`npm test`、`npm run build` 全绿。
 

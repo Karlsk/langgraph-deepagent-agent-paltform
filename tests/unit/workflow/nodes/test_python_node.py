@@ -2,15 +2,21 @@
 
 Covers: config exclusivity (code XOR entry), inline code execution with
 state access and local imports, entry loading, non-dict output rejection,
-exception propagation, R3 dual-write pipeline, and the factory plugin path.
-Zero network / zero LLM.
+exception propagation, R3 dual-write pipeline, the factory plugin path, and
+the S22 sandboxed routing (``sandboxed=true`` -> subprocess sandbox).
+Zero network / zero LLM: ``run_sandboxed`` is stubbed, no child is spawned.
 """
 
+from typing import Any
+
 import pytest
+from pydantic import ValidationError
 
 from app.workflow.nodes.factory import create_node
 from app.workflow.models import NodeDefinition, PythonNodeError
 from app.workflow.nodes.python_node import PythonNode, PythonNodeConfig
+
+pytestmark = pytest.mark.unit
 
 
 def _node(config: dict, name: str = "py") -> PythonNode:
@@ -46,6 +52,19 @@ class TestConfigExclusivity:
         """Unknown config keys are rejected (extra='forbid', S14)."""
         with pytest.raises(ValueError):
             PythonNodeConfig(code="return {}", unknown_key=1)  # pyright: ignore[reportCallIssue]
+
+    def test_sandboxed_defaults_false(self) -> None:
+        """Existing trusted-repository YAML keeps the in-process path (S22)."""
+        assert PythonNodeConfig(code="return {}").sandboxed is False
+
+    def test_sandboxed_with_code_ok(self) -> None:
+        """sandboxed=True is accepted in code mode."""
+        assert PythonNodeConfig(code="return {}", sandboxed=True).sandboxed is True
+
+    def test_sandboxed_with_entry_raises(self) -> None:
+        """The ``entry`` mode cannot be sandboxed, so the combination is rejected rather than ignored (§2.3)."""
+        with pytest.raises(ValidationError, match="cannot be sandboxed"):
+            PythonNodeConfig(entry="app.workflow.utils:convert_state_to_dict", sandboxed=True)
 
 
 class TestInlineCode:
@@ -133,7 +152,7 @@ class TestPipelineAndLogging:
         node = _node({"code": secret_code})
         _run(node, {})
         log = node.get_execution_history()[0]
-        assert log.input_data == {"mode": "code", "code_chars": len(secret_code)}
+        assert log.input_data == {"mode": "code", "code_chars": len(secret_code), "sandboxed": False}
         assert secret_code not in str(log.input_data)
         assert log.error is None
 
@@ -143,6 +162,77 @@ class TestPipelineAndLogging:
         with pytest.raises(ValueError, match="bad"):
             _run(node, {})
         assert node.get_execution_history()[0].error is not None
+
+
+class TestSandboxedRouting:
+    """S22: ``sandboxed=true`` runs the code in the subprocess sandbox, never in-process."""
+
+    @staticmethod
+    def _stub(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> list[tuple[Any, ...]]:
+        calls: list[tuple[Any, ...]] = []
+
+        def fake_run_sandboxed(code: str, state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append((code, state))
+            return result
+
+        monkeypatch.setattr("app.workflow.nodes.python_node.run_sandboxed", fake_run_sandboxed)
+        return calls
+
+    def test_sandboxed_code_routes_to_run_sandboxed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The sandbox call receives the code and a plain state dict (R3 in-pipeline unchanged)."""
+        calls = self._stub(monkeypatch, {"upper": "ABC"})
+        node = _node({"code": 'return {"upper": state["input"].upper()}', "sandboxed": True}, name="py")
+        out = _run(node, {"input": "abc"})
+        assert len(calls) == 1
+        assert calls[0][0] == 'return {"upper": state["input"].upper()}'
+        assert calls[0][1] == {"input": "abc"}
+        assert isinstance(calls[0][1], dict)
+        assert out["upper"] == "ABC"
+
+    def test_sandboxed_output_still_dual_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Sandbox results go through the same R3 out-pipeline as the in-process path."""
+        self._stub(monkeypatch, {"flag": "on"})
+        node = _node({"code": "return {'flag': 'on'}", "sandboxed": True}, name="py_node")
+        out = _run(node, {"history": []})
+        assert out["flag"] == "on"
+        assert out["py_node_result"] == {"flag": "on"}
+        assert len(out["history"]) == 1
+
+    def test_unsandboxed_code_never_touches_the_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression protection: the trusted in-process exec path is byte-for-byte unchanged."""
+        calls = self._stub(monkeypatch, {"should": "not be used"})
+        node = _node({"code": 'return {"doubled": state["value"] * 2}'})
+        assert _run(node, {"value": 21})["doubled"] == 42
+        assert calls == []
+
+    def test_entry_mode_never_touches_the_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The entry path is unaffected by the sandbox branch (§2.3)."""
+        calls = self._stub(monkeypatch, {"should": "not be used"})
+        node = _node({"entry": "app.workflow.utils:convert_state_to_dict"})
+        assert _run(node, {"a": 1})["a"] == 1
+        assert calls == []
+
+    def test_sandbox_failure_is_recorded_and_propagated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sandbox error is logged then re-raised (H2/R6, no dead except)."""
+
+        def exploding(code: str, state: dict[str, Any]) -> dict[str, Any]:
+            raise PythonNodeError("sandboxed code timed out after 10.0s")
+
+        monkeypatch.setattr("app.workflow.nodes.python_node.run_sandboxed", exploding)
+        node = _node({"code": "while True: pass", "sandboxed": True})
+        with pytest.raises(PythonNodeError, match="timed out"):
+            _run(node, {})
+        assert node.get_execution_history()[0].error is not None
+
+    def test_sandboxed_log_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The summary carries sandboxed=True and never the code body (H6/S15)."""
+        secret_code = 'return {"token": "sk-super-secret-value"}'  # noqa: S105 — dummy literal for leak assertion
+        self._stub(monkeypatch, {"token": "redacted"})
+        node = _node({"code": secret_code, "sandboxed": True})
+        _run(node, {})
+        log = node.get_execution_history()[0]
+        assert log.input_data == {"mode": "code", "code_chars": len(secret_code), "sandboxed": True}
+        assert secret_code not in str(log.input_data)
 
 
 class TestFactoryPluginPath:

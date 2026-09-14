@@ -1,18 +1,29 @@
-"""Generic ``python`` code node: in-process trusted code execution (K5 plugin).
+"""Generic ``python`` code node (K5 plugin): sandboxed or trusted in-process execution.
 
 The only non-built-in node type shipped with the engine. Config is exactly
 one of:
 
-- ``code``: inline YAML code, wrapped into a function with ``state`` (a plain
-  dict snapshot of the workflow state) injected; must ``return`` a dict.
+- ``code``: inline YAML code with ``state`` (a plain dict snapshot of the
+  workflow state) injected; must ``return`` a dict.
 - ``entry``: ``module:function`` pointing at a repository function invoked
   with the state dict; must return a dict.
 
-Execution is in-process and NOT sandboxed: only trusted, repository-owned
-code may run here (langchain-sandbox was evaluated and rejected: unmaintained,
-Deno runtime, per-invocation startup latency). Follows the R3 pipeline
-(convert_state_to_dict in / map_output_to_state out) and logs summaries only
-(code length or entry name — never the code body, H6/S15).
+``code`` runs in one of two ways, selected by ``sandboxed`` (S22):
+
+- ``sandboxed: true`` — a child process with an AST pre-check, a restricted
+  builtins whitelist, a timeout and self-applied rlimits (``app/workflow/sandbox.py``).
+  This is the only mode reachable through ``PUT /workflows/{id}``: the server
+  forces the flag on, so registering over HTTP is never equivalent to RCE (S18).
+- ``sandboxed: false`` (default) — in-process ``exec`` of repository-owned code,
+  byte-for-byte the historical behaviour. Trust boundary unchanged: whoever can
+  write these YAML files can already change the code.
+
+``entry`` cannot be sandboxed (``importlib`` loads real repository modules) and
+is therefore rejected in combination with ``sandboxed: true``. langchain-sandbox
+was evaluated and rejected: unmaintained, Deno runtime, per-invocation startup
+latency. Both modes follow the R3 pipeline (convert_state_to_dict in /
+map_output_to_state out) and log summaries only (code length or entry name —
+never the code body, H6/S15).
 """
 
 from __future__ import annotations
@@ -29,21 +40,26 @@ from pydantic import BaseModel, model_validator
 from app.workflow.models import ExecutionLog, OperatorLog, PythonNodeError
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
+from app.workflow.sandbox import run_sandboxed
 from app.workflow.utils import convert_state_to_dict, map_output_to_state
 
 logger = structlog.get_logger(__name__)
 
 
 class PythonNodeConfig(BaseModel, extra="forbid"):
-    """Exactly one of ``code`` / ``entry`` must be provided (S14 forbid extras)."""
+    """Exactly one of ``code`` / ``entry``; ``sandboxed`` applies to ``code`` only (S14 forbid extras)."""
 
     code: str | None = None
     entry: str | None = None
+    sandboxed: bool = False
 
     @model_validator(mode="after")
     def _check_exclusivity(self) -> PythonNodeConfig:
         if (self.code is None) == (self.entry is None):
             msg = "PythonNodeConfig requires exactly one of 'code' or 'entry'"
+            raise ValueError(msg)
+        if self.entry is not None and self.sandboxed:
+            msg = "PythonNodeConfig: 'entry' cannot be sandboxed; sandboxed=True requires 'code' mode"
             raise ValueError(msg)
         return self
 
@@ -96,7 +112,9 @@ class PythonNode(BaseNode):
         return self.wrap_runnable(func)
 
     def _run_inline_code(self, code: str, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Wrap inline code into a function so ``return`` / local imports work."""
+        """Sandboxed code goes to a child process (S22); otherwise wrap it so ``return`` works."""
+        if self._node_config.sandboxed:
+            return run_sandboxed(code, state_dict)
         wrapped = "def __python_node_fn(state):\n" + textwrap.indent(code, "    ")
         namespace: dict[str, Any] = {}
         try:
@@ -139,7 +157,7 @@ class PythonNode(BaseNode):
         """Write an ExecutionLog whose input_data is a summary only (S15/H6)."""
         cfg = self._node_config
         input_summary: dict[str, Any] = (
-            {"mode": "code", "code_chars": len(cfg.code or "")}
+            {"mode": "code", "code_chars": len(cfg.code or ""), "sandboxed": cfg.sandboxed}
             if cfg.code is not None
             else {"mode": "entry", "entry": cfg.entry or ""}
         )

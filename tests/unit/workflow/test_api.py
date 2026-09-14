@@ -46,6 +46,7 @@ def _add_mock_auth(app: FastAPI, username: str = "test_user") -> None:
 
     app.dependency_overrides[get_current_user] = mock_get_current_user
 
+
 _SECOND_YAML = """
 workflow_id: alpha_workflow
 description: "second workflow for list testing"
@@ -647,28 +648,114 @@ def test_save_workflow_id_mismatch_returns_422(save_client: TestClient) -> None:
     mock_save.assert_not_called()
 
 
-def test_save_workflow_python_type_rejected(save_client: TestClient) -> None:
-    """S15: type=python → 422 (RCE defense)."""
-    from unittest.mock import patch
-
-    python_payload = {
-        "workflow_id": "rce_test",
-        "entry_point": "bad_node",
-        "nodes": [{"name": "bad_node", "type": "python", "config": {"code": "print(1)"}}],
-        "edges": [{"source": "bad_node", "target": "END"}],
+def _python_payload(config: dict[str, Any], workflow_id: str = "py_test") -> dict[str, Any]:
+    """A minimal single-node definition carrying one ``python`` node."""
+    return {
+        "workflow_id": workflow_id,
+        "entry_point": "transform",
+        "nodes": [{"name": "transform", "type": "python", "config": config}],
+        "edges": [{"source": "transform", "target": "END"}],
         "state_schema": {"input": {"type": "str", "description": "x"}},
     }
+
+
+def test_save_workflow_unknown_node_type_rejected(save_client: TestClient) -> None:
+    """S18: a type outside {llm, http, python} is still refused."""
+    from unittest.mock import patch
+
     from app.core.config import settings
 
+    payload = {**_SAVE_PAYLOAD, "workflow_id": "unknown_type"}
+    payload["nodes"] = [{"name": "classify", "type": "shell", "config": {}}]
     with (
         patch("app.workflow.api.save_definition_yaml") as mock_save,
         patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
     ):
-        response = save_client.put("/workflows/rce_test", json=python_payload)
+        response = save_client.put("/workflows/unknown_type", json=payload)
     assert response.status_code == 422
-    registry = save_client.app.state.workflow_registry
-    assert not registry.has_workflow("rce_test")
+    assert "shell" in response.json()["message"]
+    assert not save_client.app.state.workflow_registry.has_workflow("unknown_type")
     mock_save.assert_not_called()
+
+
+def test_save_workflow_python_code_node_accepted(save_client: TestClient) -> None:
+    """S18: code-only python is allowed, and the server forces sandboxed=true."""
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
+    payload = _python_payload({"code": 'return {"upper": state["input"].upper()}'})
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        mock_save.return_value = Path("/fake/py_test.yaml")
+        response = save_client.put("/workflows/py_test", json=payload)
+
+    assert response.status_code == 200
+    config = response.json()["data"]["nodes"][0]["config"]
+    assert config["sandboxed"] is True
+    assert save_client.app.state.workflow_registry.has_workflow("py_test")
+    persisted = mock_save.call_args[0][0]
+    assert persisted.nodes[0].config["sandboxed"] is True
+
+
+def test_save_workflow_python_entry_node_rejected(save_client: TestClient) -> None:
+    """S18 condition 1: entry mode can load arbitrary repo modules, so it cannot be sandboxed."""
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
+    payload = _python_payload({"entry": "app.utils:helper"}, workflow_id="entry_test")
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        response = save_client.put("/workflows/entry_test", json=payload)
+    assert response.status_code == 422
+    assert "entry" in response.json()["message"]
+    assert not save_client.app.state.workflow_registry.has_workflow("entry_test")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_python_illegal_code_rejected(save_client: TestClient) -> None:
+    """S18 condition 2: AST pre-check rejects, naming the rule but never the code (H6)."""
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
+    payload = _python_payload({"code": 'secret_marker = "hunter2"\nimport os\nreturn {}'}, workflow_id="ast_test")
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        response = save_client.put("/workflows/ast_test", json=payload)
+    assert response.status_code == 422
+    message = response.json()["message"]
+    assert "no-import" in message
+    assert "hunter2" not in message
+    assert "secret_marker" not in message
+    assert not save_client.app.state.workflow_registry.has_workflow("ast_test")
+    mock_save.assert_not_called()
+
+
+def test_save_workflow_python_sandboxed_flag_is_forced(save_client: TestClient) -> None:
+    """S18 condition 3: sandboxed is a security property, so the client value is overwritten."""
+    from unittest.mock import patch
+
+    from app.core.config import settings
+
+    payload = _python_payload({"code": "return {}", "sandboxed": False}, workflow_id="forced_test")
+    with (
+        patch("app.workflow.api.save_definition_yaml") as mock_save,
+        patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]),
+    ):
+        mock_save.return_value = Path("/fake/forced_test.yaml")
+        response = save_client.put("/workflows/forced_test", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["data"]["nodes"][0]["config"]["sandboxed"] is True
+    assert mock_save.call_args[0][0].nodes[0].config["sandboxed"] is True
 
 
 def test_save_workflow_dangling_edge_returns_422(save_client: TestClient) -> None:
