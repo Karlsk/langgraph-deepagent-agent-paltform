@@ -1,13 +1,22 @@
 <script setup lang="ts">
 /**
- * 工作流执行对话框（spec-07）：
- * JSON 输入 + 三示例预设 + 前端解析校验 + 结果展示（output + metadata）+
- * 「查看轨迹」按钮打开 WorkflowTraceDrawer。
+ * 工作流执行对话框（spec-07 / S21）：
+ * 简单模式 = 主输入 + 由 state_schema 派生的自定义字段（后端把字符串 input
+ * 合成为 messages，调用方无需手写消息结构）；高级模式 = 裸 JSON 原样透传。
+ * 结果展示（output + metadata）+「查看轨迹」按钮打开 WorkflowTraceDrawer。
  */
 import { computed, ref, watch } from 'vue'
 
-import { executeWorkflow, type ExecutionLogView, type WorkflowExecuteResult } from '@/api/workflow'
-import { notifyError } from '@/utils/notify'
+import {
+  executeWorkflow,
+  getWorkflow,
+  type ExecutionLogView,
+  type StateFieldDTO,
+  type WorkflowExecuteResult,
+} from '@/api/workflow'
+import { useExecuteForm } from '@/composables/useExecuteForm'
+import { toExecuteErrorMessage } from '@/utils/workflowErrors'
+import ExecuteInputFields from '@/views/workflow/panel/ExecuteInputFields.vue'
 import WorkflowTraceDrawer from '@/views/workflow/WorkflowTraceDrawer.vue'
 
 const props = defineProps<{
@@ -20,38 +29,52 @@ const emit = defineEmits<{
   executed: [result: WorkflowExecuteResult]
 }>()
 
-const PRESETS: Record<string, Record<string, unknown>> = {
-  '空输入': {},
-  '简单消息': { message: 'hello' },
-  '多字段': { user_id: 'u-001', action: 'summarize', max_tokens: 512 },
-}
+const MODE_OPTIONS = [
+  { value: 'simple', label: '简单模式' },
+  { value: 'advanced', label: '高级模式（JSON）' },
+] as const
 
-const presetKeys = Object.keys(PRESETS)
-const selectedPreset = ref<string>(presetKeys[0])
-const inputText = ref(JSON.stringify(PRESETS[presetKeys[0]]!, null, 2))
-const jsonError = ref<string | null>(null)
+const stateSchema = ref<Record<string, StateFieldDTO> | undefined>(undefined)
+const {
+  mode,
+  primaryInput,
+  fieldValues,
+  advancedText,
+  fields,
+  fieldErrors,
+  jsonError,
+  reset,
+  buildPayload,
+} = useExecuteForm(stateSchema)
+
 const loading = ref(false)
 const result = ref<WorkflowExecuteResult | null>(null)
+const executeError = ref<string | null>(null)
 const traceVisible = ref(false)
 const traceLogs = ref<ExecutionLogView[]>([])
 
-watch(() => props.modelValue, (visible) => {
-  if (visible) {
-    result.value = null
-    jsonError.value = null
-    loading.value = false
-    selectedPreset.value = presetKeys[0]
-    inputText.value = JSON.stringify(PRESETS[presetKeys[0]]!, null, 2)
-  }
-})
-
-function onPresetChange(key: string): void {
-  const preset = PRESETS[key]
-  if (preset) {
-    inputText.value = JSON.stringify(preset, null, 2)
-    jsonError.value = null
+async function loadSchema(): Promise<void> {
+  try {
+    const definition = await getWorkflow(props.workflowId, 'json')
+    stateSchema.value = 'state_schema' in definition ? definition.state_schema : undefined
+  } catch {
+    // 定义拉取失败时降级为「只有主输入」，不阻断执行。
+    stateSchema.value = undefined
   }
 }
+
+watch(
+  () => props.modelValue,
+  (visible) => {
+    if (!visible) return
+    result.value = null
+    executeError.value = null
+    loading.value = false
+    reset()
+    void loadSchema()
+  },
+  { immediate: true },
+)
 
 const hasResult = computed(() => result.value !== null)
 
@@ -77,27 +100,20 @@ function formatTime(ms: unknown): string {
 }
 
 async function handleExecute(): Promise<void> {
-  jsonError.value = null
-  let parsed: Record<string, unknown>
-  try {
-    const raw = JSON.parse(inputText.value)
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      throw new Error('输入必须是 JSON 对象')
-    }
-    parsed = raw
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'JSON 格式错误'
-    jsonError.value = msg
-    return
-  }
+  executeError.value = null
+  // 结果区只反映最近一次提交：否则校验失败时旧输出会与新错误同屏，被误读为本次结果。
+  result.value = null
+  const payload = buildPayload()
+  if (payload === null) return
 
   loading.value = true
   try {
-    const res = await executeWorkflow(props.workflowId, parsed)
+    const res = await executeWorkflow(props.workflowId, payload)
     result.value = res
     emit('executed', res)
-  } catch {
-    notifyError('执行失败，请稍后重试')
+  } catch (err: unknown) {
+    // 请求层已 toast 过一次，这里把摘要留在对话框内便于对照输入排查。
+    executeError.value = toExecuteErrorMessage(err)
   } finally {
     loading.value = false
   }
@@ -118,28 +134,58 @@ function handleOpenTrace(): void {
   >
     <div class="execute-dialog">
       <div class="execute-dialog__input-section">
-        <div class="execute-dialog__preset-row">
-          <span class="execute-dialog__label">预设示例</span>
-          <el-select :model-value="selectedPreset" @change="onPresetChange">
-            <el-option
-              v-for="key in presetKeys"
-              :key="key"
-              :label="key"
-              :value="key"
+        <div class="execute-dialog__mode-row">
+          <label
+            v-for="option in MODE_OPTIONS"
+            :key="option.value"
+            class="execute-dialog__mode"
+          >
+            <input
+              v-model="mode"
+              type="radio"
+              name="execute-input-mode"
+              :value="option.value"
             />
-          </el-select>
+            <span>{{ option.label }}</span>
+          </label>
         </div>
-        <div class="execute-dialog__input-row">
-          <span class="execute-dialog__label">输入 (JSON)</span>
-          <el-input
-            v-model="inputText"
-            type="textarea"
-            :rows="6"
-            placeholder='{"key": "value"}'
+
+        <div v-if="mode === 'simple'" class="execute-dialog__simple">
+          <div class="execute-dialog__primary">
+            <span class="execute-dialog__label">主输入</span>
+            <el-input
+              v-model="primaryInput"
+              type="textarea"
+              :rows="4"
+              placeholder="要发给工作流的内容"
+            />
+            <p class="execute-dialog__hint">
+              主输入会自动转换为一条 user 消息发给工作流；需要完整的消息结构请切换到高级模式。
+            </p>
+          </div>
+
+          <ExecuteInputFields
+            v-model="fieldValues"
+            :fields="fields"
+            :errors="fieldErrors"
           />
         </div>
+
+        <div v-else class="execute-dialog__advanced">
+          <span class="execute-dialog__label">输入 (JSON)</span>
+          <el-input
+            v-model="advancedText"
+            type="textarea"
+            :rows="6"
+            placeholder='{"input": "hello"}'
+          />
+        </div>
+
         <div v-if="jsonError" class="execute-dialog__json-error">
           {{ jsonError }}
+        </div>
+        <div v-if="executeError" class="execute-dialog__error">
+          {{ executeError }}
         </div>
       </div>
 
@@ -192,20 +238,45 @@ function handleOpenTrace(): void {
   margin-bottom: 4px;
 }
 
-.execute-dialog__preset-row {
+.execute-dialog__input-section {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 12px;
 }
 
-.execute-dialog__input-row {
-  margin-top: 12px;
+.execute-dialog__mode-row {
+  display: flex;
+  gap: 16px;
 }
 
-.execute-dialog__json-error {
+.execute-dialog__mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.execute-dialog__simple {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.execute-dialog__hint {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
+
+.execute-dialog__json-error,
+.execute-dialog__error {
   color: var(--color-danger-600);
   font-size: 13px;
-  margin-top: 4px;
+  line-height: 1.5;
+  word-break: break-word;
 }
 
 .execute-dialog__actions {

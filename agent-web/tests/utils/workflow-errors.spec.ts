@@ -3,7 +3,7 @@
  * 纯函数测试，无 DOM 依赖
  */
 import { describe, expect, it } from 'vitest'
-import { toFieldErrors, type FieldError } from '@/utils/workflowErrors'
+import { toExecuteErrorMessage, toFieldErrors, type FieldError } from '@/utils/workflowErrors'
 import type { GraphValidationError } from '@/composables/useWorkflowGraph'
 
 function makeAxiosError(status: number, data: unknown): Error {
@@ -151,5 +151,41 @@ describe('toFieldErrors — 非 422 / 非 axios 错误', () => {
     const error = new Error('network error') as Error & { isAxiosError: boolean }
     error.isAxiosError = true
     expect(toFieldErrors(error)).toEqual([])
+  })
+})
+
+describe('toExecuteErrorMessage — 执行失败摘要', () => {
+  it('统一信封 message → 原样返回', () => {
+    const error = makeAxiosError(500, {
+      code: 500,
+      message: "workflow execution failed for 'wf': ConditionNotMatchedError: no branch matched",
+      data: null,
+    })
+    expect(toExecuteErrorMessage(error)).toContain('ConditionNotMatchedError')
+  })
+
+  it('旧 FastAPI detail → 返回 detail', () => {
+    const error = makeAxiosError(422, { detail: 'invalid node config' })
+    expect(toExecuteErrorMessage(error)).toBe('invalid node config')
+  })
+
+  it('axios 错误但无可读信封 → fallback，不暴露 axios 原始文案', () => {
+    const error = makeAxiosError(500, undefined)
+    expect(toExecuteErrorMessage(error)).toBe('执行失败，请稍后重试')
+    expect(toExecuteErrorMessage(error)).not.toContain('Request failed')
+  })
+
+  it('非 axios Error → 返回其 message', () => {
+    expect(toExecuteErrorMessage(new Error('boom'))).toBe('boom')
+  })
+
+  it('null / undefined / 字符串 → fallback', () => {
+    expect(toExecuteErrorMessage(null)).toBe('执行失败，请稍后重试')
+    expect(toExecuteErrorMessage(undefined)).toBe('执行失败，请稍后重试')
+    expect(toExecuteErrorMessage('oops')).toBe('执行失败，请稍后重试')
+  })
+
+  it('支持自定义 fallback', () => {
+    expect(toExecuteErrorMessage(makeAxiosError(500, {}), '跑不动')).toBe('跑不动')
   })
 })

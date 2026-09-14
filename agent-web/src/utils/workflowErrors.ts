@@ -19,6 +19,23 @@ export function toFieldErrors(source: GraphValidationError[] | unknown): FieldEr
   return mapHttp422(source)
 }
 
+const EXECUTE_FALLBACK = '执行失败，请稍后重试'
+
+/**
+ * 执行失败摘要：信封 message / 旧 detail 优先，其次非 axios Error 的 message。
+ * axios 自身的 "Request failed with status code 500" 对用户无信息量，直接走 fallback。
+ */
+export function toExecuteErrorMessage(error: unknown, fallback: string = EXECUTE_FALLBACK): string {
+  if (isAxiosError(error)) {
+    const data = (error as AxiosErrorLike).response?.data as Record<string, unknown> | undefined
+    return (data ? extractMessage(data) : null) ?? fallback
+  }
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+  return fallback
+}
+
 function mapLocalErrors(errors: GraphValidationError[]): FieldError[] {
   return errors.map((e) => {
     const field: FieldError = { field: e.field, message: e.message }

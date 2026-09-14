@@ -1,9 +1,10 @@
 // @vitest-environment happy-dom
 /**
- * WorkflowExecuteDialog + WorkflowTraceDrawer 测试（spec-07）：
+ * WorkflowExecuteDialog + WorkflowTraceDrawer 测试（spec-07 / S21 前端侧）：
  * - stub Element Plus 组件；
- * - mock `@/api/workflow` 的 executeWorkflow；
- * - 验证预设填充、JSON 校验、执行流程、错误处理、轨迹抽屉渲染。
+ * - mock `@/api/workflow` 的 getWorkflow + executeWorkflow；
+ * - 验证简单模式（主输入 + state_schema 驱动的自定义字段）、高级模式裸 JSON、
+ *   提交形状、错误可见性、轨迹抽屉渲染。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent, h, nextTick } from 'vue'
@@ -33,6 +34,7 @@ vi.mock('element-plus', () => ({
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     executeWorkflow: vi.fn(),
+    getWorkflow: vi.fn(),
   },
 }))
 
@@ -72,6 +74,21 @@ const EXECUTE_RESULT: WorkflowExecuteResult = {
   result: 'done',
   count: 3,
   metadata: { duration_ms: 520, execution_logs: LOGS },
+}
+
+const DEFINITION = {
+  workflow_id: 'wf-test',
+  entry_point: 'ask',
+  nodes: [{ name: 'ask', type: 'llm' as const, config: {} }],
+  edges: [{ source: 'ask', target: 'END' }],
+  state_schema: {
+    input: { type: 'str', description: '用户输入', reducer: null },
+    messages: { type: 'list', description: '对话消息', reducer: null },
+    history: { type: 'list', description: '执行历史', reducer: null },
+    user_id: { type: 'str', description: '调用方标识', reducer: null },
+    max_tokens: { type: 'int', description: '上限', reducer: null },
+    ask_result: { type: 'any', description: '', reducer: null },
+  },
 }
 
 const ElDialogStub = defineComponent({
@@ -141,40 +158,6 @@ const ElInputStub = defineComponent({
   },
 })
 
-const ElSelectStub = defineComponent({
-  name: 'ElSelect',
-  props: { modelValue: [String, Number] },
-  emits: ['update:modelValue', 'change'],
-  setup(_props, { slots, emit }) {
-    return () =>
-      h('div', { class: 'el-select-stub' }, [
-        slots.default ? slots.default() : undefined,
-        h('button', {
-          class: 'el-select__trigger',
-          onClick: () => {
-            const options = slots.default?.()
-            if (options && Array.isArray(options)) {
-              const firstOption = options[0]
-              if (firstOption && typeof firstOption === 'object' && 'props' in firstOption) {
-                const val = (firstOption.props as Record<string, unknown>).value
-                emit('update:modelValue', val)
-                emit('change', val)
-              }
-            }
-          },
-        }, 'SelectFirst'),
-      ])
-  },
-})
-
-const ElOptionStub = defineComponent({
-  name: 'ElOption',
-  props: { label: String, value: [String, Number] },
-  setup(props) {
-    return () => h('div', { class: 'el-option-stub', 'data-value': String(props.value ?? '') }, props.label ?? '')
-  },
-})
-
 const ElTagStub = defineComponent({
   name: 'ElTag',
   props: { type: String, size: String },
@@ -203,8 +186,6 @@ function mountDialog(overrides?: Record<string, unknown>): VueWrapper {
         ElDialog: ElDialogStub,
         ElButton: ElButtonStub,
         ElInput: ElInputStub,
-        ElSelect: ElSelectStub,
-        ElOption: ElOptionStub,
         ElTag: ElTagStub,
         ElIcon: ElIconStub,
         WorkflowTraceDrawer: ElDrawerStub,
@@ -229,103 +210,216 @@ function mountDrawer(overrides?: Record<string, unknown>): VueWrapper {
   })
 }
 
+function findButton(wrapper: VueWrapper, text: string) {
+  const button = wrapper.findAllComponents(ElButtonStub).find((b) => b.text().includes(text))
+  expect(button, `expected a button containing ${text}`).toBeDefined()
+  return button!
+}
+
+async function submit(wrapper: VueWrapper): Promise<void> {
+  await findButton(wrapper, '执行').trigger('click')
+  await flushPromises()
+}
+
+function makeAxiosError(status: number, data: unknown): Error {
+  const error = new Error('Request failed with status code ' + status) as Error & {
+    isAxiosError: boolean
+    response?: { status: number; data: unknown }
+  }
+  error.isAxiosError = true
+  error.response = { status, data }
+  return error
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   elMessageMock.mockReset()
   apiMock.executeWorkflow.mockResolvedValue(EXECUTE_RESULT)
+  apiMock.getWorkflow.mockResolvedValue(DEFINITION)
 })
 
-describe('WorkflowExecuteDialog（spec-07）', () => {
-  it('打开对话框 → 展示预设示例；选预设填充输入框', async () => {
+describe('WorkflowExecuteDialog — 简单模式（S21）', () => {
+  it('打开对话框 → 拉取定义，渲染主输入与自定义字段', async () => {
     const wrapper = mountDialog()
     await flushPromises()
 
-    const select = wrapper.findComponent(ElSelectStub)
-    expect(select.exists()).toBe(true)
+    expect(apiMock.getWorkflow).toHaveBeenCalledWith('wf-test', 'json')
+    expect(wrapper.find('.execute-dialog__primary .el-input-stub').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('预设示例')
+  })
 
-    const textarea = wrapper.find('.el-input-stub')
-    expect(textarea.exists()).toBe(true)
+  it('自定义字段来自 state_schema，排除保留键', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
 
-    const options = wrapper.findAll('.el-option-stub')
-    expect(options.length).toBeGreaterThanOrEqual(3)
+    const rows = wrapper.findAll('.execute-field')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].text()).toContain('user_id')
+    expect(rows[1].text()).toContain('max_tokens')
+
+    const text = wrapper.text()
+    expect(text).not.toContain('ask_result')
+    expect(wrapper.findAll('.execute-field__label').map((l) => l.text())).not.toContain('messages')
+  })
+
+  it('主输入 + 自定义字段 → executeWorkflow(id, {input, user_id})', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await wrapper.find('.execute-field__text').setValue('u-001')
+    await submit(wrapper)
+
+    expect(apiMock.executeWorkflow).toHaveBeenCalledWith('wf-test', {
+      input: 'hello',
+      user_id: 'u-001',
+    })
+  })
+
+  it('主输入留空 → payload 不含 input 键', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+
+    await wrapper.find('.execute-field__text').setValue('u-001')
+    await submit(wrapper)
+
+    expect(apiMock.executeWorkflow).toHaveBeenCalledWith('wf-test', { user_id: 'u-001' })
+  })
+
+  it('数字字段非法 → 拦截并标红，不调 executeWorkflow', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await wrapper.find('.execute-field__number').setValue('not-a-number')
+    await submit(wrapper)
+
+    expect(apiMock.executeWorkflow).not.toHaveBeenCalled()
+    expect(wrapper.find('.execute-field__error').exists()).toBe(true)
+  })
+
+  it('定义拉取失败 → 简单模式仍可只填主输入执行', async () => {
+    apiMock.getWorkflow.mockRejectedValueOnce(new Error('network down'))
+    const wrapper = mountDialog()
+    await flushPromises()
+
+    expect(wrapper.findAll('.execute-field')).toHaveLength(0)
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await submit(wrapper)
+
+    expect(apiMock.executeWorkflow).toHaveBeenCalledWith('wf-test', { input: 'hello' })
+  })
+})
+
+describe('WorkflowExecuteDialog — 高级模式', () => {
+  async function switchToAdvanced(wrapper: VueWrapper): Promise<void> {
+    await wrapper.find('input[value="advanced"]').setValue(true)
+    await nextTick()
+  }
+
+  it('切换到高级模式 → 裸 JSON 文本框，自定义字段隐藏', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+    await switchToAdvanced(wrapper)
+
+    expect(wrapper.find('.execute-dialog__advanced .el-input-stub').exists()).toBe(true)
+    expect(wrapper.findAll('.execute-field')).toHaveLength(0)
+  })
+
+  it('合法 JSON → 原样透传给 executeWorkflow', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+    await switchToAdvanced(wrapper)
+
+    const payload = { input: 'hi', messages: [{ role: 'user', content: 'hi' }] }
+    await wrapper.find('.execute-dialog__advanced .el-input-stub').setValue(JSON.stringify(payload))
+    await submit(wrapper)
+
+    expect(apiMock.executeWorkflow).toHaveBeenCalledWith('wf-test', payload)
   })
 
   it('非法 JSON → 前端拦截，展示校验错误，不调 executeWorkflow', async () => {
     const wrapper = mountDialog()
     await flushPromises()
+    await switchToAdvanced(wrapper)
 
-    const textarea = wrapper.find('.el-input-stub')
-    await textarea.setValue('{invalid json}')
-    await nextTick()
-
-    const submitBtn = wrapper.findAllComponents(ElButtonStub)
-      .find((b) => b.text().includes('执行'))
-    expect(submitBtn).toBeDefined()
-    await submitBtn!.trigger('click')
-    await flushPromises()
+    await wrapper.find('.execute-dialog__advanced .el-input-stub').setValue('{invalid json}')
+    await submit(wrapper)
 
     expect(apiMock.executeWorkflow).not.toHaveBeenCalled()
     expect(wrapper.text()).toMatch(/json|格式|校验|非法|解析/i)
   })
 
-  it('合法输入提交 → 调 executeWorkflow(id, input)；loading 态；成功渲染 output + metadata', async () => {
+  it('切回简单模式 → 恢复主输入与自定义字段', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+    await switchToAdvanced(wrapper)
+    await wrapper.find('input[value="simple"]').setValue(true)
+    await nextTick()
+
+    expect(wrapper.find('.execute-dialog__primary .el-input-stub').exists()).toBe(true)
+    expect(wrapper.findAll('.execute-field')).toHaveLength(2)
+  })
+})
+
+describe('WorkflowExecuteDialog — 结果与错误', () => {
+  it('执行成功 → 渲染 output 与耗时', async () => {
     const wrapper = mountDialog()
     await flushPromises()
 
-    const textarea = wrapper.find('.el-input-stub')
-    await textarea.setValue('{"message": "hello"}')
-    await nextTick()
-
-    const submitBtn = wrapper.findAllComponents(ElButtonStub)
-      .find((b) => b.text().includes('执行'))
-    await submitBtn!.trigger('click')
-
-    expect(apiMock.executeWorkflow).toHaveBeenCalledWith('wf-test', { message: 'hello' })
-
-    await flushPromises()
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await submit(wrapper)
 
     expect(wrapper.text()).toContain('done')
     expect(wrapper.text()).toContain('520')
   })
 
-  it('executeWorkflow reject → 错误提示，对话框不崩', async () => {
-    apiMock.executeWorkflow.mockRejectedValue(new Error('500 Internal Server Error'))
+  it('执行失败 → 对话框内展示后端错误摘要，不崩', async () => {
+    apiMock.executeWorkflow.mockRejectedValue(
+      makeAxiosError(500, {
+        code: 500,
+        message: "workflow execution failed for 'wf-test': ConditionNotMatchedError: no branch matched",
+        data: null,
+      }),
+    )
     const wrapper = mountDialog()
     await flushPromises()
 
-    const textarea = wrapper.find('.el-input-stub')
-    await textarea.setValue('{"key": "value"}')
-    await nextTick()
-
-    const submitBtn = wrapper.findAllComponents(ElButtonStub)
-      .find((b) => b.text().includes('执行'))
-    await submitBtn!.trigger('click')
-    await flushPromises()
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await submit(wrapper)
 
     expect(wrapper.find('.el-dialog-stub').exists()).toBe(true)
+    expect(wrapper.find('.execute-dialog__error').text()).toContain('ConditionNotMatchedError')
   })
 
-  it('执行成功后点击「查看轨迹」→ 打开 WorkflowTraceDrawer 并传入 logs', async () => {
+  it('执行成功后点击「查看轨迹」→ 打开 WorkflowTraceDrawer', async () => {
     const wrapper = mountDialog()
     await flushPromises()
 
-    const textarea = wrapper.find('.el-input-stub')
-    await textarea.setValue('{"key": "value"}')
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await submit(wrapper)
+
+    await findButton(wrapper, '轨迹').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findComponent({ name: 'ElDrawer' }).exists()).toBe(true)
+  })
+
+  it('再次提交校验失败 → 清除上一次结果，避免把旧输出误读为本次结果', async () => {
+    const wrapper = mountDialog()
+    await flushPromises()
+
+    await wrapper.find('.execute-dialog__primary .el-input-stub').setValue('hello')
+    await submit(wrapper)
+    expect(wrapper.find('.execute-dialog__result').exists()).toBe(true)
+
+    await wrapper.find('input[value="advanced"]').setValue(true)
     await nextTick()
+    await wrapper.find('.execute-dialog__advanced .el-input-stub').setValue('{invalid json}')
+    await submit(wrapper)
 
-    const submitBtn = wrapper.findAllComponents(ElButtonStub)
-      .find((b) => b.text().includes('执行'))
-    await submitBtn!.trigger('click')
-    await flushPromises()
-
-    const traceBtn = wrapper.findAllComponents(ElButtonStub)
-      .find((b) => b.text().includes('轨迹'))
-    expect(traceBtn).toBeDefined()
-    await traceBtn!.trigger('click')
-    await flushPromises()
-
-    const drawer = wrapper.findComponent({ name: 'ElDrawer' })
-    expect(drawer.exists()).toBe(true)
+    expect(wrapper.find('.execute-dialog__json-error').exists()).toBe(true)
+    expect(wrapper.find('.execute-dialog__result').exists()).toBe(false)
   })
 })
 
