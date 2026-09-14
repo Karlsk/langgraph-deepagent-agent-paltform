@@ -31,7 +31,7 @@ CONTRACT.md（本文件） > spec-00..09 > 规划文档（00-03） > 原 workflo
 
 ### 2.1 本期允许创建/修改的文件全集（白名单）
 
-**`app/workflow/`（15 个模块，多一个即违规）：**
+**`app/workflow/`（22 个模块，多一个即违规）：**
 
 ```
 app/workflow/
@@ -39,23 +39,34 @@ app/workflow/
   models.py              # DSL 模型 + 精简 NodeType + 异常族（单点）
   state.py               # StateModelFactory（< 150 行）
   graph_builder.py       # GraphBuilder + BuildResult（< 300 行，只含 GraphBuilder）
-  registry.py            # WorkflowRegistry + RunResult + RunLogCollector + load_definitions_from_dir（< 350 行）
+  registry.py            # WorkflowRegistry + RunResult + RunLogCollector + load_definitions_from_dir + synthesize_run_input（< 350 行）
   utils.py               # 仅 convert_state_to_dict / map_output_to_state（< 150 行）
   logging_conf.py        # setup_logging + redact + 脱敏 processor
   cli.py                 # ApiResponse + build_registry + build_parser + main（< 200 行）
   __main__.py            # python -m app.workflow 入口
   api.py                 # 【可选】FastAPI router（AD-10）
+  auth.py                # 写端点管理员角色校验（S19）。入口层：可 import app.api/app.core（AD-02 组装点例外）
+  ports.py               # ChatModelFactory 等宿主注入类型别名（S20），仅类型，不含任何 app.* 依赖
+  security.py            # SSRF 校验 validate_http_url（spec-20）。入口层：读 app.core.config（AD-02 组装点例外）
+  store.py               # YAML 落盘读写 + 原子替换（S17），只依赖 stdlib + yaml
+  sandbox.py             # validate_code_ast + SandboxLimits + run_sandboxed（S22，< 400 行）
+  sandbox_worker.py      # 子进程入口；**非 importable API**，只被 sandbox.py 以 sys.executable -I 拉起（S22，< 400 行）
   nodes/
     __init__.py          # 导出 BaseNode/register_node_type/create_node/LLMNode/HTTPNode
     base.py              # BaseNode + RunLogCollectorLike + _RUN_COLLECTOR（< 200 行）
     factory.py           # _NODE_REGISTRY + register/list/create（< 120 行）
     llm_node.py          # LLMNode + LLMConfig（< 250 行）
     http_node.py         # HTTPNode + HTTPNodeConfig（< 280 行）
+    python_node.py       # PythonNode 插件（K5 范例，R4 守护不变：factory 无内置分支）
   config/examples/
     minimal.yaml         # Phase 1
     http_demo.yaml       # Phase 9
     condition_branch.yaml # Phase 6
 ```
+
+> **计数说明（2026-09-14）**：原表记 15 个模块，但 `auth.py` / `ports.py` / `security.py` / `store.py` / `nodes/python_node.py`
+> 早已随 spec-17..20 与 K5 插件范例落地却未回写白名单（文档漂移）。本次按第 11 章流程一并补录，
+> 并新增 S22 所需的 `sandbox.py` / `sandbox_worker.py`。补录不改变任何代码，只使白名单与实际仓库一致。
 
 **测试（镜像结构，`tests/` 目录本仓库新建）：**
 
@@ -548,7 +559,8 @@ async def get_workflow(request: Request, workflow_id: str, format: Literal["json
 async def save_workflow(request: Request, workflow_id: str, body: dict[str, Any]) -> JSONResponse:
     """全量保存注册（S13 原子替换）：
     body → parse_definition(body)（WorkflowDefinition.model_validate）
-         → 节点类型白名单校验（S18：type ∈ {llm, http}，拒 python → 422）
+         → 节点类型白名单校验（S18：type ∈ {llm, http, python}；python 须 code-only + AST 通过，
+           服务端强制 sandboxed=true；违规 → 422）
          → register_workflow(definition, default_edges=body.get("default_edges"))
          → yaml.safe_dump 落盘 user 目录（S17：文件名白名单 ^[A-Za-z0-9_-]{1,64}$）
          → 成功 data: {"yaml_text": ..., "workflow_id": ...}。
@@ -565,11 +577,57 @@ async def delete_workflow(request: Request, workflow_id: str) -> JSONResponse:
 **约束**：
 
 - **引擎内核零改动**：`registry.py` / `nodes/*` / `graph_builder.py` / `models.py` 不修改（AD-02 引擎自包含红线不变）。
+  *范围限定*：本条只约束画布编排这一特性自身；后续 S22（2026-09-14）按其契约行另行修改 `models.py`（异常族规范化）
+  与 `nodes/python_node.py`（沙箱分支），不视为违反本条。
 - **限流 / DI / 信封**：沿用现状 execute 端点范式（slowapi、`get_registry`、宿主统一信封，AD-10）。
 - **写端点鉴权**（S19）：`PUT` / `DELETE` 须 `Depends(get_current_user)` + 管理员角色校验；现状 execute 端点无鉴权，需后端补齐策略。
-- **节点类型白名单**（S18）：`PUT` 服务端二次校验 `node.type ∈ {llm, http}`，拒绝 `python`（S15 RCE）及未知类型。
+- **节点类型白名单**（S18，2026-09-14 修订）：`PUT` 服务端二次校验 `node.type ∈ {llm, http, python}`；`python` 须满足
+  code-only + `validate_code_ast` 通过 + 服务端强制 `sandboxed=true`（客户端值被忽略并覆写），其余一律拒绝（详见 S18/S22）。
 - **YAML 落盘**（S17）：用户定义目录 `app/workflow/config/user/`（与只读 `examples/` 分离）；`PUT` 全量覆盖写 + 原子替换；文件名白名单校验 `^[A-Za-z0-9_-]{1,64}$`（防路径穿越）；`build_registry` 启动扫描 `examples/` + `user/`（S16 fail-fast）。
 - **前端契约期望**：`docs/workflow-frontend-spec.md` §4.2 声明的端点路径、请求/响应形态、错误码须与本契约一致。
+
+### 4.14 `app/workflow/sandbox.py` — Python 节点沙箱（S22，2026-09-14 新增）
+
+> 引擎内核模块（只依赖 stdlib + `app.workflow.models`），供 `PythonNode` 与 `api.py` 注册期校验共用。
+> `sandbox_worker.py` 不在此冻结签名——它是**子进程入口**而非 importable API，其线上协议冻结在 S22。
+
+```python
+def validate_code_ast(code: str) -> None:
+    """静态拒绝不可沙箱化的代码。通过返回 None，否则抛 WorkflowValidationError。
+
+    规则（命中即拒；消息含**行号 + 规则名**，绝不含代码正文，H6）：
+      1. import / from ... import（ast.Import / ast.ImportFrom）——全禁，无白名单模块
+      2. 危险调用名（ast.Call.func 为 ast.Name 且 id ∈ _FORBIDDEN_CALLS）：
+         exec / eval / compile / open / __import__ / globals / locals / vars / dir /
+         getattr / setattr / delattr / type / input / breakpoint / exit / quit / help
+      3. dunder 标识符：任何 ast.Name.id 或 ast.Attribute.attr 含 "__"
+         （封死 ().__class__.__bases__.__subclasses__() 这类内省逃逸链）
+      4. 体积 > _MAX_CODE_BYTES（64 KiB）
+    """
+
+@dataclass(frozen=True)
+class SandboxLimits:
+    """沙箱资源上限（POSIX best-effort，残留风险见 S22 备注）。"""
+
+    timeout_s: float = 10.0
+    max_memory_mb: int = 256
+    max_output_bytes: int = 1_000_000
+
+def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = SandboxLimits()) -> dict[str, Any]:
+    """在子进程沙箱中执行 code，返回其 dict 结果。
+
+    执行前**复跑** validate_code_ast（纵深防御：调用方可能绕过注册期校验）。
+    超时 / 非零退出 / worker 报 ok=false / 输出非 dict → 一律抛 PythonNodeError。
+    """
+```
+
+**约束**：
+
+- **默认参数在定义处求值一次**（`SandboxLimits()` 不可变 dataclass），不得写成 `limits=None` 再在函数内构造，以保证签名与行为一致。
+- **`sandbox.py` 不得 import `app.core.*` / `app.api.*` / `app.services.*`**（引擎自包含红线，AD-02）；异常只用 §5 冻结族。
+- **`sandbox_worker.py` 不进入任何模块的 import 图**：只被 `run_sandboxed` 以 `[sys.executable, "-I", <绝对路径>]` 拉起；
+  协议为 stdin/stdout 各恰好一个 JSON 文档（详见 S22）。
+- **R8**：两模块各 < 400 行，函数 < 50 行；AST 规则表与 `SAFE_BUILTINS` 为模块级常量，便于守护测试直接断言。
 
 ## 5. 异常族契约
 
@@ -588,7 +646,24 @@ class LLMNodeError(WorkflowEngineError):
     """LLM 调用失败（含重试耗尽）。"""
 class HTTPNodeError(WorkflowEngineError):
     """HTTP 调用失败（含重试耗尽、mock 未命中显式报错）。"""
+class PythonNodeError(WorkflowEngineError):
+    """python 节点执行失败（inline code 编译/返回契约、entry 解析，以及 S22 沙箱超时/非零退出/输出非 dict）。"""
+class WorkflowValidationError(WorkflowEngineError):
+    """注册期定义校验失败 → HTTP 422（S6 构建期优先）。承载 SSRF（spec-20）与沙箱 AST 预检（S22）两类原因。"""
 ```
+
+**规范化说明（2026-09-14）**：`WorkflowValidationError` 原定义于 `app/workflow/security.py`（spec-20 引入），
+违反本章「单点定义于 `models.py`」规则。本次**迁入 `models.py`** 并改挂 `WorkflowEngineError` 基类，
+`security.py` / `api.py` / 相关测试改为从 `models.py` 导入（4 处 import 调整）。
+
+迁移动机：S22 的 `sandbox.py` 需要抛同一类「注册期校验失败 → 422」异常，若沿用现状就会出现第二个模块
+从 SSRF 专用模块 import 通用校验异常的怪依赖，把既有漂移扩大成结构性问题。
+
+**可观测影响（已逐处核对）**：HTTP 状态码全部不变——`PUT` 的注册期校验仍由 `api.py` 的
+`except WorkflowValidationError` 命中 → 422；`execute` 端点的 catch-all 仍 → 500。唯一差异是 CLI：执行期
+SSRF 拦截（`http_node.py` 二次校验）原落入 `except Exception` 分支打印 `unexpected error while running ...`，
+改挂基类后落入 `except WorkflowEngineError` 分支打印 `workflow engine error for ...`，**退出码同为 1**，
+无测试断言该字符串。
 
 **场景映射（pytest.raises 按此断言）：**
 
@@ -600,6 +675,10 @@ class HTTPNodeError(WorkflowEngineError):
 | 条件路由全部未命中（`no_match_policy="raise"`） | `ConditionNotMatchedError` | spec-06 |
 | 未知 `workflow_id` | `WorkflowNotFoundError` | spec-07 |
 | 定义解析 / 字段校验失败 | `ValueError` / pydantic `ValidationError` | spec-01 |
+| python 节点：输出非 dict / 缺 return / entry 格式错 / import 失败 | `PythonNodeError` | `docs/workflow-node-development.md` §5 |
+| python 节点（S22 沙箱）：超时 / 非零退出 / worker 报 `ok=false` / AST 执行期复检失败 | `PythonNodeError` | spec-22 |
+| HTTP 节点 URL 落入私网/环回/元数据段（SSRF） | `WorkflowValidationError` → 422 | spec-20 |
+| python 节点代码 AST 预检拒绝（import / dunder / 危险调用 / 超长） | `WorkflowValidationError` → 422 | spec-22 |
 
 ## 6. 行为语义契约
 
@@ -622,10 +701,27 @@ class HTTPNodeError(WorkflowEngineError):
 | S15 | 日志形态 | structlog；事件名 lowercase_with_underscores；kwargs 传参禁 f-string；`logger.exception()` 留 traceback；ExecutionLog/日志只记摘要（消息条数、method/url、配置摘要），**不含密钥与完整 state**（H6）【AD-02】 |
 | S16 | YAML 安全 | 全引擎只允许 `yaml.safe_load`（D6） |
 | S17 | YAML 落盘持久化（2026-09-07 新增） | 用户定义目录 `app/workflow/config/user/`（与只读 `examples/` 分离）；`PUT` 全量覆盖写 + 原子替换（对齐 S13 原子替换语义）；文件名 `workflow_id` 白名单校验 `^[A-Za-z0-9_-]{1,64}$`（防路径穿越）；`build_registry` 启动扫描 `examples/` + `user/`（S16 fail-fast 不变）；`DELETE` 同步删除对应 YAML 文件。落盘失败 → 500（message 携脱敏原因，H6） |
-| S18 | 节点类型 API 白名单（2026-09-07 新增） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http}`（`NodeType` 枚举内置集，C8）；拒绝 `python`（S15 非沙箱 RCE，经 HTTP 注册等价远程代码执行）及未知类型；校验失败 → HTTP 422（S6 构建期校验），`message` 携脱敏原因（H6）。前端画布 palette 仅 `llm`/`http`（`docs/workflow-frontend-spec.md` §5.1），但**安全边界在后端** |
+| S18 | 节点类型 API 白名单（2026-09-07 新增，**2026-09-14 修订**） | `PUT /api/v1/workflows/{id}` 服务端二次校验每个 `node.type ∈ {llm, http, python}`（`llm`/`http` 为 `NodeType` 枚举内置集 C8；`python` 为 K5 插件类型，见 §8 R1 carve-out）；未知类型 → HTTP 422。**修订要点**：`python` 由「一律拒绝（S15 非沙箱 RCE）」改为**有条件接受**，三条注册期条件全部满足方可通过：① **只允许 `code` 模式**——`config` 含 `entry` 即拒（`entry` 可 `importlib` 加载任意仓库模块，无法沙箱化）；② **AST 预检通过**——`validate_code_ast(config["code"])`（§4.14），失败 → 422（S6 构建期优先），`message` 携**行号 + 规则名**、不携代码正文（H6）；③ **服务端强制 `sandboxed=true`**——忽略并覆写客户端传入值，落盘 YAML 与注册进 registry 的定义中该字段恒为 `true`（`sandboxed` 是**安全属性**而非用户偏好，交给客户端等于把 RCE 开关暴露给请求方）。`ALLOWED_NODE_TYPES` 仍为 `frozenset`；无新端点，限流键复用 `workflows_save`。前端画布 palette 增列 `python`（体验层），但**安全边界始终在后端** |
 | S19 | 写端点鉴权（2026-09-07 新增） | `PUT` / `DELETE` 写端点须 `Depends(get_current_user)` + **管理员角色**校验；未授权 → HTTP 403。现状 `execute` 端点无鉴权（仅 slowapi 限流），本期不改动；写端点鉴权策略由后端联动任务补齐（前端按角色禁用写按钮，`docs/workflow-frontend-spec.md` §5.4） |
 | S20 | LLM 凭据解析（2026-09-11 新增） | `LLMConfig.provider_ref` 非空时，客户端由宿主注入的 `ChatModelFactory` 构建：`factory(provider_ref, overrides)`，`overrides` 携节点级 `temperature`（及 `max_tokens`，若设置），**节点配置优先于** `ModelConfig.extra_params`。凭据（api_key/base_url/model_id）全部来自 provider 表，**config 与 YAML 永不落密钥**（H6）。`_get_llm_instance()` 三分支：① `provider_ref` + 工厂 → 工厂路径；② `provider_ref` 但工厂为 `None` → **`ConfigError`**（消息含节点名与 ref，**不静默回退 env**——用错端点/密钥比直接失败更危险）；③ `provider_ref` 为空 → 现有 env 路径（`llm_type` 分支）逐字不变（向后兼容既有 YAML）。K10 memoize 不变：客户端按节点实例缓存，provider 换密钥需重新注册工作流方生效。`provider_ref` 存在性/enabled 校验在**注册期**完成（S6 构建期优先）：`PUT` 对每个携 `provider_ref` 的 llm 节点校验，失败 → HTTP 422 |
 | S21 | 运行输入合成（2026-09-11 新增） | `execute_workflow` 在 `graph.invoke` 前调用纯函数 `synthesize_run_input(definition, input_data)`（§4.10），规则按序：① `input_data["messages"]` 真值 → 原样透传（显式消息优先，向后兼容）；② 否则 `input_data["input"]` 为非空 `str` → **附加式**注入 `messages=[{"role":"user","content":<input>}]`（不删改任何用户键，`input` 键仍写入 state 供 `{input}` 占位符使用）；③ `input` 缺失/非 `str`/空白 → 不合成（缺失 channel 按 S14 走声明默认值，LLMNode 空 messages 仍按现状 `ValueError`）；④ 对**所有**工作流生效，不按节点类型特判（R2）；无 llm 节点时多余 `messages` 键被 langgraph 静默丢弃（S14）。wire 双形态兼容：`{"input":"hi"}` 与 `{"input":{"input":"hi",...}}` 均命中合成（`api.py` 解包逻辑不变）。本语义约束**运行入口的输入预处理**，不改变 `state.py`「状态模型构建不做字段名特判」原则 |
+| S22 | 沙箱执行（2026-09-14 新增） | `sandboxed=true` 的 python 节点，其代码**必须**在子进程中执行（`sandbox.run_sandboxed`，§4.14），**禁止任何形式的进程内 `exec`**；`sandboxed=false` 的既有受信仓库路径逐字不变。执行前复跑 `validate_code_ast`（纵深防御：调用方可能绕过 S18 注册期校验）。失败一律包 `PythonNodeError`（§5）。进程/协议/资源/日志细则见下方「S22 细则」表，均为**冻结约定**，实现不得自行放宽 |
+
+**S22 细则（冻结）：**
+
+| 维度 | 约定 |
+| --- | --- |
+| 进程隔离 | `subprocess.run([sys.executable, "-I", <sandbox_worker.py 绝对路径>], ...)`。`-I`（isolated）忽略 `PYTHON*` 环境变量与 user site-packages，防止宿主路径污染沙箱 |
+| 通信协议 | stdin/stdout 各**恰好一个** JSON 文档。入：`{"code": str, "state": dict}`；出：`{"ok": true, "output": dict}` 或 `{"ok": false, "error": str}`。worker 内**替换 `sys.stdout`** 为丢弃器，用户代码的 `print` 不得污染协议流；结果经 `os.write(1, ...)` 单次写出 |
+| 退出码 | `0` = 正常（含 `ok=false` 的业务失败）；`2` = SyntaxError；`3` = 运行期异常。非零退出 → 父进程包 `PythonNodeError` |
+| 超时 | `subprocess.run(timeout=limits.timeout_s)`，到期由 stdlib kill 子进程 → `TimeoutExpired` → `PythonNodeError`。**禁止无限等待** |
+| 资源上限 | `preexec_fn` 内设 `RLIMIT_AS`（= `max_memory_mb`）、`RLIMIT_CPU`（= `ceil(timeout_s)`）、`RLIMIT_FSIZE = 0`（禁写任何文件）、`RLIMIT_NPROC = 0`（禁 fork 子进程）。**POSIX best-effort**：macOS 常忽略 `RLIMIT_AS`，此时 `logger.warning("sandbox_rlimit_partial", platform=...)`，不阻断执行（生产为 Linux 容器） |
+| 环境变量 | 子进程 `env={"PATH": "/usr/bin:/bin"}`。**不继承宿主环境**——API 密钥、DB DSN 一律不进沙箱（H6/R5） |
+| 内建白名单 | worker 以 `SAFE_BUILTINS` 作为 `__builtins__`：仅纯计算类（`len/range/sorted/min/max/sum/abs/round/divmod/pow`、`str/int/float/bool/list/dict/set/tuple/frozenset/bytes`、`enumerate/zip/map/filter/reversed/isinstance/issubclass/print`、`chr/ord/hex/oct/bin/format/repr`、`True/False/None`）+ 常用异常类（`Exception/ValueError/TypeError/KeyError/IndexError/AttributeError/ZeroDivisionError/ArithmeticError/LookupError/RuntimeError/StopIteration/NotImplementedError`）。**不含** `open/exec/eval/compile/__import__/globals/locals/vars/dir/getattr/setattr/delattr/type/input/breakpoint/exit/quit/help` |
+| 无网络 | stdlib 无法做 seccomp 级 syscall 过滤，本期防线是**能力剥夺**：AST 全禁 import + builtins 无 `__import__`/`open`/`getattr` + 空 env，使沙箱内代码在语言层面拿不到 `socket`/`urllib`/`http.client` 任何入口。生产建议叠加容器网络策略 |
+| 输出上限 | 父进程校验 `len(stdout) <= limits.max_output_bytes`，超限 → `PythonNodeError` |
+| 日志 | 只记摘要（`sandboxed` 布尔、代码长度、退出码、耗时），**绝不记代码正文与完整 state**（H6/S15）；事件名 lowercase_with_underscores，kwargs 传参禁 f-string（S15/AD-02） |
+| R3 不变 | 沙箱是 `PythonNode` 的内部执行策略：入口 `convert_state_to_dict` / 出口 `map_output_to_state` 管线、`_ensure_dict` 返回契约、`graph_builder.py` / `registry.py` / `state.py` / `factory.py` **全部零改动** |
 
 ## 7. 探索先行规则（R-EXP）
 
@@ -644,7 +740,7 @@ class HTTPNodeError(WorkflowEngineError):
 
 | 编号 | 一句话 | 机器检查方法 |
 | --- | --- | --- |
-| R1 | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型或领域逻辑 | `ls app/workflow/nodes/` 对白名单；`grep -rn "plan\|worker\|dispatcher" app/workflow/` 仅出现于"未来扩展"注释；`NodeType` 成员数守护测试 |
+| R1 | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增**内置**节点类型或领域逻辑。**carve-out（2026-09-14）**：`python` 是 K5 **插件类型**（`register_node_type` 任意字符串注册、factory 无内置分支、不入 `NodeType` 枚举 C8），不构成 R1 意义上的新增内置节点类型；其 API 可达性由 S18/S22 单独约束 | `ls app/workflow/nodes/` 对白名单；`grep -rn "plan\|worker\|dispatcher" app/workflow/` 仅出现于"未来扩展"注释；`NodeType` 成员数守护测试（**恒为 2，不因 python 改变**） |
 | R2 | reducer 只来自 YAML 显式声明，禁止硬编码业务字段名 | `grep -nE "circle_\|planner_\|worker_\|reflector_\|current_node" app/workflow/state.py` 零命中；守护测试 `test_no_hardcoded_field_names` |
 | R3 | 节点 convert_state_to_dict 进 / map_output_to_state 出，禁止 mutate 输入 state | 节点 func 代码审查；R3 进出管线测试（spec-04/05 契约测试） |
 | R4 | 新节点必须经 register_node_type 注册，create_node 内置分支恰好 2 个 | 守护测试断言内置分支数 == 2 且为 `("llm","LLM")` / `("http","HTTP")` 大小写集合；`grep -n "elif" app/workflow/nodes/factory.py` 人工核对 |
@@ -742,6 +838,7 @@ grep -rni "dispatcher\|triage\|subgraph" app/workflow/
 | 2026-09-07 | 画布编排契约扩展：§4.12 `metadata` 新增可选第五键 `execution_logs`（execute 成功响应内嵌轨迹，脱敏后）；新增 §4.13 画布管理端点签名（GET 列表 / GET 查定义 / PUT 全量保存 / DELETE 删除）；§6 新增 S17（YAML 落盘持久化）、S18（节点类型 API 白名单）、S19（写端点鉴权） | §4.12 / §4.13 / §6（S17-S19） | `docs/changelog/workflow-canvas-orchestration/spec-01-contract-change.md` 及下游 spec-02..04、16..20 | 纯契约变更，提交 `docs:`；引擎内核零改动；详细设计见 `docs/workflow-frontend-spec.md` §4-5 与 `docs/workflow-api-and-trace.md` §7.1 |
 | 2026-09-11 | LLM 节点接入 provider 体系：§4.7 `LLMConfig` 新增可选 `provider_ref`、`LLMNode.__init__` 新增可选 `chat_model_factory`；§4.5 `create_node`、`GraphBuilder.__init__`、`WorkflowRegistry.__init__` 各新增可选 `chat_model_factory` 透传参数；新增 `app/workflow/ports.py` 承载 `ChatModelFactory` 类型别名；§3 红线 4 补充「注入的不透明 callable 不构成 `app.*` 依赖」；§6 新增 S20（凭据解析三分支 + 注册期校验） | §3 / §4.5 / §4.7 / §6（S20） | `docs/changelog/workflow-llm-provider-integration/spec-01-contract-change.md`；下游 `spec-04-llmnode.md`、`docs/workflow-node-development.md` §3.1-3.2、`docs/changelog/workflow-canvas-orchestration/spec-12-node-config-forms.md` | 签名变更（全部为新增带默认值的可选参数，向后兼容），代码提交用 `refactor!`。**动机**：引擎原先只从 env 取凭据，与 provider 表的 `auth_config.api_key`/`base_url` 完全割裂，设计器手填 `model_name` 既不校验存在性也用不上真实端点 |
 | 2026-09-11 | 运行输入合成：§4.10 新增模块级纯函数 `synthesize_run_input(definition, input_data)`；§6 新增 S21（`execute_workflow` 在 `graph.invoke` 前把非空 `input` str 附加式合成为 `messages=[{"role":"user","content":...}]`；`messages` 已存在则透传；对所有工作流生效、不按节点类型特判） | §4.10 / §6（S21） | `docs/changelog/workflow-input-synthesis/spec-01-contract-change.md` | 纯契约变更，提交 `docs:`；引擎仅 registry 一行接线，`api.py`/`cli.py`/`state.py`/`llm_node.py` 零改动。**动机**：执行含 LLM 节点的工作流须手写完整 langchain 消息结构，`messages` 实为引擎内置通道而非业务字段 |
+| 2026-09-14 | Python 节点真沙箱：§2.1 新增 `app/workflow/sandbox.py`、`app/workflow/sandbox_worker.py`（并补录 5 个早已落地却漏记的模块 `auth.py`/`ports.py`/`security.py`/`store.py`/`nodes/python_node.py`，计数 15→22）；新增 §4.14 冻结 `validate_code_ast` / `SandboxLimits` / `run_sandboxed`；§5 异常族规范化（`PythonNodeError` 补入冻结块；`WorkflowValidationError` 从 `security.py` **迁入 `models.py`** 并改挂 `WorkflowEngineError`）；**S18 修订**（白名单 `{llm,http}` → `{llm,http,python}`，`python` 须 code-only + AST 通过 + 服务端强制 `sandboxed=true`）；§6 新增 S22（子进程沙箱执行）及其「S22 细则」冻结表（进程隔离 `-I` / 单 JSON 文档协议 / 退出码 0-2-3 / 超时 kill / POSIX rlimit / 空 env / `SAFE_BUILTINS` / 输出上限 / 摘要日志）；§8 R1 追加 K5 插件 carve-out（`NodeType` 恒 2 成员、R4 内置分支恒 2，守护测试不动） | §2.1 / §4.13 / §4.14 / §5 / §6（S18 修订、S22 新增）/ §8（R1） | `docs/changelog/workflow-python-sandbox/spec-01-contract-change.md`；同步 `docs/workflow-node-development.md` §5.1-5.5 与红线表 R1；同步 `docs/workflow-frontend-spec.md` §2.1（Out 行）/ §5.1（节点类型白名单）/ §7（NodeDTO type）/ §8（`validateGraph` 预校验）/ §9（组件树 + `PythonNodeForm.vue`）/ §13（测试覆盖点）/ §14（验收） | 纯契约变更，提交 `docs:`；下游代码提交用 `refactor!`（`PythonNodeConfig` 新增 `sandboxed` + 互斥校验扩展）。**动机**：`PythonNode` 现为进程内非沙箱 `exec`，S18 因此把 `python` 挡在 HTTP 之外——代价是设计器画不出 python 节点，用户做一点数据加工只能塞进 LLM 提示词或外部 HTTP 服务。S18 挡住的是**实现方式**，不是节点类型的价值 |
 
 ## 12. 每 Phase 交付自检表
 

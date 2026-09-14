@@ -260,32 +260,44 @@ _DEFAULT_BASE_URL_ENV = {"openai": "OPENAI_BASE_URL"}
 `PythonNode` 是引擎附带的**唯一非内置节点类型**，完整演示了 K5 插件路径：factory **无**它的内置分支，
 它经模块底部 `register_node_type("python", PythonNode)` 自注册。新节点开发者应以此为蓝本。
 
-### 5.1 配置（`code` / `entry` 互斥，S14）
+### 5.1 配置（`code` / `entry` 互斥，S14；`sandboxed` 只对 `code` 有意义）
 
 ```python
 class PythonNodeConfig(BaseModel, extra="forbid"):
-    code: str | None = None     # 内联 YAML 代码，注入 state（dict 快照），须 return dict
-    entry: str | None = None    # "module:function"，以 state dict 调用，须 return dict
+    code: str | None = None         # 内联 YAML 代码，注入 state（dict 快照），须 return dict
+    entry: str | None = None        # "module:function"，以 state dict 调用，须 return dict
+    sandboxed: bool = False         # True → 子进程沙箱执行（S22）；仅 code 模式可用
 
     @model_validator(mode="after")
     def _check_exclusivity(self) -> PythonNodeConfig:
         if (self.code is None) == (self.entry is None):
             raise ValueError("PythonNodeConfig requires exactly one of 'code' or 'entry'")
+        if self.entry is not None and self.sandboxed:
+            raise ValueError("sandboxed=True requires 'code' mode; 'entry' cannot be sandboxed")
         return self
 ```
 
+`sandboxed` 对 `entry` 无意义（`entry` 靠 `importlib` 加载仓库模块，无法沙箱化），因此**报错而非静默忽略**——
+静默忽略会让读者以为代码跑在沙箱里。经 `PUT` 进入的定义由服务端强制 `sandboxed=true`（S18 ③），客户端传值被覆写。
+
 ### 5.2 执行语义
 
-- **进程内、非沙箱**：只允许运行受信的、仓库自有的代码（langchain-sandbox 已评估并否决：失维护、Deno 运行时、
-  每次调用启动延迟）。`exec` 处标注 `# noqa: S102 — trusted repository-owned code by design`。
-- `code` 模式：包装为 `def __python_node_fn(state):` 后 `exec`，调用并取返回值；须 `return` dict。
-- `entry` 模式：`importlib.import_module` 加载 `module:function`，以 state dict 调用；须返回 dict。
+`code` 模式有**两条执行路径**，由 `sandboxed` 决定（S22）：
+
+- **`sandboxed=false`（默认，受信仓库路径）**：进程内 `exec`，只允许运行受信的、仓库自有的代码
+  （langchain-sandbox 已评估并否决：失维护、Deno 运行时、每次调用启动延迟）。包装为
+  `def __python_node_fn(state):` 后 `exec`，调用并取返回值；须 `return` dict。`exec` 处标注
+  `# noqa: S102 — trusted repository-owned code by design`。**该路径不可经 HTTP 注册**（见 §5.5）。
+- **`sandboxed=true`（S22 沙箱路径）**：转交 `app/workflow/sandbox.py` 的 `run_sandboxed(code, state_dict)`，
+  在子进程中执行，**禁止进程内 `exec`**。代码同样须 `return` dict；超时 / 非零退出 / worker 报 `ok=false` /
+  输出非 dict → `PythonNodeError`。
+- `entry` 模式（**无沙箱形态**）：`importlib.import_module` 加载 `module:function`，以 state dict 调用；须返回 dict。
 - 输出非 dict / 缺 return / entry 格式错 / import 失败 → 抛 `PythonNodeError`（`_ensure_dict` 统一校验）。
 
 ### 5.3 日志（H6/S15）
 
-`_log()` 的 `input_data` 只记摘要：`{"mode":"code","code_chars":N}` 或 `{"mode":"entry","entry":"..."}`——
-**绝不记代码正文**（H6/S15）。异常分支记录后重抛（H2/R6，禁死 except）。
+`_log()` 的 `input_data` 只记摘要：`{"mode":"code","code_chars":N,"sandboxed":bool}` 或
+`{"mode":"entry","entry":"..."}`——**绝不记代码正文**（H6/S15）。异常分支记录后重抛（H2/R6，禁死 except）。
 
 ### 5.4 自注册
 
@@ -293,6 +305,27 @@ class PythonNodeConfig(BaseModel, extra="forbid"):
 # 模块底部（factory 底部 import 本模块触发注册，R4 不加内置分支）
 register_node_type("python", PythonNode)
 ```
+
+### 5.5 API 可达性与沙箱边界（S18 / S22）
+
+`python` 是 K5 插件类型，不入 `NodeType` 枚举（C8 恒 2 成员），也不增加 `create_node` 的内置分支（R4 恒 2）——
+CONTRACT §8 R1 已就此追加 carve-out。它能否经 `PUT /api/v1/workflows/{id}` 写入，由 S18 的三条注册期条件决定：
+
+1. **只允许 `code` 模式**：`config` 含 `entry` → 拒绝（`entry` 能加载任意仓库模块，无法沙箱化）；
+2. **AST 预检通过**：`validate_code_ast(config["code"])` 拒绝 import / dunder 标识符 / 危险调用
+   （`exec`/`eval`/`open`/`getattr`/`type`/…）/ 超长（64 KiB）；错误消息携**行号 + 规则名**，
+   **绝不携代码正文**（H6）→ HTTP 422；
+3. **服务端强制 `sandboxed=true`**：忽略并覆写客户端传值。`sandboxed` 是**安全属性**而非用户偏好，
+   交给客户端等于把 RCE 开关暴露给请求方。
+
+沙箱本身的冻结约定（子进程 `sys.executable -I`、单 JSON 文档协议、退出码 0/2/3、`timeout` kill、
+POSIX rlimit、`env={"PATH":"/usr/bin:/bin"}` 不继承宿主环境、`SAFE_BUILTINS` 白名单、输出上限、摘要日志）
+见 CONTRACT §6「S22 细则」表。两点必须记住：
+
+- **沙箱不是绝对安全**，而是把「经 HTTP 注册的代码」从*等价 RCE* 降到*受限于纯计算 + 有限资源*；
+  生产部署建议叠加容器级隔离（gVisor / seccomp / 网络策略）。
+- **`sandboxed=false` 的 YAML 仍是进程内 `exec`**，其安全性依赖「能写这些文件的人已经能改代码」这一既有信任边界。
+  S18 只保证经 HTTP 进入的定义必为 `sandboxed=true`。
 
 ---
 
@@ -493,7 +526,7 @@ register_node_type("my_node", MyNode)
 
 | 编号 | 一句话 | 对节点开发者的含义 | 机器检查（CONTRACT §10） |
 | --- | --- | --- | --- |
-| **R1** | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增节点类型或领域逻辑 | 本期节点范围冻结；确需新类型走 CONTRACT §11 变更流程，不得夹带领域逻辑 | `ls app/workflow/nodes/` 对白名单；`NodeType` 成员数守护测试（恰 2） |
+| **R1** | 只实现 BaseNode/LLMNode/HTTPNode，禁止新增**内置**节点类型或领域逻辑（carve-out：`python` 为 K5 插件类型，不入 `NodeType`、不加 factory 内置分支，见 §5.5） | 本期节点范围冻结；确需新内置类型走 CONTRACT §11 变更流程，不得夹带领域逻辑 | `ls app/workflow/nodes/` 对白名单；`NodeType` 成员数守护测试（**恰 2，不因 python 改变**） |
 | **R2** | reducer 只来自 YAML 显式声明，禁止硬编码业务字段名 | 节点 `func` 内**不得**出现 `circle_`/`planner_`/`worker_`/`reflector_`/`current_node` 等领域字面量 | `grep -rnE "circle_\|planner_\|worker_\|reflector_\|current_node" app/workflow/` 零命中；`test_no_hardcoded_field_names` |
 | **R3** | 节点 `convert_state_to_dict` 进 / `map_output_to_state` 出，禁止 mutate 输入 state | 见 §2.4；`func` 只读使用 state_dict，输出经 `map_output_to_state` | 节点 func 代码审查；R3 进出管线契约测试 |
 | **R4** | 新节点必须经 `register_node_type` 注册，`create_node` 内置分支恰好 2 个 | 见 §6.3；禁止在 factory 堆 if/elif | `test_builtin_branch_count_is_two`；`grep -n "elif" app/workflow/nodes/factory.py` |
