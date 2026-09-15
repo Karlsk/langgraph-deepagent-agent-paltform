@@ -138,15 +138,26 @@
   - **不发送 `sandboxed` 字段**——它是安全属性而非用户偏好，由后端强制覆写为 `true`（S18 ③）。前端即使发了也会被忽略；
   - 代码输入用普通 `textarea`（等宽字体），**不做前端 `eval` / 预览执行 / 语法高亮插件引入**；
     校验与报错以后端 422 的 `message`（行号 + 规则名）为准，前端只展示、不二次解释；
-  - 面板须明示沙箱限制：无 import、无文件/网络、无 `open`/`exec`/`getattr` 等内建、须 `return` dict、
-    超时与内存有上限（S22 细则）。
+  - 面板须明示沙箱限制：**只有白名单内的 stdlib 根模块可 import**（`json`/`re`/`math`/`random`/`datetime`/
+    `collections`/`functools` 等 18 项，S22 细则「模块白名单」；`os`/`sys`/`socket` 等一律拒、相对导入一律拒）、
+    无文件/网络、无 `open`/`exec`/`getattr` 等内建、须 `return` dict、超时与内存有上限；
+  - **前端不复制白名单常量**——白名单是后端安全属性，前端只做提示文案；422 的 `message`（行号 + 规则名 + 根模块名）
+    已是权威，前端**不得**据此自行放行或改写用户代码。
+- **`http` 节点前端约束（2026-09-14 新增）**：
+  - `headers` 用**键值行编辑器**（「+ 添加请求头」按钮，每行 key 输入 + value 输入 + 删除），与 `StateSchemaPanel`
+    的字段行同款交互。**不用 JSON 文本域**：`HTTPNodeConfig.headers` 是 `dict[str, str]`，键值行在类型上
+    **不可能**构造出后端必拒的载荷，而文本域会重蹈 `mock_responses` 的覆辙（值类型陷阱，上一期 §5 残留风险）；
+  - header 值支持 `{占位符}` 模板（如 `Authorization: Bearer {access_token}`），前端**不做**占位符存在性校验
+    ——渲染发生在执行期，与 `body_template` 同一套语义；
+  - `url` 含 `{占位符}` 时前端可给**体验层**提示（「模板 URL 的 host 校验推迟到执行期」），但**不是边界**：
+    注册期跳过与执行期兜底都由后端负责（spec-20 §3 第 5 条）。
 - **`subworkflow` 节点前端约束**：
   - 被引用工作流用 `el-select` 从 **`listWorkflows()` 已注册列表**中选，**客户端排除当前正在编辑的 id**
     （自引用是最常见的误操作）。这是**体验层**便利，**不是边界**：后端的 S23 运行栈环检测才是权威，
     间接环（A→B→A）前端看不出来也不该试图看出来；
   - **不在保存时校验被引用工作流是否存在**——存在性是**运行期**检查（S18：注册期只校验 `workflow_id` 为非空 str）。
     理由：`wf_outer` 可能先于 `wf_inner` 保存，前端若强制存在性就等于强制拓扑序保存；
-  - `inherit_input`（switch）+ `input_map`（kv 编辑器，复用 http 节点 headers/mock 的编辑模式）；
+  - `inherit_input`（switch）+ `input_map`（kv 编辑器，复用 `http` 节点 `headers` 的**键值行**编辑模式，见上）；
     `input_map` 的值是**外层 state 的点路径**（S7 语法），可用 `deriveStateChannels` 给键名下拉做提示；
   - 轨迹抽屉对嵌套**零改动**：内层日志的 `node_name` 已被后端前缀化为 `"{调用节点}/{内层节点}"`（S24），
     直接展示即可读出层级。前端**不得**自行解析或重组该前缀。
@@ -157,6 +168,10 @@
 
 - `http` 节点 `url` 由用户填写 → **SSRF 风险**。后端应有 host 白名单 / 内网地址拦截（后端联动项，前端仅提示）。
 - `mock_enabled`（S9 显式开关）仅演示用途；生产保存时前端应提示关闭 mock。
+- **模板 URL 的校验时机（2026-09-14 修订，spec-20 §3 第 5 条）**：`url` 含 `{占位符}` 时**注册期跳过**校验
+  （`urlparse` 取不到 scheme，且 base URL 天然按环境变化），改由**执行期对已渲染 URL** 校验兜住。
+  对用户的可见后果：host 拼错从「保存即 422」变为「执行才报错」——与 `subworkflow` 悬空引用同款取舍。
+  前端**不得**据此自行拼一个假 URL 去试探后端，也**不得**在前端做私网段判断（那是后端边界，且前端看不到 DNS）。
 
 ### 5.3 密钥 env-only（H6 / ADR-008）
 
@@ -363,7 +378,7 @@ views/workflow/
 └── panel/
     ├── NodeConfigPanel.vue           # 右侧节点配置面板（按 type 驱动表单）
     ├── LlmNodeForm.vue               # llm 配置：provider_ref 分组下拉/temperature/system_prompt（无明文密钥）
-    ├── HttpNodeForm.vue              # http 配置：url/method/body_template/response_path/timeout/max_retries/mock
+    ├── HttpNodeForm.vue              # http 配置：url/method/headers(kv 行)/body_template/response_path/timeout/max_retries/mock
     ├── PythonNodeForm.vue            # python 配置：**仅** code（等宽 textarea）+ 沙箱限制说明；无 entry、无 sandboxed 开关（§5.1）
     ├── SubWorkflowNodeForm.vue       # subworkflow 配置：已注册工作流下拉（排除当前 id）+ inherit_input + input_map kv 编辑器（§5.1）
     ├── StateSchemaPanel.vue          # state_schema 字段增删改（type/default/description/reducer）
@@ -394,7 +409,7 @@ views/workflow/
 | type | 表单字段 | 约束 |
 | --- | --- | --- |
 | `llm` | `llm_type`(openai/anthropic)、`model_name`、`temperature`(0.0-2.0)、`system_prompt`、`api_key_env`、`base_url_env`、`max_retries` | **无明文 api_key**（§5.3）；密钥仅 env 名引用 |
-| `http` | `url`、`method`、`body_template`、`response_path`、`timeout`、`max_retries`、`retry_on_status`、`mock_enabled`、`mock_responses` | mock key 格式 `"{METHOD} {url}"`（S9）；生产提示关 mock |
+| `http` | `url`、`method`、`headers`、`body_template`、`response_path`、`timeout`、`max_retries`、`retry_on_status`、`mock_enabled`、`mock_responses` | `headers` 用**键值行**编辑（值只能是 str，禁 JSON 文本域，§5.1）；`DEFAULT_CONFIGS.http` 须带 `headers: {}`；mock key 格式 `"{METHOD} {url}"`（S9）；生产提示关 mock |
 
 ### 9.4 执行 + 轨迹（P1）
 
@@ -462,7 +477,10 @@ views/workflow/
   3. `validateGraph` 各失败分支（无节点 / 重名 / 缺入口 / 悬空边 / 非法条件 / 类型不在 `{llm,http,python,subworkflow}` /
      `python` 缺 `code` / `python` 含 `entry` / `subworkflow` 缺 `workflow_id` / 明文密钥）；
   4. 保存：前端校验拦截不发请求；通过则 `saveWorkflow` 全量提交；422 回显；
-  5. 执行：JSON 输入解析、成功展示、`execution_logs` 轨迹渲染、缺失降级、404/500 分支。
+  5. 执行：JSON 输入解析、成功展示、`execution_logs` 轨迹渲染、缺失降级、404/500 分支；
+  6. **（2026-09-14 新增）`http` 节点 headers 键值行**：加一行 → emit 的 config 含 `headers: {K: V}`；删行 → 键消失；
+     `readonly` 下控件禁用；`props.config.headers` 为 `undefined` 时不崩且初始为空；`NodeConfigPanel` 的 patch
+     **透传 headers 不丢键**；`DEFAULT_CONFIGS.http` 与新拖出节点的默认 config 均含 `headers: {}`。
 - 范例参照 `tests/components/provider-list.spec.ts` 与 `tests/design-tokens.spec.ts`。
 
 ---
@@ -488,7 +506,12 @@ views/workflow/
 - 构建期校验失败（如悬空边 / 缺入口 / 非法条件）→ 422 原因内联回显，定位到问题元素。
 - 画布可拖拽 `python` 节点，面板只暴露 `code`（无 `entry` 输入、无 `sandboxed` 开关）；提交体不含 `entry`/`sandboxed`
   两键（§5.1）；后端对 `entry` 模式与 AST 非法代码仍 422，且 `message` 含规则名不含代码正文；
+  **（2026-09-14）** 白名单内 import（`import json` / `from datetime import datetime` / `import re` / `import random`）
+  须**保存成功**，白名单外（`import os`）仍 422 且 `message` 含 `no-import` + 行号 + **根模块名**、不含代码正文（H6）；
   `llm` 节点无明文密钥输入（§5.3）；写端点非管理员 403。
+- **（2026-09-14 新增）** `http` 节点面板可增删 headers 键值行，保存体含 `headers: {K: V}`（值恒为 str）；
+  `url` 以 `{占位符}` 开头（如 `{sdn_base_url}/oauth/token`）时 PUT **200**（注册期跳过），字面量私网 host 仍 **422**；
+  模板渲染后落入元数据段的请求在**执行期**被拦（spec-20 §3 第 5 条）。
 - 画布可拖拽 `subworkflow` 节点，下拉只列已注册工作流且排除当前编辑 id；执行外层后**轨迹抽屉零改动**即可读出
   `"{调用节点}/{内层节点}"` 前缀层级（S24）；子节点自身条目只显摘要（output_keys / run_id / duration_ms /
   inner_log_count），不重复内嵌内层输出。反例：自引用执行 → 500 信封含 `NestedWorkflowError` 与完整环栈（S23）；

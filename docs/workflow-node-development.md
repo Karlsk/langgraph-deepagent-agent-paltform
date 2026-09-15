@@ -313,21 +313,27 @@ register_node_type("python", PythonNode)
 CONTRACT §8 R1 已就此追加 carve-out。它能否经 `PUT /api/v1/workflows/{id}` 写入，由 S18 的三条注册期条件决定：
 
 1. **只允许 `code` 模式**：`config` 含 `entry` → 拒绝（`entry` 能加载任意仓库模块，无法沙箱化）；
-2. **AST 预检通过**：`validate_code_ast(config["code"])` 拒绝 import / dunder 标识符 / 危险调用
-   （`exec`/`eval`/`open`/`getattr`/`type`/…）/ 超长（64 KiB）；错误消息携**行号 + 规则名**，
-   **绝不携代码正文**（H6）→ HTTP 422；
+2. **AST 预检通过**：`validate_code_ast(config["code"])` 拒绝**白名单外** import 与**相对导入** /
+   dunder 标识符 / 危险调用（`exec`/`eval`/`open`/`getattr`/`type`/…）/ 超长（64 KiB）；
+   import 判定**只看根模块**（`import a.b` / `from a.b import c` 均取 `a`），规则名仍为 `no-import`，
+   错误消息携**行号 + 规则名 + 根模块名**，**绝不携代码正文**（H6）→ HTTP 422；
 3. **服务端强制 `sandboxed=true`**：忽略并覆写客户端传值。`sandboxed` 是**安全属性**而非用户偏好，
    交给客户端等于把 RCE 开关暴露给请求方。
 
 沙箱本身的冻结约定（子进程 `sys.executable -I`、单 JSON 文档协议（含 `limits` 入参与 `applied`/`refused` 回报）、
 退出码 0/2/3、`timeout` kill、**worker 自我施加**的 POSIX rlimit（逐项容错，父进程禁用 `preexec_fn`）、
-`env={"PATH":"/usr/bin:/bin"}` 不继承宿主环境、`SAFE_BUILTINS` 白名单、输出上限、摘要日志）
-见 CONTRACT §6「S22 细则」表。两点必须记住：
+`env={"PATH":"/usr/bin:/bin"}` 不继承宿主环境、`SAFE_BUILTINS` 内建白名单（含 **受限 `__import__`**）、
+**模块白名单**（18 项 stdlib，`sandbox.py` 与 `sandbox_worker.py` 各存一份、守护测试钉住相等）、输出上限、摘要日志）
+见 CONTRACT §6「S22 细则」表。三点必须记住：
 
 - **沙箱不是绝对安全**，而是把「经 HTTP 注册的代码」从*等价 RCE* 降到*受限于纯计算 + 有限资源*；
   生产部署建议叠加容器级隔离（gVisor / seccomp / 网络策略）。
 - **`sandboxed=false` 的 YAML 仍是进程内 `exec`**，其安全性依赖「能写这些文件的人已经能改代码」这一既有信任边界。
   S18 只保证经 HTTP 进入的定义必为 `sandboxed=true`。
+- **（2026-09-14）「无网络」由机制保证降级为评审保证**：原论证是「AST 全禁 import + builtins 无 `__import__` +
+  空 env」三条一起成立；白名单放开后，保证的**来源**变成「白名单里没有任何网络模块」。规则 3 只封 dunder，
+  **单下划线属性可达**（实测 `re._compiler`），故**每新增一个白名单模块都必须逐个评审其公开与单下划线属性**
+  是否携带能力——「加了再说」在这里不成立。
 
 ---
 
