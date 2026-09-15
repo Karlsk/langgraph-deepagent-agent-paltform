@@ -317,7 +317,7 @@ class TestExecutionTimeValidation:
         """执行期默认允许私网 IP（allow_private_networks=True）."""
         from app.workflow.nodes.http_node import HTTPNode
 
-        def mock_request(method, url, headers=None, json=None, timeout=None):
+        def mock_request(method, url, headers=None, json=None, timeout=None, verify=None):
             request = httpx.Request(method, url, headers=headers)
             return httpx.Response(200, json={"data": "ok"}, request=request)
 
@@ -359,7 +359,7 @@ class TestExecutionTimeValidation:
         """执行期允许公网地址（mock httpx 避免真实网络）."""
         from app.workflow.nodes.http_node import HTTPNode
 
-        def mock_request(method, url, headers=None, json=None, timeout=None):
+        def mock_request(method, url, headers=None, json=None, timeout=None, verify=None):
             request = httpx.Request(method, url, headers=headers)
             return httpx.Response(200, json={"data": "ok"}, request=request)
 

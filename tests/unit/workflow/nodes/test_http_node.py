@@ -55,6 +55,7 @@ def patch_httpx(monkeypatch: pytest.MonkeyPatch, transport: httpx.MockTransport)
 
     def fake_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
         kwargs.pop("timeout", None)
+        kwargs.pop("verify", None)
         with httpx.Client(transport=transport) as client:
             return client.request(method, url, **kwargs)
 

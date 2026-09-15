@@ -63,6 +63,7 @@ class HTTPNodeConfig(BaseModel):
     mock_enabled: bool = False  # 默认关闭；显式启用才生效（H2/H6）
     mock_responses: dict[str, str] | None = None
     allow_private_networks: bool = True  # injected by graph builder from workflow definition
+    verify_ssl: bool = False  # default False for internal networks with self-signed/weak certs
 
 
 def _flatten_context(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -127,7 +128,9 @@ class HTTPNode(BaseNode):
 
     def _send_once(self, method: str, url: str, headers: dict[str, str] | None, body: Any) -> httpx.Response:
         """One synchronous HTTP request (K10); retry ownership lives in tenacity (AD-03)."""
-        return httpx.request(method, url, headers=headers, json=body, timeout=self._node_config.timeout)
+        return httpx.request(
+            method, url, headers=headers, json=body, timeout=self._node_config.timeout, verify=self._node_config.verify_ssl
+        )
 
     def _is_retryable(self, exc: BaseException) -> bool:
         """S8 predicate: only HTTPStatusError whose status hits retry_on_status retries."""
