@@ -87,6 +87,16 @@ class TestRealExecution:
         code = 'print("noise")\nreturn {"n": len(state["items"])}'
         assert run_sandboxed(code, {"items": [1, 2]}) == {"n": 2}
 
+    def test_allowlisted_import_resolves_in_the_child(self) -> None:
+        """The runtime half of rule 1: an allowlisted module is genuinely importable."""
+        code = 'import json\nreturn {"k": json.dumps({"a": 1})}'
+        assert run_sandboxed(code, {}) == {"k": '{"a": 1}'}
+
+    def test_from_import_resolves_in_the_child(self) -> None:
+        """``from X import Y`` reaches the same restricted importer."""
+        code = "from datetime import datetime\nreturn {'y': datetime(2026, 9, 14).year}"
+        assert run_sandboxed(code, {}) == {"y": 2026}
+
     def test_non_dict_return_is_a_node_error(self) -> None:
         """R3: the node output contract is a dict."""
         with pytest.raises(PythonNodeError, match="dict"):
@@ -129,11 +139,27 @@ class TestWorkerRlimits:
 
 
 class TestSecondDefenseLine:
-    """Even with the AST pre-check bypassed, the sandbox has no import capability."""
+    """Even with the AST pre-check bypassed, the sandbox has no capability."""
 
     def test_import_os_fails_at_runtime(self) -> None:
-        """__import__ is absent from SAFE_BUILTINS, so the statement cannot resolve."""
+        """``__import__`` is the worker's restricted gate, so a capability module cannot resolve."""
         document = _document(_invoke_worker('import os\nreturn {"pid": os.getpid()}'))
+        assert document["ok"] is False
+        assert "ImportError" in document["error"]
+        assert "os" in document["error"]
+        assert "getpid" not in document["error"]
+
+    @pytest.mark.parametrize("module", ["socket", "subprocess", "urllib.request", "pathlib", "ctypes"])
+    def test_capability_module_is_refused_by_the_child(self, module: str) -> None:
+        """The allowlist is enforced in the child, not only by the parent's AST walk."""
+        document = _document(_invoke_worker(f"import {module}\nreturn {{}}"))
+        assert document["ok"] is False
+        assert "ImportError" in document["error"]
+        assert module.split(".")[0] in document["error"]
+
+    def test_relative_import_is_refused_by_the_child(self) -> None:
+        """A nonzero level would resolve against the worker's own directory."""
+        document = _document(_invoke_worker("from . import sibling\nreturn {}"))
         assert document["ok"] is False
         assert "ImportError" in document["error"]
 

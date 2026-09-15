@@ -134,6 +134,23 @@ describe('PythonNodeForm 沙箱限制说明', () => {
     const wrapper = mountForm({ code: SAMPLE_CODE })
     expect(wrapper.findAll('button')).toHaveLength(0)
   })
+
+  // 白名单放开后，「禁止 import / 无标准库」变成假话，文案必须跟着改（spec-01 §2.5 更正项）
+  it('文案不得再声称禁止一切 import 或没有标准库', () => {
+    const wrapper = mountForm({ code: SAMPLE_CODE })
+    const text = wrapper.find('.python-node-form__limits').text()
+    expect(text).not.toContain('禁止 import')
+    expect(text).not.toContain('无标准库')
+  })
+
+  it('文案点名白名单模块，并明示 os / socket 一类仍被拒', () => {
+    const wrapper = mountForm({ code: SAMPLE_CODE })
+    const text = wrapper.find('.python-node-form__limits').text()
+    expect(text).toContain('json')
+    expect(text).toContain('datetime')
+    expect(text).toContain('functools')
+    expect(text).toContain('socket')
+  })
 })
 
 describe('PythonNodeForm 提交体', () => {

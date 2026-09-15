@@ -85,15 +85,72 @@ _SAFE_NAMES = frozenset(
     }
 )
 
-SAFE_BUILTINS: dict[str, Any] = {name: getattr(builtins, name) for name in sorted(_SAFE_NAMES)}
+_ALLOWED_MODULES = frozenset(
+    {
+        "json",
+        "re",
+        "math",
+        "statistics",
+        "decimal",
+        "fractions",
+        "random",
+        "datetime",
+        "itertools",
+        "bisect",
+        "heapq",
+        "copy",
+        "string",
+        "textwrap",
+        "base64",
+        "hashlib",
+        "collections",
+        "functools",
+    }
+)
+"""Stdlib an ``import`` may name, by *root* module — a verbatim copy.
+
+``sandbox.py`` holds the other copy: the worker is spawned as a child and must
+never join the parent's import graph, so the constant cannot be shared by
+import, and sending it over stdin would change a frozen protocol row.
+``tests/unit/workflow/test_sandbox.py`` pins the two equal by parsing source.
+"""
+
+
+def _restricted_import(
+    name: str,
+    globals: Any = None,
+    locals: Any = None,
+    fromlist: Any = (),
+    level: int = 0,
+) -> Any:
+    """Rule 1's runtime half: re-check the allowlist, then delegate.
+
+    The signature mirrors CPython's ``__import__``. An ``import`` statement
+    compiles to a lookup of ``__import__`` in the frame's builtins, so an entry
+    is required for allowlisted modules to resolve at all. This is the worker's
+    own gate — never ``builtins.__import__`` — and it exists because a caller may
+    bypass the registration-time AST pre-check.
+    """
+    if level > 0:
+        raise ImportError("relative imports are not allowed in the sandbox")
+    root = name.split(".")[0]
+    if root not in _ALLOWED_MODULES:
+        raise ImportError(f"import of {root} is not allowed in the sandbox")
+    return builtins.__import__(name, globals, locals, fromlist, level)
+
+
+SAFE_BUILTINS: dict[str, Any] = {
+    **{name: getattr(builtins, name) for name in sorted(_SAFE_NAMES)},
+    "__import__": _restricted_import,
+}
 """The sandbox's entire ``__builtins__``.
 
-Deliberately absent: ``__import__``/``open``/``exec``/``eval``/``compile``/
-``globals``/``locals``/``vars``/``dir``/``getattr``/``setattr``/``delattr``/
-``type``/``input``/``breakpoint``/``exit``/``quit``/``help``. With no
-``__import__``, even code that slips past the AST pre-check cannot reach
-``socket``, ``urllib`` or the filesystem. ``True``/``False``/``None`` are
-keywords, not builtins, so they need no entry here.
+Deliberately absent: ``open``/``exec``/``eval``/``compile``/``globals``/
+``locals``/``vars``/``dir``/``getattr``/``setattr``/``delattr``/``type``/
+``input``/``breakpoint``/``exit``/``quit``/``help``. ``__import__`` is present
+but is ``_restricted_import``, so even code that slips past the AST pre-check
+cannot reach ``socket``, ``urllib`` or the filesystem. ``True``/``False``/
+``None`` are keywords, not builtins, so they need no entry here.
 """
 
 _EXIT_NORMAL = 0

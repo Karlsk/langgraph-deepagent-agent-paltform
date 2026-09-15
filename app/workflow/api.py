@@ -154,11 +154,27 @@ def _enforce_python_node_policy(node: NodeDefinition) -> None:
     config["sandboxed"] = True
 
 
+def _validate_http_node_url(config: dict[str, Any]) -> None:
+    """Run the spec-20 SSRF check, skipping mock runs and unresolved templates.
+
+    ``"{" in url`` marks a template: its host does not exist yet, so registration
+    has nothing to resolve. Skipping here opens no hole — the execution-time check
+    on the *rendered* URL (``http_node.py``, before the request is sent) applies
+    to literal and template URLs alike.
+    """
+    if config.get("mock_enabled", False):
+        return
+    url = config.get("url")
+    if not url or "{" in url:
+        return
+    validate_http_url(url)
+
+
 def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> WorkflowDefinition:
     """Parse and validate a PUT body: pydantic → id match → node-type whitelist → per-type guards.
 
-    Per-type guards are the SSRF check for http nodes (spec-20) and the sandbox
-    policy for python nodes (S18).
+    Per-type guards are the SSRF check for http nodes (spec-20, skipped for
+    template URLs) and the sandbox policy for python nodes (S18).
 
     Raises:
         ValidationError: If pydantic model validation fails.
@@ -175,13 +191,8 @@ def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> W
         if node.type not in ALLOWED_NODE_TYPES:
             msg = f"node type '{node.type}' is not allowed; allowed types: {sorted(ALLOWED_NODE_TYPES)}"
             raise ValueError(msg)
-        # spec-20: SSRF guard for HTTP nodes with mock_enabled=false
         if node.type == "http":
-            config = node.config
-            if not config.get("mock_enabled", False):
-                url = config.get("url")
-                if url:
-                    validate_http_url(url)
+            _validate_http_node_url(node.config)
         elif node.type == "python":
             _enforce_python_node_policy(node)
     return definition

@@ -50,6 +50,11 @@ describe('NodePalette 节点面板', () => {
     })
   })
 
+  it('DEFAULT_CONFIGS.http 含空 headers，新拖出的节点即可编辑请求头（§5.1）', () => {
+    expect(DEFAULT_CONFIGS.http).toHaveProperty('headers')
+    expect(DEFAULT_CONFIGS.http!.headers).toEqual({})
+  })
+
   it('拖拽项 dragstart → dataTransfer.setData 写入 type', async () => {
     const wrapper = mountPalette()
     const llmItem = wrapper.findAll('.node-palette__item')[0]

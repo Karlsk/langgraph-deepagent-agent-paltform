@@ -59,6 +59,36 @@ _FORBIDDEN_CALLS = frozenset(
 )
 """Capability-bearing builtins rejected by name (rule 2)."""
 
+_ALLOWED_MODULES = frozenset(
+    {
+        "json",
+        "re",
+        "math",
+        "statistics",
+        "decimal",
+        "fractions",
+        "random",
+        "datetime",
+        "itertools",
+        "bisect",
+        "heapq",
+        "copy",
+        "string",
+        "textwrap",
+        "base64",
+        "hashlib",
+        "collections",
+        "functools",
+    }
+)
+"""Stdlib an ``import`` may name, by *root* module (rule 1).
+
+Duplicated verbatim in ``sandbox_worker.py``: the worker is spawned, never
+imported, so it must not join this module's import graph to share the constant.
+``tests/unit/workflow/test_sandbox.py`` pins the two copies equal by parsing
+source text.
+"""
+
 _WORKER_PATH = Path(__file__).with_name("sandbox_worker.py")
 
 _CHILD_ENV = {"PATH": "/usr/bin:/bin"}
@@ -78,7 +108,8 @@ def validate_code_ast(code: str) -> None:
     """静态拒绝不可沙箱化的代码。通过返回 None，否则抛 WorkflowValidationError。.
 
     规则（命中即拒；消息含行号 + 规则名，绝不含代码正文，H6）：
-      1. import / from ... import（ast.Import / ast.ImportFrom）——全禁，无白名单模块
+      1. import / from ... import（ast.Import / ast.ImportFrom）——根模块须在
+         _ALLOWED_MODULES 内；相对导入（level > 0）一律拒。规则名沿用 no-import
       2. 危险调用名（ast.Call.func 为 ast.Name 且 id ∈ _FORBIDDEN_CALLS）
       3. dunder 标识符：任何 ast.Name.id 或 ast.Attribute.attr 含 "__"
       4. 体积 > _MAX_CODE_BYTES（64 KiB）
@@ -141,7 +172,7 @@ def _reject(rule: str, lineno: int, detail: str) -> WorkflowValidationError:
 def _check_node(node: ast.AST) -> None:
     """Apply rules 1-3 to a single AST node."""
     if isinstance(node, ast.Import | ast.ImportFrom):
-        raise _reject("no-import", node.lineno, "imports are not allowed in sandboxed code")
+        _check_import(node)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         if node.func.id in _FORBIDDEN_CALLS:
             raise _reject("forbidden-call", node.func.lineno, f"{node.func.id}() is not allowed")
@@ -149,6 +180,24 @@ def _check_node(node: ast.AST) -> None:
         raise _reject("dunder-identifier", node.lineno, "dunder names are not allowed")
     if isinstance(node, ast.Attribute) and "__" in node.attr:
         raise _reject("dunder-identifier", node.lineno, "dunder attributes are not allowed")
+
+
+def _check_import(node: ast.Import | ast.ImportFrom) -> None:
+    """Rule 1: allow the import iff every *root* module it names is allowlisted.
+
+    Relative imports are refused outright — the sandbox has no package context,
+    and a level would resolve against the worker's own directory.
+    """
+    if isinstance(node, ast.ImportFrom) and node.level > 0:
+        raise _reject("no-import", node.lineno, "relative imports are not allowed in sandboxed code")
+    if isinstance(node, ast.Import):
+        names = [alias.name for alias in node.names]
+    else:
+        names = [node.module or ""]
+    for name in names:
+        root = name.split(".")[0]
+        if root not in _ALLOWED_MODULES:
+            raise _reject("no-import", node.lineno, f"import of {root} is not allowed")
 
 
 def _spawn(code: str, state: dict[str, Any], limits: SandboxLimits) -> subprocess.CompletedProcess[str]:

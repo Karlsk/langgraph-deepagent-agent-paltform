@@ -9,13 +9,17 @@ protocol, timeout kill, rlimits — lives in
 
 from __future__ import annotations
 
+import ast
+import builtins
 import dataclasses
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from app.workflow import sandbox, sandbox_worker
 from app.workflow.models import PythonNodeError, WorkflowValidationError
@@ -24,14 +28,17 @@ from app.workflow.sandbox_worker import SAFE_BUILTINS
 
 pytestmark = pytest.mark.unit
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SDN_TEMPLATE = REPO_ROOT / "app" / "sdn" / "config" / "sdn_alert_inspection.template.yaml"
+
 VALID_CODE = 'total = sum(state["values"])\nreturn {"total": total, "label": state["label"].upper()}'
 
 
 # ─── §4.14 rule 1: imports ────────────────────────────────────────────
 
 
-class TestNoImport:
-    """Every import form is rejected; there is no allowed-module whitelist."""
+class TestImportAllowlist:
+    """Rule 1 (revised 2026-09-14): the *root* module must be allowlisted."""
 
     @pytest.mark.parametrize(
         "code",
@@ -39,15 +46,51 @@ class TestNoImport:
             "import os",
             "import os, sys",
             "from os import path",
-            "from . import sibling",
             "import socket",
-            "x = 1\nimport json\nreturn {}",
+            "import uuid",
+            "import typing",
+            "import os.path",
+            "from os.path import join",
+            "x = 1\nimport subprocess\nreturn {}",
         ],
     )
-    def test_rejects_import(self, code: str) -> None:
-        """Import statements raise the no-import rule."""
+    def test_rejects_module_outside_allowlist(self, code: str) -> None:
+        """A root module outside the allowlist raises the no-import rule."""
         with pytest.raises(WorkflowValidationError, match="no-import"):
             validate_code_ast(code)
+
+    @pytest.mark.parametrize("code", ["from . import sibling", "from ..pkg import thing", "from .mod import x"])
+    def test_rejects_relative_import(self, code: str) -> None:
+        """Relative imports are rejected outright: there is no package context in the sandbox."""
+        with pytest.raises(WorkflowValidationError, match="no-import"):
+            validate_code_ast(code)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import json",
+            "import re",
+            "import random",
+            "from datetime import datetime",
+            "import collections.abc",
+            "import re as _re",
+            "from functools import reduce",
+            "x = 1\nimport json\nreturn {}",
+            "import json\nimport re\nfrom datetime import datetime\nreturn {}",
+        ],
+    )
+    def test_accepts_allowlisted_module(self, code: str) -> None:
+        """Allowlisted stdlib passes, including submodule and alias forms."""
+        assert validate_code_ast(code) is None
+
+    def test_rejection_names_the_root_module(self) -> None:
+        """The message carries the offending root module, not the code body (H6)."""
+        with pytest.raises(WorkflowValidationError) as exc_info:
+            validate_code_ast("import os.path\nreturn {}")
+        message = str(exc_info.value)
+        assert "no-import" in message
+        assert "os" in message
+        assert "import os.path" not in message
 
     def test_accepts_code_without_import(self) -> None:
         """Pure computation passes the pre-check."""
@@ -459,9 +502,8 @@ class TestWorkerBuiltins:
         assert hasattr(sandbox_worker, "main")
 
     def test_excludes_capability_builtins(self) -> None:
-        """No import, file, exec or introspection entry point survives."""
+        """No file, exec or introspection entry point survives."""
         for forbidden in (
-            "__import__",
             "open",
             "exec",
             "eval",
@@ -481,6 +523,26 @@ class TestWorkerBuiltins:
             "help",
         ):
             assert forbidden not in SAFE_BUILTINS, f"{forbidden} must not be reachable in the sandbox"
+
+    def test_import_is_restricted_not_builtin(self) -> None:
+        """``__import__`` is present but is the worker's own gate, not the real importer."""
+        assert "__import__" in SAFE_BUILTINS
+        assert SAFE_BUILTINS["__import__"] is not builtins.__import__
+
+    def test_restricted_import_allows_allowlisted_module(self) -> None:
+        """The runtime half of rule 1 lets allowlisted stdlib through."""
+        assert SAFE_BUILTINS["__import__"]("json") is json
+
+    @pytest.mark.parametrize("name", ["os", "sys", "socket", "subprocess", "uuid", "typing"])
+    def test_restricted_import_rejects_capability_module(self, name: str) -> None:
+        """Code that bypasses the AST pre-check still cannot reach a capability module."""
+        with pytest.raises(ImportError, match=name):
+            SAFE_BUILTINS["__import__"](name)
+
+    def test_restricted_import_rejects_relative(self) -> None:
+        """A nonzero level is refused regardless of module name."""
+        with pytest.raises(ImportError):
+            SAFE_BUILTINS["__import__"]("json", level=1)
 
     def test_includes_pure_computation_builtins(self) -> None:
         """Data-shaping code still has what it needs."""
@@ -513,3 +575,125 @@ class TestWorkerBuiltins:
             "KeyError",
         ):
             assert allowed in SAFE_BUILTINS, f"{allowed} is required for ordinary data shaping"
+
+
+# ─── S22: the allowlist is stored twice ───────────────────────────────
+
+
+def _allowed_modules_from_source(path: Path) -> set[str]:
+    """Read ``_ALLOWED_MODULES`` out of a file's *text*, never out of its imports.
+
+    The worker must not enter the parent's import graph (it is spawned as a
+    child), so the two copies can only be compared by parsing source.
+    ``ast.literal_eval`` cannot digest ``frozenset({...})``, so the call node is
+    asserted and only its argument evaluated.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(getattr(target, "id", None) == "_ALLOWED_MODULES" for target in node.targets):
+            continue
+        call = node.value
+        assert isinstance(call, ast.Call), f"{path.name}: _ALLOWED_MODULES must be built by frozenset(...)"
+        assert getattr(call.func, "id", None) == "frozenset", f"{path.name}: _ALLOWED_MODULES must be a frozenset"
+        return set(ast.literal_eval(call.args[0]))
+    raise AssertionError(f"{path.name} does not define _ALLOWED_MODULES")
+
+
+class TestAllowedModuleCopies:
+    """Two files, one allowlist — a drift between them is a security hole."""
+
+    _SANDBOX = REPO_ROOT / "app" / "workflow" / "sandbox.py"
+    _WORKER = REPO_ROOT / "app" / "workflow" / "sandbox_worker.py"
+
+    def test_copies_are_equal(self) -> None:
+        """The registration-time pre-check and the runtime gate must agree."""
+        assert _allowed_modules_from_source(self._SANDBOX) == _allowed_modules_from_source(self._WORKER)
+
+    def test_copies_are_non_empty(self) -> None:
+        """Guards against a parse that silently matched nothing."""
+        assert _allowed_modules_from_source(self._SANDBOX)
+
+    def test_allowlist_covers_what_the_sdn_workflow_needs(self) -> None:
+        """The motivation for the revision, pinned as data."""
+        assert {"json", "re", "random", "datetime"} <= _allowed_modules_from_source(self._SANDBOX)
+
+    def test_parent_never_imports_the_worker(self) -> None:
+        """Why the constant is duplicated rather than shared."""
+        tree = ast.parse(self._SANDBOX.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+                imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+        assert not any("sandbox_worker" in name for name in imported), imported
+
+
+# ─── motivation anchor: the SDN workflow's verbatim code ──────────────
+
+
+def _sdn_python_nodes() -> list[tuple[str, str]]:
+    """Every ``type: python`` node's code body from the git-tracked template."""
+    document = yaml.safe_load(SDN_TEMPLATE.read_text(encoding="utf-8"))
+    nodes = [(node["name"], node["config"]["code"]) for node in document["nodes"] if node["type"] == "python"]
+    assert nodes, "the SDN template must contain python nodes for this card to mean anything"
+    return nodes
+
+
+_SDN_NODES = _sdn_python_nodes()
+
+
+class TestSdnWorkflowCodePassesThePrecheck:
+    """The YAML that motivated the revision must survive registration as-is."""
+
+    @pytest.mark.parametrize(("name", "code"), _SDN_NODES, ids=[node_name for node_name, _ in _SDN_NODES])
+    def test_node_code_is_accepted(self, name: str, code: str) -> None:
+        """The workflow is not hand-edited to fit the sandbox; the sandbox fits the workflow."""
+        assert validate_code_ast(code) is None, f"node {name} was rejected"
+
+    def test_nodes_import_nothing_outside_the_allowlist(self) -> None:
+        """Documents the allowlist's lower bound in terms of real usage."""
+        roots: set[str] = set()
+        for _, code in _SDN_NODES:
+            for node in ast.walk(ast.parse(code)):
+                if isinstance(node, ast.Import):
+                    roots.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    roots.add((node.module or "").split(".")[0])
+        assert roots == {"json", "re", "random", "datetime"}
+
+
+# ─── §4.14 rule 1 (revised): a legal import must not reopen old holes ─
+
+
+class TestEscapeChainsAfterAllowlistedImport:
+    """Widening rule 1 hands user code a real module object; rules 2/3 must hold."""
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            "json.__loader__",
+            "json.__builtins__",
+            "json.__spec__",
+            "().__class__",
+            "''.__class__.__bases__",
+        ],
+    )
+    def test_rejects_dunder_reach(self, tail: str) -> None:
+        """Rule 3 fires at registration, before any child is spawned."""
+        with pytest.raises(WorkflowValidationError, match="dunder-identifier"):
+            validate_code_ast(f"import json\nreturn {{'x': {tail}}}")
+
+    @pytest.mark.parametrize("name", ["getattr", "vars", "dir", "globals", "eval", "exec", "open", "__import__"])
+    def test_rejects_introspection_builtin(self, name: str) -> None:
+        """Rule 2 is untouched by the allowlist: the escape primitives stay banned."""
+        with pytest.raises(WorkflowValidationError, match="forbidden-call"):
+            validate_code_ast(f"import json\nreturn {{'x': {name}(json)}}")
+
+    def test_accepts_ordinary_module_use(self) -> None:
+        """Positive control: the widening is not so tight that legal calls break."""
+        code = 'import json\nimport re\nreturn {"s": json.dumps({"a": 1}), "m": bool(re.match("a", "ab"))}'
+        assert validate_code_ast(code) is None

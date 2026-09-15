@@ -4,9 +4,11 @@
 - validate_http_url() 纯函数：私网/环回/链路本地/元数据/scheme 拦截
 - 白名单模式：非空时仅允许名单内 host
 - 注册期校验：PUT 含非法 url（mock 关闭）→ 422
+- 注册期豁免：url 含未解析 `{占位符}`（模板）→ 跳过，由执行期渲染后校验兜住
 - 执行期校验：http 节点请求前二次校验（defense in depth）
 - mock_enabled=true 豁免（零网络，S9）
 """
+import socket
 from unittest.mock import patch
 
 import pytest
@@ -241,6 +243,62 @@ class TestRegistrationTimeValidation:
                 response = client.put("/workflows/public_test", json=payload)
         assert response.status_code == 200
 
+    @pytest.mark.parametrize(
+        ("workflow_id", "url"),
+        [
+            ("tpl_host", "{sdn_base_url}/oauth/token"),
+            ("tpl_path", "https://unresolvable.invalid/{version}/v1"),
+            ("tpl_query", "https://unresolvable.invalid/api?pageNumber={page}"),
+        ],
+    )
+    def test_put_with_template_url_skips_registration_validation(self, client, workflow_id, url):
+        """含 `{占位符}` 的 url 是模板：host 要到运行期才知道，注册期无从校验（spec-20 修订）."""
+        payload = {
+            "workflow_id": workflow_id,
+            "nodes": [
+                {
+                    "name": "fetch",
+                    "type": "http",
+                    "config": {"url": url, "method": "GET", "mock_enabled": False},
+                }
+            ],
+            "entry_point": "fetch",
+            "state_schema": {"input": {"type": "str", "description": "user input"}},
+        }
+        with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+            with patch("app.workflow.api.validate_http_url") as spy:
+                response = client.put(f"/workflows/{workflow_id}", json=payload)
+        assert response.status_code == 200
+        spy.assert_not_called()
+
+    def test_put_with_literal_url_still_validated(self, client):
+        """钉住「只有模板才跳过」：字面量 host 照旧走注册期校验（DNS 不可解析 → 422）."""
+        payload = {
+            "workflow_id": "literal_test",
+            "nodes": [
+                {
+                    "name": "fetch",
+                    "type": "http",
+                    "config": {
+                        "url": "https://unresolvable.invalid/api",
+                        "method": "GET",
+                        "mock_enabled": False,
+                    },
+                }
+            ],
+            "entry_point": "fetch",
+            "state_schema": {"input": {"type": "str", "description": "user input"}},
+        }
+        with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+            with (
+                patch("app.workflow.api.validate_http_url", side_effect=validate_http_url) as spy,
+                patch("app.workflow.security.socket.getaddrinfo", side_effect=socket.gaierror("no such host")),
+            ):
+                response = client.put("/workflows/literal_test", json=payload)
+        spy.assert_called_once_with("https://unresolvable.invalid/api")
+        assert response.status_code == 422
+        assert "cannot resolve" in response.json()["message"]
+
 
 # ─── 执行期校验（defense in depth） ────────────────────────────────────
 
@@ -261,6 +319,21 @@ class TestExecutionTimeValidation:
         )
         with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
             node.build_runnable().invoke({})
+
+    def test_execution_blocks_url_rendered_from_a_template(self):
+        """跳过注册期 ≠ 没有边界：模板渲染出链路本地地址，执行期照样拦（spec-20 修订）."""
+        from app.workflow.nodes.http_node import HTTPNode
+
+        node = HTTPNode(
+            name="fetch",
+            config={
+                "url": "{base}/latest/meta-data",
+                "method": "GET",
+                "mock_enabled": False,
+            },
+        )
+        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
+            node.build_runnable().invoke({"base": "http://169.254.169.254"})
 
     def test_execution_allows_public_url(self, monkeypatch):
         """执行期允许公网地址（mock httpx 避免真实网络）."""

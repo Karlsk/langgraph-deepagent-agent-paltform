@@ -60,7 +60,7 @@ function onFieldChange() {
       <div class="python-node-form__limits-title">沙箱限制</div>
       <ul>
         <li>必须 return 一个 dict，否则视为执行失败</li>
-        <li>禁止 import：无第三方库，也无标准库</li>
+        <li>只能 import 白名单内的标准库（json / re / math / random / datetime / collections / functools 等）；os / sys / socket 等一律拒绝</li>
         <li>无文件与网络访问，无 open / exec / eval / getattr 等内建</li>
         <li>禁止 dunder 标识符（如 __class__），内省逃逸链被封死</li>
         <li>超时与内存均有上限，超限即被终止</li>

@@ -170,6 +170,20 @@ describe('NodeConfigPanel 节点配置面板', () => {
       expect(emitted.config.url).toBe('https://new-api.example.com')
       expect(emitted.config).not.toBe(mockHttpNode.data.config)
     })
+
+    it('修改 headers → patch 透传 headers，不丢键', async () => {
+      const wrapper = mountPanel({ node: mockHttpNode })
+      const form = wrapper.findComponent({ name: 'HttpNodeForm' })
+
+      await form.vm.$emit('update:config', {
+        ...mockHttpNode.data.config,
+        headers: { Authorization: 'Bearer {token}' },
+      })
+
+      const emitted = wrapper.emitted('update:node')![0][0] as { config: Record<string, unknown> }
+      expect(emitted.config.headers).toEqual({ Authorization: 'Bearer {token}' })
+      expect(emitted.config.url).toBe('https://api.example.com')
+    })
     it('修改 code → emit update:node({ config }) 含新值，且不带 entry / sandboxed（§14）', async () => {
       const wrapper = mountPanel({ node: mockPythonNode })
       const form = wrapper.findComponent({ name: 'PythonNodeForm' })
