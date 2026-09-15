@@ -154,7 +154,7 @@ def _enforce_python_node_policy(node: NodeDefinition) -> None:
     config["sandboxed"] = True
 
 
-def _validate_http_node_url(config: dict[str, Any]) -> None:
+def _validate_http_node_url(config: dict[str, Any], *, allow_private_networks: bool = True) -> None:
     """Run the spec-20 SSRF check, skipping mock runs and unresolved templates.
 
     ``"{" in url`` marks a template: its host does not exist yet, so registration
@@ -167,7 +167,7 @@ def _validate_http_node_url(config: dict[str, Any]) -> None:
     url = config.get("url")
     if not url or "{" in url:
         return
-    validate_http_url(url)
+    validate_http_url(url, allow_private_networks=allow_private_networks)
 
 
 def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> WorkflowDefinition:
@@ -192,7 +192,7 @@ def _validate_definition_payload(payload: dict[str, Any], workflow_id: str) -> W
             msg = f"node type '{node.type}' is not allowed; allowed types: {sorted(ALLOWED_NODE_TYPES)}"
             raise ValueError(msg)
         if node.type == "http":
-            _validate_http_node_url(node.config)
+            _validate_http_node_url(node.config, allow_private_networks=definition.allow_private_networks)
         elif node.type == "python":
             _enforce_python_node_policy(node)
     return definition

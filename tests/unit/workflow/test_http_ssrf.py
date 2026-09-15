@@ -1,14 +1,13 @@
-"""HTTP 节点 SSRF 防护测试（spec-20）。.
+"""HTTP 节点 URL 校验测试（spec-20）。.
 
 覆盖：
-- validate_http_url() 纯函数：私网/环回/链路本地/元数据/scheme 拦截
-- 白名单模式：非空时仅允许名单内 host
+- validate_http_url() 纯函数：scheme 拦截 + host 缺失 + 白名单 + IP 段校验（条件）
 - 注册期校验：PUT 含非法 url（mock 关闭）→ 422
 - 注册期豁免：url 含未解析 `{占位符}`（模板）→ 跳过，由执行期渲染后校验兜住
 - 执行期校验：http 节点请求前二次校验（defense in depth）
 - mock_enabled=true 豁免（零网络，S9）
+- allow_private_networks 字段：默认 True（允许内网），False 时启用 IP 段校验
 """
-import socket
 from unittest.mock import patch
 
 import pytest
@@ -25,61 +24,7 @@ pytestmark = pytest.mark.unit
 
 # ─── spec-20 §4: 拦截规则 ─────────────────────────────────────────────
 
-class TestPrivateNetworkRejection:
-    """私网/环回/链路本地/元数据地址全部拒绝."""
-
-    def test_loopback_ipv4_127(self):
-        """127.0.0.0/8 环回段拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://127.0.0.1/api")
-
-    def test_loopback_ipv4_127_other(self):
-        """127.x.x.x 其他环回地址拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://127.0.0.2/api")
-
-    def test_localhost_hostname(self):
-        """Localhost 主机名拒绝（解析到 127.0.0.1）."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://localhost/api")
-
-    def test_private_10_network(self):
-        """10.0.0.0/8 私网段拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://10.0.0.1/api")
-
-    def test_private_172_16_network(self):
-        """172.16.0.0/12 私网段拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://172.16.0.1/api")
-
-    def test_private_192_168_network(self):
-        """192.168.0.0/16 私网段拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://192.168.1.1/api")
-
-    def test_link_local_169_254(self):
-        """169.254.0.0/16 链路本地段拒绝（含云元数据）."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
-            validate_http_url("http://169.254.169.254/latest/meta-data")
-
-    def test_loopback_ipv6(self):
-        """::1 IPv6 环回拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://[::1]/api")
-
-    def test_private_ipv6_fc00(self):
-        """fc00::/7 IPv6 私网段拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-            validate_http_url("http://[fc00::1]/api")
-
-    def test_link_local_ipv6_fe80(self):
-        """fe80::/10 IPv6 链路本地段拒绝."""
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
-            validate_http_url("http://[fe80::1]/api")
-
-
-class TestSchemeWhitelist:
+class TestSchemeValidation:
     """scheme 仅允许 http/https."""
 
     def test_file_scheme_rejected(self):
@@ -98,71 +43,100 @@ class TestSchemeWhitelist:
             validate_http_url("ftp://example.com/file")
 
 
-class TestPublicNetworkAllowed:
-    """公网地址通过."""
+class TestHostValidation:
+    """host 必须存在."""
 
-    def test_https_example_com(self, monkeypatch):
-        """https://example.com 公网通过."""
-        # Mock DNS 解析返回公网 IP
-        monkeypatch.setattr(
-            "socket.getaddrinfo",
-            lambda *args: [(2, 1, 6, "", ("93.184.216.34", 0))],
-        )
-        validate_http_url("https://example.com/api")  # 不抛异常即通过
+    def test_missing_host_rejected(self):
+        """URL 缺少 host 拒绝."""
+        with pytest.raises(WorkflowValidationError, match="missing host"):
+            validate_http_url("http:///path/only")
 
-    def test_http_example_com(self, monkeypatch):
-        """http://example.com 公网通过."""
-        monkeypatch.setattr(
-            "socket.getaddrinfo",
-            lambda *args: [(2, 1, 6, "", ("93.184.216.34", 0))],
-        )
+
+class TestValidUrls:
+    """合法 URL 通过."""
+
+    def test_https_example_com(self):
+        """https://example.com 通过."""
+        validate_http_url("https://example.com/api")
+
+    def test_http_example_com(self):
+        """http://example.com 通过."""
         validate_http_url("http://example.com/api")
 
-    def test_https_subdomain(self, monkeypatch):
+    def test_https_subdomain(self):
         """https://api.example.com 子域名通过."""
+        validate_http_url("https://api.example.com/v1")
+
+
+class TestPrivateNetworks:
+    """allow_private_networks 控制 IP 段校验."""
+
+    def test_private_ip_allowed_by_default(self):
+        """默认 allow_private_networks=True，私网 IP 允许."""
+        validate_http_url("http://192.168.1.1/api")
+
+    def test_loopback_allowed_by_default(self):
+        """默认 allow_private_networks=True，环回地址允许."""
+        validate_http_url("http://127.0.0.1/api")
+
+    def test_link_local_allowed_by_default(self):
+        """默认 allow_private_networks=True，链路本地地址允许."""
+        validate_http_url("http://169.254.169.254/latest/meta-data")
+
+    def test_private_ip_blocked_when_disabled(self, monkeypatch):
+        """allow_private_networks=False 时，私网 IP 拒绝."""
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *args: [(2, 1, 6, "", ("192.168.1.1", 0))],
+        )
+        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
+            validate_http_url("http://192.168.1.1/api", allow_private_networks=False)
+
+    def test_loopback_blocked_when_disabled(self, monkeypatch):
+        """allow_private_networks=False 时，环回地址拒绝."""
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *args: [(2, 1, 6, "", ("127.0.0.1", 0))],
+        )
+        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
+            validate_http_url("http://127.0.0.1/api", allow_private_networks=False)
+
+    def test_link_local_blocked_when_disabled(self, monkeypatch):
+        """allow_private_networks=False 时，链路本地地址拒绝."""
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *args: [(2, 1, 6, "", ("169.254.169.254", 0))],
+        )
+        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
+            validate_http_url("http://169.254.169.254/latest/meta-data", allow_private_networks=False)
+
+    def test_public_ip_allowed_when_disabled(self, monkeypatch):
+        """allow_private_networks=False 时，公网 IP 允许."""
         monkeypatch.setattr(
             "socket.getaddrinfo",
             lambda *args: [(2, 1, 6, "", ("93.184.216.34", 0))],
         )
-        validate_http_url("https://api.example.com/v1")
+        validate_http_url("https://example.com/api", allow_private_networks=False)
 
 
 class TestHostAllowlist:
     """WORKFLOW_HTTP_ALLOWED_HOSTS 白名单模式."""
 
-    def test_empty_allowlist_allows_public(self, monkeypatch):
-        """空白名单（默认）允许所有公网 host."""
-        monkeypatch.setattr(
-            "socket.getaddrinfo",
-            lambda *args: [(2, 1, 6, "", ("93.184.216.34", 0))],
-        )
+    def test_empty_allowlist_allows_all(self):
+        """空白名单（默认）允许所有 host."""
         with patch.object(settings, "WORKFLOW_HTTP_ALLOWED_HOSTS", []):
-            validate_http_url("https://example.com/api")  # 不抛异常
+            validate_http_url("https://example.com/api")
 
-    def test_nonempty_allowlist_permits_listed_host(self, monkeypatch):
+    def test_nonempty_allowlist_permits_listed_host(self):
         """非空白名单允许名单内 host."""
-        monkeypatch.setattr(
-            "socket.getaddrinfo",
-            lambda *args: [(2, 1, 6, "", ("93.184.216.34", 0))],
-        )
         with patch.object(settings, "WORKFLOW_HTTP_ALLOWED_HOSTS", ["api.example.com"]):
-            validate_http_url("https://api.example.com/v1")  # 不抛异常
+            validate_http_url("https://api.example.com/v1")
 
-    def test_nonempty_allowlist_blocks_unlisted_public(self, monkeypatch):
-        """非空白名单拒绝名单外公网 host."""
-        monkeypatch.setattr(
-            "socket.getaddrinfo",
-            lambda *args: [(2, 1, 6, "", ("93.184.216.34", 0))],
-        )
+    def test_nonempty_allowlist_blocks_unlisted_host(self):
+        """非空白名单拒绝名单外 host."""
         with patch.object(settings, "WORKFLOW_HTTP_ALLOWED_HOSTS", ["api.example.com"]):
             with pytest.raises(WorkflowValidationError, match="not in allowed hosts"):
                 validate_http_url("https://other.com/api")
-
-    def test_allowlist_blocks_private_even_if_listed(self):
-        """白名单不豁免私网地址（私网始终拒绝）."""
-        with patch.object(settings, "WORKFLOW_HTTP_ALLOWED_HOSTS", ["192.168.1.1"]):
-            with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
-                validate_http_url("http://192.168.1.1/api")
 
 
 # ─── 注册期校验（spec-16 链） ──────────────────────────────────────────
@@ -170,8 +144,8 @@ class TestHostAllowlist:
 class TestRegistrationTimeValidation:
     """PUT 注册时校验 http 节点 url."""
 
-    def test_put_with_private_url_rejected_422(self, client):
-        """PUT 含私网 url（mock 关闭）→ 422."""
+    def test_put_with_invalid_scheme_rejected_422(self, client):
+        """PUT 含非法 scheme（mock 关闭）→ 422."""
         payload = {
             "workflow_id": "ssrf_test",
             "nodes": [
@@ -179,7 +153,7 @@ class TestRegistrationTimeValidation:
                     "name": "fetch",
                     "type": "http",
                     "config": {
-                        "url": "http://169.254.169.254/latest/meta-data",
+                        "url": "file:///etc/passwd",
                         "method": "GET",
                         "mock_enabled": False,
                     },
@@ -191,12 +165,60 @@ class TestRegistrationTimeValidation:
         with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
             response = client.put("/workflows/ssrf_test", json=payload)
         assert response.status_code == 422
-        # api.py 的 WorkflowValidationError 分支自 S18 起为原因中立（SSRF + 沙箱 AST 共用），
-        # 故断言异常自身携带的原因文本，而非已被移除的 "SSRF guard:" 前缀
-        assert "private/loopback/link-local/reserved" in response.json()["message"].lower()
+        assert "scheme" in response.json()["message"].lower()
+
+    def test_put_with_private_url_allowed_by_default(self, client):
+        """PUT 含私网 url（默认 allow_private_networks=True）→ 通过."""
+        payload = {
+            "workflow_id": "private_test",
+            "nodes": [
+                {
+                    "name": "fetch",
+                    "type": "http",
+                    "config": {
+                        "url": "http://192.168.1.1/api",
+                        "method": "GET",
+                        "mock_enabled": False,
+                    },
+                }
+            ],
+            "entry_point": "fetch",
+            "state_schema": {"input": {"type": "str", "description": "user input"}},
+        }
+        with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+            response = client.put("/workflows/private_test", json=payload)
+        assert response.status_code == 200
+
+    def test_put_with_private_url_blocked_when_disabled(self, client, monkeypatch):
+        """PUT 含私网 url + allow_private_networks=False → 422."""
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *args: [(2, 1, 6, "", ("192.168.1.1", 0))],
+        )
+        payload = {
+            "workflow_id": "private_blocked_test",
+            "nodes": [
+                {
+                    "name": "fetch",
+                    "type": "http",
+                    "config": {
+                        "url": "http://192.168.1.1/api",
+                        "method": "GET",
+                        "mock_enabled": False,
+                    },
+                }
+            ],
+            "entry_point": "fetch",
+            "state_schema": {"input": {"type": "str", "description": "user input"}},
+            "allow_private_networks": False,
+        }
+        with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
+            response = client.put("/workflows/private_blocked_test", json=payload)
+        assert response.status_code == 422
+        assert "private/loopback" in response.json()["message"].lower()
 
     def test_put_with_mock_enabled_true_skips_validation(self, client):
-        """PUT 含私网 url 但 mock_enabled=true → 通过（零网络，S9）."""
+        """PUT 含非法 url 但 mock_enabled=true → 通过（零网络，S9）."""
         payload = {
             "workflow_id": "mock_test",
             "nodes": [
@@ -204,11 +226,11 @@ class TestRegistrationTimeValidation:
                     "name": "fetch",
                     "type": "http",
                     "config": {
-                        "url": "http://169.254.169.254/latest/meta-data",
+                        "url": "file:///etc/passwd",
                         "method": "GET",
                         "mock_enabled": True,
                         "mock_responses": {
-                            "GET http://169.254.169.254/latest/meta-data": '{"data": "mocked"}'
+                            "GET file:///etc/passwd": '{"data": "mocked"}'
                         },
                     },
                 }
@@ -239,8 +261,7 @@ class TestRegistrationTimeValidation:
             "state_schema": {"input": {"type": "str", "description": "user input"}},
         }
         with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
-            with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
-                response = client.put("/workflows/public_test", json=payload)
+            response = client.put("/workflows/public_test", json=payload)
         assert response.status_code == 200
 
     @pytest.mark.parametrize(
@@ -271,104 +292,90 @@ class TestRegistrationTimeValidation:
         assert response.status_code == 200
         spy.assert_not_called()
 
-    def test_put_with_literal_url_still_validated(self, client):
-        """钉住「只有模板才跳过」：字面量 host 照旧走注册期校验（DNS 不可解析 → 422）."""
-        payload = {
-            "workflow_id": "literal_test",
-            "nodes": [
-                {
-                    "name": "fetch",
-                    "type": "http",
-                    "config": {
-                        "url": "https://unresolvable.invalid/api",
-                        "method": "GET",
-                        "mock_enabled": False,
-                    },
-                }
-            ],
-            "entry_point": "fetch",
-            "state_schema": {"input": {"type": "str", "description": "user input"}},
-        }
-        with patch.object(settings, "WORKFLOW_ADMIN_USERNAMES", ["admin_user"]):
-            with (
-                patch("app.workflow.api.validate_http_url", side_effect=validate_http_url) as spy,
-                patch("app.workflow.security.socket.getaddrinfo", side_effect=socket.gaierror("no such host")),
-            ):
-                response = client.put("/workflows/literal_test", json=payload)
-        spy.assert_called_once_with("https://unresolvable.invalid/api")
-        assert response.status_code == 422
-        assert "cannot resolve" in response.json()["message"]
-
 
 # ─── 执行期校验（defense in depth） ────────────────────────────────────
 
 class TestExecutionTimeValidation:
     """执行期二次校验（即使绕过注册）."""
 
-    def test_execution_blocks_private_url(self):
-        """执行期请求前校验拦截私网地址."""
+    def test_execution_blocks_invalid_scheme(self):
+        """执行期请求前校验拦截非法 scheme."""
         from app.workflow.nodes.http_node import HTTPNode
 
         node = HTTPNode(
             name="fetch",
             config={
-                "url": "http://169.254.169.254/latest/meta-data",
+                "url": "file:///etc/passwd",
                 "method": "GET",
                 "mock_enabled": False,
             },
         )
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
+        with pytest.raises(WorkflowValidationError, match="scheme"):
             node.build_runnable().invoke({})
 
-    def test_execution_blocks_url_rendered_from_a_template(self):
-        """跳过注册期 ≠ 没有边界：模板渲染出链路本地地址，执行期照样拦（spec-20 修订）."""
+    def test_execution_allows_private_ip_by_default(self):
+        """执行期默认允许私网 IP（allow_private_networks=True）."""
         from app.workflow.nodes.http_node import HTTPNode
 
-        node = HTTPNode(
-            name="fetch",
-            config={
-                "url": "{base}/latest/meta-data",
-                "method": "GET",
-                "mock_enabled": False,
-            },
-        )
-        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved|link-local"):
-            node.build_runnable().invoke({"base": "http://169.254.169.254"})
-
-    def test_execution_allows_public_url(self, monkeypatch):
-        """执行期允许公网地址（mock httpx 避免真实网络）."""
-        import socket
-        from app.workflow.nodes.http_node import HTTPNode
-
-        # Mock httpx.request 避免真实网络
         def mock_request(method, url, headers=None, json=None, timeout=None):
-            # 创建带 request 实例的 Response，使 raise_for_status() 正常工作
             request = httpx.Request(method, url, headers=headers)
             return httpx.Response(200, json={"data": "ok"}, request=request)
 
-        monkeypatch.setattr("app.workflow.nodes.http_node.httpx.request", mock_request)
+        with patch("app.workflow.nodes.http_node.httpx.request", mock_request):
+            node = HTTPNode(
+                name="fetch",
+                config={
+                    "url": "http://192.168.1.1/api",
+                    "method": "GET",
+                    "mock_enabled": False,
+                },
+            )
+            result = node.build_runnable().invoke({})
+            assert result["fetch_result"]["response"] == {"data": "ok"}
+            assert result["fetch_result"]["status_code"] == 200
+            assert result["fetch_result"]["url"] == "http://192.168.1.1/api"
 
-        # Mock DNS 解析返回公网 IP
-        def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-            if host == "api.example.com":
-                # 返回公网 IP（93.184.216.34 是 example.com 的真实 IP）
-                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
-            raise socket.gaierror(f"cannot resolve {host}")
+    def test_execution_blocks_private_ip_when_disabled(self, monkeypatch):
+        """执行期 allow_private_networks=False 时拦截私网 IP."""
+        from app.workflow.nodes.http_node import HTTPNode
 
-        monkeypatch.setattr("app.workflow.security.socket.getaddrinfo", mock_getaddrinfo)
-
+        monkeypatch.setattr(
+            "app.workflow.security.socket.getaddrinfo",
+            lambda *args: [(2, 1, 6, "", ("192.168.1.1", 0))],
+        )
         node = HTTPNode(
             name="fetch",
             config={
-                "url": "https://api.example.com/v1",
+                "url": "http://192.168.1.1/api",
                 "method": "GET",
                 "mock_enabled": False,
+                "allow_private_networks": False,
             },
         )
-        result = node.build_runnable().invoke({})
-        assert result["fetch_result"]["response"] == {"data": "ok"}
-        assert result["fetch_result"]["status_code"] == 200
-        assert result["fetch_result"]["url"] == "https://api.example.com/v1"
+        with pytest.raises(WorkflowValidationError, match="private|loopback|reserved"):
+            node.build_runnable().invoke({})
+
+    def test_execution_allows_public_url(self):
+        """执行期允许公网地址（mock httpx 避免真实网络）."""
+        from app.workflow.nodes.http_node import HTTPNode
+
+        def mock_request(method, url, headers=None, json=None, timeout=None):
+            request = httpx.Request(method, url, headers=headers)
+            return httpx.Response(200, json={"data": "ok"}, request=request)
+
+        with patch("app.workflow.nodes.http_node.httpx.request", mock_request):
+            node = HTTPNode(
+                name="fetch",
+                config={
+                    "url": "https://api.example.com/v1",
+                    "method": "GET",
+                    "mock_enabled": False,
+                },
+            )
+            result = node.build_runnable().invoke({})
+            assert result["fetch_result"]["response"] == {"data": "ok"}
+            assert result["fetch_result"]["status_code"] == 200
+            assert result["fetch_result"]["url"] == "https://api.example.com/v1"
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────

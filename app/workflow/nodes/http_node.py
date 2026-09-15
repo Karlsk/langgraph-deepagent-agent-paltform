@@ -62,6 +62,7 @@ class HTTPNodeConfig(BaseModel):
     retry_on_status: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
     mock_enabled: bool = False  # 默认关闭；显式启用才生效（H2/H6）
     mock_responses: dict[str, str] | None = None
+    allow_private_networks: bool = True  # injected by graph builder from workflow definition
 
 
 def _flatten_context(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -208,7 +209,7 @@ class HTTPNode(BaseNode):
                     status_code = _MOCK_HIT_STATUS_CODE
                 else:
                     # 4. 真实分支：tenacity 按 retry_on_status 退避 + raise_for_status（S8）
-                    validate_http_url(rendered_url)  # spec-20: execution-time SSRF guard
+                    validate_http_url(rendered_url, allow_private_networks=cfg.allow_private_networks)  # spec-20: execution-time SSRF guard
                     response = self._send_with_retry(cfg.method, rendered_url, headers, body)
                     data = response.json()
                     status_code = response.status_code

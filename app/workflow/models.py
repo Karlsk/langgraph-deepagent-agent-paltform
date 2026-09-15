@@ -138,6 +138,11 @@ class WorkflowDefinition(BaseModel):
     edges: list[EdgeDefinition] = Field(default_factory=list)
     state_schema: dict[str, StateFieldSchema]
     ui_layout: dict[str, Any] | None = None
+    allow_private_networks: bool = Field(
+        default=True,
+        description="Whether HTTP nodes can access private/loopback/link-local IPs. "
+        "Default True for internal network scenarios; set False to enforce public-only SSRF protection.",
+    )
     operator_logs: dict[str, OperatorLog] = Field(default_factory=dict)
     execution_history: list[ExecutionLog] = Field(default_factory=list)
 

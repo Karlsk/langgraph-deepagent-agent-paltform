@@ -109,6 +109,9 @@ class GraphBuilder:
         nodes_map: dict[str, BaseNode] = {}
         for node_def in definition.nodes:
             try:
+                # Inject workflow-level allow_private_networks into HTTP node configs
+                if node_def.type == "http":
+                    node_def.config["allow_private_networks"] = definition.allow_private_networks
                 node = create_node(
                     node_def,
                     operator_log=definition.operator_logs.get(node_def.name),
