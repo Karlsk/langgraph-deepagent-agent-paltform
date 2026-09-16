@@ -15,6 +15,7 @@ import { useRouter } from 'vue-router'
 import WebAgentTable from '@/components/WebAgentTable.vue'
 import type { TableColumnConfig } from '@/components/WebAgentTable.vue'
 import WorkflowExecuteDialog from '@/views/workflow/WorkflowExecuteDialog.vue'
+import WorkflowRunHistoryDialog from '@/views/workflow/WorkflowRunHistoryDialog.vue'
 import {
   deleteWorkflow,
   listWorkflows,
@@ -30,7 +31,7 @@ const columns: TableColumnConfig[] = [
   { label: '节点数', prop: 'node_count', width: 100 },
   { label: '入口', prop: 'entry_point', width: 150 },
   { label: '描述', prop: 'description', slot: 'description' },
-  { label: '操作', prop: 'actions', width: 240, slot: 'actions' },
+  { label: '操作', prop: 'actions', width: 300, slot: 'actions' },
 ]
 
 const router = useRouter()
@@ -56,6 +57,14 @@ const executeWorkflowId = ref<string | null>(null)
 function handleExecute(row: WorkflowSummary): void {
   executeWorkflowId.value = row.workflow_id
   executeDialogVisible.value = true
+}
+
+const historyDialogVisible = ref(false)
+const historyWorkflowId = ref<string | null>(null)
+
+function handleHistory(row: WorkflowSummary): void {
+  historyWorkflowId.value = row.workflow_id
+  historyDialogVisible.value = true
 }
 
 function handleDelete(row: WorkflowSummary): void {
@@ -96,6 +105,9 @@ function handleDelete(row: WorkflowSummary): void {
           <el-button link type="primary" size="small" @click="handleExecute(row as WorkflowSummary)">
             执行
           </el-button>
+          <el-button link type="primary" size="small" @click="handleHistory(row as WorkflowSummary)">
+            历史
+          </el-button>
           <el-button
             v-if="canEdit"
             link
@@ -114,6 +126,12 @@ function handleDelete(row: WorkflowSummary): void {
       v-model="executeDialogVisible"
       :workflow-id="executeWorkflowId"
       @executed="() => tableRef?.refresh()"
+    />
+
+    <WorkflowRunHistoryDialog
+      v-if="historyWorkflowId"
+      v-model="historyDialogVisible"
+      :workflow-id="historyWorkflowId"
     />
   </div>
 </template>

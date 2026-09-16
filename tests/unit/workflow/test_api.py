@@ -17,7 +17,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from sqlmodel import Session as DBSession
+from sqlmodel import SQLModel, create_engine
+from sqlalchemy.pool import StaticPool
 
+from app.api.v1.agent_assets_common import get_db_session
 from app.core.config import settings
 from app.core.logging import get_structlog_processors
 from app.workflow import api as workflow_api
@@ -171,6 +175,20 @@ def client(tmp_path: Path) -> Generator[TestClient, None, None]:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.include_router(workflow_api.router)
     _add_mock_auth(app, username="admin_user")
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def _override_get_db_session() -> Generator[DBSession, None, None]:
+        with DBSession(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = _override_get_db_session
+
     with TestClient(app) as test_client:
         yield test_client
 
@@ -212,7 +230,8 @@ def test_api_failure_envelope_redacted(client: TestClient) -> None:
     assert "sk-live-leak-999" not in response.text
     envelope = response.json()
     assert envelope["code"] == 500
-    assert envelope["data"] is None
+    assert envelope["data"] is not None
+    assert "execution_logs" in envelope["data"]["metadata"]
 
 
 def test_api_missing_registry_injection_returns_500(tmp_path: Path) -> None:
@@ -449,8 +468,8 @@ def test_execute_logs_truncate_long_values(tmp_path: Path) -> None:
     assert blob.endswith("...(truncated)")
 
 
-def test_execute_failure_no_execution_logs(client: TestClient) -> None:
-    """spec-04: failed execution envelope has data=null, no execution_logs exposed."""
+def test_execute_failure_includes_execution_logs(client: TestClient) -> None:
+    """Failed execution envelope includes partial traces in data.metadata (Dify-like)."""
     register_node_type("fail_leak", _FailNode)
     app_state = client.app.state
     fail_path = Path(app_state.workflow_directory) / "fail_demo.yaml"
@@ -458,7 +477,77 @@ def test_execute_failure_no_execution_logs(client: TestClient) -> None:
     app_state.workflow_registry = build_registry(app_state.workflow_directory)
     response = client.post("/workflows/fail_demo/execute", json={})
     assert response.status_code == 500
-    assert response.json()["data"] is None
+    data = response.json()["data"]
+    assert data is not None
+    assert "execution_logs" in data["metadata"]
+    assert isinstance(data["metadata"]["execution_logs"], list)
+
+
+def test_execute_persists_run_listable_via_history(client: TestClient) -> None:
+    """Successful execution persists a WorkflowRun row retrievable via the list endpoint."""
+    response = client.post("/workflows/echo_demo/execute", json={"input": "hi"})
+    assert response.status_code == 200
+    run_id = response.json()["data"]["metadata"]["run_id"]
+
+    list_response = client.get("/workflows/echo_demo/runs")
+    assert list_response.status_code == 200
+    page = list_response.json()["data"]
+    assert page["total"] == 1
+    assert page["items"][0]["run_id"] == run_id
+    assert page["items"][0]["status"] == "success"
+
+
+def test_execute_failure_persists_run(client: TestClient) -> None:
+    """Failed execution also persists a WorkflowRun row with status=failed."""
+    register_node_type("fail_leak", _FailNode)
+    app_state = client.app.state
+    fail_path = Path(app_state.workflow_directory) / "fail_demo.yaml"
+    fail_path.write_text(_FAIL_YAML, encoding="utf-8")
+    app_state.workflow_registry = build_registry(app_state.workflow_directory)
+
+    response = client.post("/workflows/fail_demo/execute", json={})
+    assert response.status_code == 500
+    run_id = response.json()["data"]["metadata"]["run_id"]
+
+    list_response = client.get("/workflows/fail_demo/runs")
+    assert list_response.status_code == 200
+    page = list_response.json()["data"]
+    assert page["total"] == 1
+    assert page["items"][0]["status"] == "failed"
+    assert page["items"][0]["run_id"] == run_id
+
+
+def test_get_workflow_run_detail(client: TestClient) -> None:
+    """GET /workflows/{id}/runs/{run_id} returns full detail with execution_logs."""
+    response = client.post("/workflows/echo_demo/execute", json={"input": "hi"})
+    run_id = response.json()["data"]["metadata"]["run_id"]
+
+    detail_response = client.get(f"/workflows/echo_demo/runs/{run_id}")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()["data"]
+    assert detail["run_id"] == run_id
+    assert detail["status"] == "success"
+    assert "execution_logs" in detail
+    assert "input_data" in detail
+
+
+def test_get_workflow_run_unknown_returns_404(client: TestClient) -> None:
+    """GET /workflows/{id}/runs/{unknown} returns 404."""
+    response = client.get("/workflows/echo_demo/runs/nonexistent_run_id")
+    assert response.status_code == 404
+
+
+def test_list_workflow_runs_pagination(client: TestClient) -> None:
+    """GET /workflows/{id}/runs supports pagination."""
+    for _ in range(3):
+        client.post("/workflows/echo_demo/execute", json={"input": "hi"})
+
+    page1 = client.get("/workflows/echo_demo/runs?page=1&pageSize=2").json()["data"]
+    assert len(page1["items"]) == 2
+    assert page1["total"] == 3
+
+    page2 = client.get("/workflows/echo_demo/runs?page=2&pageSize=2").json()["data"]
+    assert len(page2["items"]) == 1
 
 
 def _install_probe_workflow(client: TestClient) -> None:

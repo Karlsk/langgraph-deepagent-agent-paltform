@@ -23,6 +23,7 @@ from app.models.session import Session  # noqa: F401
 from app.models.subagent_trace import SubAgentTrace  # noqa: F401
 from app.models.thread import Thread  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.models.workflow_run import WorkflowRun  # noqa: F401
 
 # Alembic Config object
 config = context.config

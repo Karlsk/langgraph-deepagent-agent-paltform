@@ -17,17 +17,23 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from sqlalchemy import func
+from sqlmodel import Session as DBSession
+from sqlmodel import col, select
 from yaml import safe_dump as yaml_safe_dump
 
+from app.api.v1.agent_assets_common import get_db_session
 from app.api.v1.auth import get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.models.user import User
+from app.models.workflow_run import WorkflowRun
 from app.schemas.base import ApiResponse as HostApiResponse
+from app.schemas.base import PageResult
 from app.services.llm.provider_service import validate_reference
 from app.workflow.auth import require_workflow_admin
 from app.workflow.cli import ApiResponse
@@ -81,7 +87,8 @@ def _host_envelope_content(response: ApiResponse, status_code: int) -> dict[str,
         else:
             data = {"result": response.data, "metadata": response.metadata}
         return {"code": status_code, "message": "success", "data": data}
-    return {"code": status_code, "message": response.error or "error", "data": None}
+    error_data = {"metadata": response.metadata} if response.metadata else None
+    return {"code": status_code, "message": response.error or "error", "data": error_data}
 
 
 def _project_to_host_envelope(response: ApiResponse, status_code: int) -> JSONResponse:
@@ -120,6 +127,55 @@ def _definition_to_yaml_text(definition: WorkflowDefinition) -> str:
 def _serialize_execution_logs(logs: list[ExecutionLog]) -> list[dict[str, Any]]:
     """Serialize execution logs with redaction (H6) and truncation (max_len=500)."""
     return [redact(log.model_dump(mode="json"), max_len=500) for log in logs]
+
+
+_MAX_FIELD_LEN = 10_000
+
+
+def _truncate_for_storage(data: Any) -> Any:
+    """Cap string values at _MAX_FIELD_LEN for safe DB storage."""
+    if isinstance(data, str):
+        return data[:_MAX_FIELD_LEN] if len(data) > _MAX_FIELD_LEN else data
+    if isinstance(data, dict):
+        return {k: _truncate_for_storage(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_truncate_for_storage(item) for item in data]
+    return data
+
+
+def _persist_workflow_run(
+    db: DBSession,
+    *,
+    workflow_id: str,
+    run_id: str,
+    status: str,
+    input_data: dict[str, Any],
+    output_data: dict[str, Any],
+    error_message: str | None,
+    execution_logs: list[dict[str, Any]],
+    duration_ms: float,
+    node_count: int,
+    created_by: str | None,
+) -> None:
+    """Persist a WorkflowRun row; never raises (logs and swallows DB errors)."""
+    try:
+        row = WorkflowRun(
+            workflow_id=workflow_id,
+            run_id=run_id,
+            status=status,
+            input_data=_truncate_for_storage(input_data),
+            output_data=_truncate_for_storage(output_data),
+            error_message=error_message,
+            execution_logs=_truncate_for_storage(execution_logs),
+            duration_ms=duration_ms,
+            node_count=node_count,
+            created_by=created_by,
+        )
+        db.add(row)
+        db.commit()
+    except Exception:  # noqa: BLE001 — persist is best-effort
+        logger.exception("workflow_run_persist_failed", workflow_id=workflow_id, run_id=run_id)
+        db.rollback()
 
 
 ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http", "python", "subworkflow"})
@@ -352,7 +408,8 @@ async def execute_workflow(
     request: Request,
     workflow_id: str,
     payload: dict[str, Any] | None = None,
-    _user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> JSONResponse:
     """Execute one registered workflow and return the unified envelope (AD-10).
 
@@ -360,7 +417,8 @@ async def execute_workflow(
         request: FastAPI request object required by the slowapi limiter and registry lookup.
         workflow_id: Registered workflow to execute.
         payload: Optional JSON object passed as workflow input.
-        _user: Current authenticated user (auth gate).
+        db: Request-scoped DB session for persisting the run.
+        user: Current authenticated user (auth gate + audit trail).
 
     Returns:
         JSONResponse carrying the host unified envelope ``{code, message, data}`` (200/404/500).
@@ -386,6 +444,42 @@ async def execute_workflow(
         return _project_to_host_envelope(ApiResponse(success=False, error=_redacted_summary(summary)), 500)
 
     definition = registry.get_workflow_definition(workflow_id)
+    node_count = len(definition.nodes) if definition else 0
+    serialized_logs = _serialize_execution_logs(result.execution_logs)
+    created_by = user.username or str(user.id)
+
+    await run_in_threadpool(
+        _persist_workflow_run,
+        db,
+        workflow_id=workflow_id,
+        run_id=result.run_id,
+        status=result.status,
+        input_data=input_data,
+        output_data=result.output if result.status == "success" else {},
+        error_message=result.error_message,
+        execution_logs=serialized_logs,
+        duration_ms=result.duration_ms,
+        node_count=node_count,
+        created_by=created_by,
+    )
+
+    if result.status == "failed":
+        logger.warning("api_workflow_execution_failed", workflow_id=workflow_id, error=result.error_message)
+        return _project_to_host_envelope(
+            ApiResponse(
+                success=False,
+                error=_redacted_summary(result.error_message or "workflow execution failed"),
+                metadata={
+                    "workflow_id": workflow_id,
+                    "run_id": result.run_id,
+                    "duration_ms": result.duration_ms,
+                    "node_count": node_count,
+                    "execution_logs": serialized_logs,
+                },
+            ),
+            500,
+        )
+
     response = ApiResponse(
         success=True,
         data=result.output,
@@ -393,11 +487,115 @@ async def execute_workflow(
             "workflow_id": workflow_id,
             "run_id": result.run_id,
             "duration_ms": result.duration_ms,
-            "node_count": len(definition.nodes) if definition else 0,
-            "execution_logs": _serialize_execution_logs(result.execution_logs),
+            "node_count": node_count,
+            "execution_logs": serialized_logs,
         },
     )
     return _project_to_host_envelope(response, 200)
+
+
+def _run_to_summary(row: WorkflowRun) -> dict[str, Any]:
+    """Project a WorkflowRun row into a list-view summary dict."""
+    return {
+        "id": row.id,
+        "workflow_id": row.workflow_id,
+        "run_id": row.run_id,
+        "status": row.status,
+        "duration_ms": row.duration_ms,
+        "node_count": row.node_count,
+        "error_message": row.error_message,
+        "created_by": row.created_by,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _run_to_detail(row: WorkflowRun) -> dict[str, Any]:
+    """Project a WorkflowRun row into a detail dict with full execution logs."""
+    return {
+        **_run_to_summary(row),
+        "input_data": row.input_data,
+        "output_data": row.output_data,
+        "execution_logs": row.execution_logs,
+    }
+
+
+@router.get(
+    "/workflows/{workflow_id}/runs",
+    response_model=HostApiResponse[PageResult[dict[str, Any]]],
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_detail"][0])
+async def list_workflow_runs(
+    request: Request,
+    workflow_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100, alias="pageSize"),
+    db: DBSession = Depends(get_db_session),
+    _user: User = Depends(get_current_user),
+) -> JSONResponse:
+    """List persisted execution runs for a workflow, newest first.
+
+    Args:
+        request: FastAPI request (limiter).
+        workflow_id: Workflow whose runs to list.
+        page: 1-based page number.
+        page_size: Rows per page.
+        db: Request-scoped DB session.
+        _user: Current authenticated user (auth gate).
+
+    Returns:
+        JSONResponse carrying a PageResult of run summaries.
+    """
+    stmt = select(WorkflowRun).where(col(WorkflowRun.workflow_id) == workflow_id)
+    count_stmt = select(func.count()).select_from(WorkflowRun).where(col(WorkflowRun.workflow_id) == workflow_id)
+    total = db.exec(count_stmt).one()
+    rows = db.exec(
+        stmt.order_by(col(WorkflowRun.created_at).desc()).offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    items = [_run_to_summary(row) for row in rows]
+    result = PageResult(items=items, total=total, page=page, page_size=page_size)
+    return _project_to_host_envelope(ApiResponse(success=True, data=result.model_dump(by_alias=True)), 200)
+
+
+@router.get(
+    "/workflows/{workflow_id}/runs/{run_id}",
+    response_model=HostApiResponse[dict[str, Any]],
+    responses={
+        404: {
+            "model": HostApiResponse[None],
+            "description": "Unknown run_id: envelope with code=404, data=null",
+        },
+    },
+)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["workflows_detail"][0])
+async def get_workflow_run(
+    request: Request,
+    workflow_id: str,
+    run_id: str,
+    db: DBSession = Depends(get_db_session),
+    _user: User = Depends(get_current_user),
+) -> JSONResponse:
+    """Fetch full detail of a single workflow run (with execution logs).
+
+    Args:
+        request: FastAPI request (limiter).
+        workflow_id: Workflow the run belongs to.
+        run_id: Unique run identifier.
+        db: Request-scoped DB session.
+        _user: Current authenticated user (auth gate).
+
+    Returns:
+        JSONResponse carrying the full run detail or 404.
+    """
+    stmt = select(WorkflowRun).where(
+        col(WorkflowRun.workflow_id) == workflow_id,
+        col(WorkflowRun.run_id) == run_id,
+    )
+    row = db.exec(stmt).first()
+    if row is None:
+        return _project_to_host_envelope(
+            ApiResponse(success=False, error=f"run not found: {run_id}"), 404
+        )
+    return _project_to_host_envelope(ApiResponse(success=True, data=_run_to_detail(row)), 200)
 
 
 @router.put(

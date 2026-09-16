@@ -107,3 +107,37 @@ export function executeWorkflow(
 ): Promise<WorkflowExecuteResult> {
   return post<WorkflowExecuteResult>('/workflows/' + id + '/execute', { input }, { timeout: 600000 })
 }
+
+export interface WorkflowRunSummary {
+  id: number
+  workflow_id: string
+  run_id: string
+  status: 'success' | 'failed'
+  duration_ms: number
+  node_count: number
+  error_message: string | null
+  created_by: string | null
+  created_at: string
+}
+
+export interface WorkflowRunDetail extends WorkflowRunSummary {
+  input_data: Record<string, unknown>
+  output_data: Record<string, unknown>
+  execution_logs: ExecutionLogView[]
+}
+
+export function listWorkflowRuns(
+  workflowId: string,
+  query: { page?: number; pageSize?: number } = {},
+): Promise<import('@/types').PageResult<WorkflowRunSummary>> {
+  return get<import('@/types').PageResult<WorkflowRunSummary>>(
+    `/workflows/${encodeURIComponent(workflowId)}/runs`,
+    { params: { page: query.page, pageSize: query.pageSize } },
+  )
+}
+
+export function getWorkflowRun(workflowId: string, runId: string): Promise<WorkflowRunDetail> {
+  return get<WorkflowRunDetail>(
+    `/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}`,
+  )
+}
