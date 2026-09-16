@@ -182,7 +182,7 @@ def test_api_execute_success(client: TestClient) -> None:
     envelope = response.json()
     assert envelope["code"] == 200
     assert envelope["message"] == "success"
-    assert envelope["data"]["response"] == "hello"
+    assert envelope["data"]["greet_result"]["response"] == "hello"
     metadata = envelope["data"]["metadata"]
     assert metadata["workflow_id"] == "echo_demo"
     assert len(metadata["run_id"]) == 32

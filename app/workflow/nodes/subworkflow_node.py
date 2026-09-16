@@ -30,19 +30,9 @@ from app.workflow.models import ConfigError, ExecutionLog, OperatorLog
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
 from app.workflow.ports import WorkflowRunner
-from app.workflow.utils import convert_state_to_dict, map_output_to_state
+from app.workflow.utils import convert_state_to_dict, map_output_to_state, resolve_dot_path
 
 logger = structlog.get_logger(__name__)
-
-
-def _resolve_path(state_dict: dict[str, Any], path: str) -> Any:
-    """Dot-path lookup; hitting a non-dict mid-way resolves to None (S7 semantics)."""
-    current: Any = state_dict
-    for part in path.split("."):
-        if not isinstance(current, dict):
-            return None
-        current = current.get(part)
-    return current
 
 
 class SubWorkflowNodeConfig(BaseModel, extra="forbid"):
@@ -121,7 +111,7 @@ class SubWorkflowNode(BaseNode):
         """Assemble what the inner workflow receives; never mutates the outer state (R3/S5)."""
         inner: dict[str, Any] = dict(state_dict) if self._node_config.inherit_input else {}
         for inner_key, outer_path in self._node_config.input_map.items():
-            value = _resolve_path(state_dict, outer_path)
+            value = resolve_dot_path(state_dict, outer_path)
             # A dangling path leaves the key out so the inner workflow falls back to its
             # declared S14 default, rather than failing the outer run over a rename.
             if value is None:

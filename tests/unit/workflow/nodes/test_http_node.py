@@ -76,10 +76,10 @@ def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 @pytest.mark.unit
 def test_render_simple_and_nested() -> None:
-    """{key} placeholders render; one-level nested dicts flatten to {parent[child]} (TC1)."""
+    """{key} placeholders render; nested dicts resolve via dot-path {a.b} (TC1)."""
     node = make_node()
     context = {"name": "alice", "a": {"b": 42}}
-    assert node.render_template("hello {name}, value={a[b]}", context) == "hello alice, value=42"
+    assert node.render_template("hello {name}, value={a.b}", context) == "hello alice, value=42"
 
 
 @pytest.mark.unit
@@ -199,9 +199,9 @@ def test_success_extracts_response_path(monkeypatch: pytest.MonkeyPatch) -> None
     state = {"token": "abc"}
     result = node.build_runnable().invoke(state)
     assert counter["calls"] == 1
-    assert result["status_code"] == 200
-    assert result["url"] == "https://api.example.com/v1"
-    assert result["response"] == "ok"
+    assert result["http1_result"]["status_code"] == 200
+    assert result["http1_result"]["url"] == "https://api.example.com/v1"
+    assert result["http1_result"]["response"] == "ok"
     assert result["http1_result"] == {
         "status_code": 200,
         "url": "https://api.example.com/v1",
@@ -218,7 +218,7 @@ def test_no_response_path_returns_whole_body(monkeypatch: pytest.MonkeyPatch) ->
     patch_httpx(monkeypatch, transport)
     node = make_node()
     result = node.build_runnable().invoke({})
-    assert result["response"] == {"a": 1, "b": 2}
+    assert result["http1_result"]["response"] == {"a": 1, "b": 2}
 
 
 @pytest.mark.unit
@@ -228,8 +228,8 @@ def test_response_path_missing_yields_none(monkeypatch: pytest.MonkeyPatch) -> N
     patch_httpx(monkeypatch, transport)
     node = make_node({"url": "https://api.example.com/v1", "response_path": "data.result"})
     result = node.build_runnable().invoke({})
-    assert result["response"] is None
-    assert result["status_code"] == 200
+    assert result["http1_result"]["response"] is None
+    assert result["http1_result"]["status_code"] == 200
 
 
 @pytest.mark.unit
@@ -243,7 +243,7 @@ def test_url_rendered_from_state(monkeypatch: pytest.MonkeyPatch) -> None:
 
     transport, _ = counting_transport(handler)
     patch_httpx(monkeypatch, transport)
-    node = make_node({"url": "https://api.example.com/{user[tenant]}/run", "method": "GET"})
+    node = make_node({"url": "https://api.example.com/{user.tenant}/run", "method": "GET"})
     node.build_runnable().invoke({"user": {"tenant": "t1"}})
     assert seen["url"] == "https://api.example.com/t1/run"
 
@@ -298,8 +298,8 @@ def test_mock_enabled_hit(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     result = node.build_runnable().invoke({})
     assert counter["calls"] == 0
-    assert result["status_code"] == 200
-    assert result["response"] == "mocked"
+    assert result["http1_result"]["status_code"] == 200
+    assert result["http1_result"]["response"] == "mocked"
 
 
 @pytest.mark.unit
@@ -316,7 +316,7 @@ def test_mock_enabled_hit_fallback_url_key(monkeypatch: pytest.MonkeyPatch) -> N
     )
     result = node.build_runnable().invoke({})
     assert counter["calls"] == 0
-    assert result["response"] == {"ok": True}
+    assert result["http1_result"]["response"] == {"ok": True}
 
 
 @pytest.mark.unit
@@ -350,7 +350,7 @@ def test_mock_disabled_ignores_mock_responses(monkeypatch: pytest.MonkeyPatch) -
     )
     result = node.build_runnable().invoke({})
     assert counter["calls"] == 1
-    assert result["response"] == {"real": True}
+    assert result["http1_result"]["response"] == {"real": True}
 
 
 @pytest.mark.unit
@@ -397,7 +397,7 @@ def test_retry_on_500_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
     node = make_node({"url": "https://api.example.com/v1", "max_retries": 2})
     result = node.build_runnable().invoke({})
     assert counter["calls"] == 3
-    assert result["response"] == {"ok": True}
+    assert result["http1_result"]["response"] == {"ok": True}
     assert delays == [1.0, 2.0]
 
 

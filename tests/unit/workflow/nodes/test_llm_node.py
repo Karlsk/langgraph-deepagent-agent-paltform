@@ -182,15 +182,14 @@ def test_init_accepts_llm_config_instance() -> None:
 
 @pytest.mark.unit
 def test_invoke_success_maps_state() -> None:
-    """Successful invoke dual-writes response/model: {name}_result + flattened keys (S4/S5)."""
+    """Successful invoke writes response/model to {name}_result only (S4, dual_write=False default)."""
     node = make_node()
     node._llm_instance = FakeLLM()  # noqa: SLF001 — injected fake, zero network
     state = {"messages": [HumanMessage(content="hello")]}
     result = node.build_runnable().invoke(state)
-    assert result["response"] == "hi"
-    assert result["model"] == "gpt-4o-mini"
+    assert result["llm1_result"]["response"] == "hi"
+    assert result["llm1_result"]["model"] == "gpt-4o-mini"
     assert result["llm1_result"] == {"response": "hi", "model": "gpt-4o-mini"}
-    # R3/S5: the input state must never be mutated
     assert state == {"messages": [HumanMessage(content="hello")]}
     assert "llm1_result" not in state
 
@@ -206,7 +205,7 @@ def test_invoke_pydantic_state_entry() -> None:
     node._llm_instance = FakeLLM()  # noqa: SLF001
     state = PydanticState(messages=[HumanMessage(content="hello")])
     result = node.build_runnable().invoke(state)
-    assert result["response"] == "hi"
+    assert result["llm1_result"]["response"] == "hi"
 
 
 @pytest.mark.unit
@@ -603,7 +602,7 @@ def test_provider_ref_factory_client_is_used_for_invocation() -> None:
     )
     result = node.build_runnable().invoke({"messages": [HumanMessage(content="hi")]})
 
-    assert result["response"] == "from-provider"
+    assert result["llm1_result"]["response"] == "from-provider"
     assert len(fake.calls) == 1
 
 

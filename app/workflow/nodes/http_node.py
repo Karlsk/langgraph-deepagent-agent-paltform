@@ -29,13 +29,13 @@ from app.workflow.models import ExecutionLog, HTTPNodeError, NodeType, OperatorL
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
 from app.workflow.security import validate_http_url
-from app.workflow.utils import convert_state_to_dict, map_output_to_state
+from app.workflow.utils import convert_state_to_dict, map_output_to_state, resolve_dot_path
 
 logger = structlog.get_logger(__name__)
 
 # {key} placeholders: braces holding JSON syntax (quotes/colons/whitespace) are
 # not placeholders and survive rendering untouched.
-_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*(?:\[[A-Za-z0-9_]+\])?)\}")
+_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_.]*)\}")
 
 # User-finalized (spec-05 supplement): a mock hit simulates a successful response,
 # so its output carries status_code=200 to stay structurally identical to the real branch.
@@ -66,17 +66,6 @@ class HTTPNodeConfig(BaseModel):
     verify_ssl: bool = False  # default False for internal networks with self-signed/weak certs
 
 
-def _flatten_context(state_dict: dict[str, Any]) -> dict[str, Any]:
-    """Top-level keys plus one-level nested dicts flattened to ``parent[child]`` (TC1)."""
-    flat: dict[str, Any] = {}
-    for key, value in state_dict.items():
-        flat[key] = value
-        if isinstance(value, dict):
-            for child, child_value in value.items():
-                flat[f"{key}[{child}]"] = child_value
-    return flat
-
-
 class HTTPNode(BaseNode):
     """HTTP request node: rendered templates, retry_on_status backoff, explicit mock."""
 
@@ -103,14 +92,14 @@ class HTTPNode(BaseNode):
         return True
 
     def render_template(self, template: str, context: dict[str, Any]) -> str:
-        """Replace {key} placeholders; one-level nested dicts flatten to parent[child]."""
-        flat = _flatten_context(context)
+        """Replace {key} and {a.b.c} placeholders via dot-path resolution."""
 
         def _sub(match: re.Match[str]) -> str:
-            key = match.group(1)
-            if key in flat:
-                return str(flat[key])
-            logger.debug("http_node_placeholder_unresolved", node=self.name, placeholder=key)
+            path = match.group(1)
+            value = resolve_dot_path(context, path)
+            if value is not None:
+                return str(value)
+            logger.debug("http_node_placeholder_unresolved", node=self.name, placeholder=path)
             return match.group(0)
 
         return _PLACEHOLDER_PATTERN.sub(_sub, template)
@@ -119,12 +108,7 @@ class HTTPNode(BaseNode):
         """Walk a dot path layer by layer; missing segment -> None; None path -> whole data."""
         if path is None:
             return data
-        value = data
-        for part in path.split("."):
-            if not isinstance(value, dict):
-                return None
-            value = value.get(part)
-        return value
+        return resolve_dot_path(data, path)
 
     def _send_once(self, method: str, url: str, headers: dict[str, str] | None, body: Any) -> httpx.Response:
         """One synchronous HTTP request (K10); retry ownership lives in tenacity (AD-03)."""

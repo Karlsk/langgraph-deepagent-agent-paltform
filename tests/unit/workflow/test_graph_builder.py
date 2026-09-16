@@ -15,10 +15,10 @@ from app.workflow.models import (
     ConditionNotMatchedError,
     EdgeDefinition,
     NodeDefinition,
-    StateFieldSchema,
     WorkflowDefinition,
 )
 from app.workflow.state import StateModelFactory
+from app.workflow.utils import resolve_dot_path
 
 from tests.conftest import EchoNode
 
@@ -200,7 +200,7 @@ def test_router_equality_branch() -> None:
 
 
 def test_router_truthiness_branch() -> None:
-    """Pure-path condition is evaluated as truthiness (S7); the field needs a state channel."""
+    """Dot-path condition into {node}_result is evaluated as truthiness (S7, dual_write=False)."""
     definition = make_definition(
         workflow_id="wf_truth",
         entry_point="check",
@@ -210,10 +210,9 @@ def test_router_truthiness_branch() -> None:
             NodeDefinition(name="no", type="echo", config={"output": {"branch": "no"}}),
         ],
         edges=[
-            EdgeDefinition(source="check", target="yes", condition="flag"),
+            EdgeDefinition(source="check", target="yes", condition="check_result.flag"),
             EdgeDefinition(source="check", target="no", condition="no_flag"),
         ],
-        state_schema={"flag": StateFieldSchema(type="bool")},
     )
     final = GraphBuilder().build_graph(definition).compiled_graph.invoke({})
     assert final["yes_result"] == {"branch": "yes"}
@@ -287,6 +286,6 @@ def test_parse_condition_variants() -> None:
 
 def test_resolve_path_non_dict_midway() -> None:
     """Dot-path hitting a non-dict mid-way resolves to None (S7)."""
-    assert GraphBuilder._resolve_path({"a": {"b": 1}}, "a.b") == 1
-    assert GraphBuilder._resolve_path({"a": "scalar"}, "a.b") is None
-    assert GraphBuilder._resolve_path({}, "a.b") is None
+    assert resolve_dot_path({"a": {"b": 1}}, "a.b") == 1
+    assert resolve_dot_path({"a": "scalar"}, "a.b") is None
+    assert resolve_dot_path({}, "a.b") is None

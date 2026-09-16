@@ -145,7 +145,7 @@ def test_cli_run_success_envelope(tmp_path: Path, capsys: pytest.CaptureFixture[
     envelope = _last_json_line(capsys.readouterr().out)
     assert envelope["success"] is True
     assert envelope["error"] is None
-    assert envelope["data"]["response"] == "hello"
+    assert envelope["data"]["greet_result"]["response"] == "hello"
     assert envelope["data"]["greet_result"] == {"response": "hello"}
     metadata = envelope["metadata"]
     assert metadata["workflow_id"] == "echo_demo"

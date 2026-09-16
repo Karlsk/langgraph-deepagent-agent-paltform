@@ -21,7 +21,7 @@ from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import create_node
 from app.workflow.ports import ChatModelFactory, WorkflowRunner
 from app.workflow.state import StateModelFactory
-from app.workflow.utils import convert_state_to_dict
+from app.workflow.utils import convert_state_to_dict, resolve_dot_path
 
 logger = structlog.get_logger(__name__)
 
@@ -194,7 +194,7 @@ class GraphBuilder:
         def router(state: Any) -> str:
             state_dict = convert_state_to_dict(state)
             for edge, (path, expected) in parsed:
-                value = self._resolve_path(state_dict, path)
+                value = resolve_dot_path(state_dict, path)
                 matched = value == expected if expected is not None else bool(value)
                 if matched:
                     logger.debug(
@@ -217,13 +217,3 @@ class GraphBuilder:
             path, _, expected = condition.partition("==")
             return path.strip(), expected.strip().strip("'\"")
         return condition.strip(), None
-
-    @staticmethod
-    def _resolve_path(state_dict: dict[str, Any], path: str) -> Any:
-        """Dot-path lookup; hitting a non-dict mid-way resolves to None (S7)."""
-        current: Any = state_dict
-        for part in path.split("."):
-            if not isinstance(current, dict):
-                return None
-            current = current.get(part)
-        return current
