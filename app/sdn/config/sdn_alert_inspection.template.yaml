@@ -235,6 +235,8 @@ nodes:
                 context = "No interface inspection results available."
             return {"messages": [{"role": "user", "content": context}]}
       sandboxed: true
+      state_keys:
+        - messages
 
   # 10. LLM 汇总（内置 LLM 节点；key/base_url 走 env：OPENAI_API_KEY / OPENAI_BASE_URL）
   - name: llm_summary
