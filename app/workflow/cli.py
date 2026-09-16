@@ -20,7 +20,7 @@ from typing import Any
 import structlog
 from dotenv import load_dotenv
 
-from app.workflow.logging_conf import redact_processor, setup_logging
+from app.workflow.logging_conf import redact, redact_processor, setup_logging
 from app.workflow.models import WorkflowEngineError
 from app.workflow.ports import ChatModelFactory
 from app.workflow.registry import WorkflowRegistry, load_definitions_from_dir
@@ -123,6 +123,23 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — explicit catch-all layer per R6
         logger.exception("cli_unexpected_error", workflow_id=args.workflow)
         _print_failure(f"unexpected error while running '{args.workflow}': {type(exc).__name__}: {exc}")
+        return 1
+
+    if result.status == "failed":
+        logger.warning("cli_workflow_execution_failed", workflow_id=args.workflow, error=result.error_message)
+        definition = registry.get_workflow_definition(args.workflow)
+        response = ApiResponse(
+            success=False,
+            error=_redacted_summary(result.error_message or "workflow execution failed"),
+            metadata={
+                "workflow_id": args.workflow,
+                "run_id": result.run_id,
+                "duration_ms": result.duration_ms,
+                "node_count": len(definition.nodes) if definition else 0,
+                "execution_logs": [redact(log.model_dump(mode="json"), max_len=500) for log in result.execution_logs],
+            },
+        )
+        print(response.to_json())  # noqa: T201 — envelope output is the G8 exception point
         return 1
 
     definition = registry.get_workflow_definition(args.workflow)

@@ -196,6 +196,7 @@ def test_cli_error_no_state_leak(tmp_path: Path, capsys: pytest.CaptureFixture[s
     envelope = _last_json_line(out)
     assert envelope["success"] is False
     assert envelope["data"] is None
+    assert "execution_logs" in envelope["metadata"]
 
 
 def test_cli_str_input_synthesizes_messages(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

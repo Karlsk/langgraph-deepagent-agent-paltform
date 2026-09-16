@@ -61,6 +61,8 @@ class RunResult:
     execution_logs: list[ExecutionLog]
     started_at: datetime
     finished_at: datetime
+    status: Literal["success", "failed"] = "success"
+    error_message: str | None = None
 
     @property
     def duration_ms(self) -> float:
@@ -216,9 +218,10 @@ class WorkflowRegistry:
         The caller payload goes through ``synthesize_run_input`` (S21) before
         the graph runs. Log collection is run-scoped (S11): a fresh
         RunLogCollector is bound to the ContextVar and reset in finally, so the
-        ContextVar never leaks. Node exceptions propagate to the caller
-        unchanged (EXP-G7). The definition's execution_history keeps only the
-        latest run (S12, bounded).
+        ContextVar never leaks. Node exceptions are caught and recorded as a
+        failed RunResult with partial logs, so callers can display traces even
+        on failure (Dify-like behavior). The definition's execution_history
+        keeps only the latest run (S12, bounded).
 
         The workflow id is also pushed onto ``_RUN_STACK`` for the duration of the
         run and popped in the finally (S23), which is what lets a nested call see
@@ -234,11 +237,15 @@ class WorkflowRegistry:
                 collector = RunLogCollector(run_id)
                 started_at = datetime.now()
                 token = set_run_collector(collector)
+                output: dict[str, Any] = {}
+                status: Literal["success", "failed"] = "success"
+                error_message: str | None = None
                 try:
                     output = workflow.invoke(synthesize_run_input(definition, input_data))
-                except Exception:
+                except Exception as exc:
                     logger.exception("workflow_execution_failed", workflow_id=workflow_id, run_id=run_id)
-                    raise
+                    status = "failed"
+                    error_message = f"{type(exc).__name__}: {exc}"
                 finally:
                     _RUN_COLLECTOR.reset(token)  # noqa: SLF001 — paired set/reset (S11)
                 finished_at = datetime.now()
@@ -251,6 +258,8 @@ class WorkflowRegistry:
                     execution_logs=logs,
                     started_at=started_at,
                     finished_at=finished_at,
+                    status=status,
+                    error_message=error_message,
                 )
         finally:
             _RUN_STACK.reset(stack_token)  # paired set/reset (S11/S23)
@@ -293,6 +302,9 @@ class WorkflowRegistry:
 
         result = self.execute_workflow(workflow_id, input_data)
         self._merge_inner_logs(result.execution_logs, caller_label)
+        if result.status == "failed":
+            msg = f"nested workflow '{workflow_id}' failed: {result.error_message}"
+            raise NestedWorkflowError(msg)
         logger.debug(
             "nested_workflow_completed",
             workflow_id=workflow_id,

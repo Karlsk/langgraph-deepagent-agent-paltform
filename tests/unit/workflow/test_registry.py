@@ -245,8 +245,8 @@ class _FailNode(BaseNode):
         return True
 
 
-def test_execute_failure_reraises_and_resets_collector() -> None:
-    """Node exceptions propagate unchanged (EXP-G7) and the ContextVar is still reset."""
+def test_execute_failure_returns_failed_result_with_partial_logs() -> None:
+    """Node exceptions are caught: result.status='failed', error_message set, ContextVar still reset."""
     register_node_type("boom", _FailNode)
     definition = WorkflowDefinition(
         workflow_id="wf_fail",
@@ -259,8 +259,10 @@ def test_execute_failure_reraises_and_resets_collector() -> None:
     )
     registry = WorkflowRegistry()
     registry.register_workflow(definition)
-    with pytest.raises(RuntimeError, match="boom from fail node"):
-        registry.execute_workflow("wf_fail", {})
+    result = registry.execute_workflow("wf_fail", {})
+    assert result.status == "failed"
+    assert result.error_message is not None
+    assert "boom from fail node" in result.error_message
     assert get_run_collector() is None
 
 

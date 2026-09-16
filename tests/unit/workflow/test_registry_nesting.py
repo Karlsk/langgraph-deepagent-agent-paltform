@@ -17,11 +17,9 @@ import pytest
 
 from app.workflow.models import (
     EdgeDefinition,
-    NestedWorkflowError,
     NodeDefinition,
     StateFieldSchema,
     WorkflowDefinition,
-    WorkflowNotFoundError,
 )
 from app.workflow.registry import _RUN_STACK, WorkflowRegistry  # noqa: SLF001 — asserting ContextVar hygiene per S23
 
@@ -111,21 +109,21 @@ class TestCycleDetection:
     """S23: a workflow already on the run stack can never be entered again."""
 
     def test_indirect_cycle_is_rejected_with_the_full_stack(self) -> None:
-        """An indirect cycle reports the whole path, which is what makes the YAML fixable."""
+        """An indirect cycle reports the whole path in the failed result's error_message."""
         registry = _registry_with(
             _nested_wf("wf_a", "wf_b", sub_node="sub_b"),
             _nested_wf("wf_b", "wf_a", sub_node="sub_a"),
         )
-        with pytest.raises(NestedWorkflowError) as exc_info:
-            registry.execute_workflow("wf_a", {"input": "x"})
-        message = str(exc_info.value)
-        assert "wf_a -> wf_b -> wf_a" in message
+        result = registry.execute_workflow("wf_a", {"input": "x"})
+        assert result.status == "failed"
+        assert "wf_a -> wf_b -> wf_a" in (result.error_message or "")
 
     def test_self_reference_is_rejected(self) -> None:
         """A node pointing at its own workflow is caught by the cycle guard, not by RLock re-entry."""
         registry = _registry_with(_nested_wf("wf_self", "wf_self"))
-        with pytest.raises(NestedWorkflowError, match="wf_self -> wf_self"):
-            registry.execute_workflow("wf_self", {"input": "x"})
+        result = registry.execute_workflow("wf_self", {"input": "x"})
+        assert result.status == "failed"
+        assert "wf_self -> wf_self" in (result.error_message or "")
 
 
 class TestDepthLimit:
@@ -148,8 +146,9 @@ class TestDepthLimit:
             _nested_wf("wf_b", "wf_c", sub_node="sub_c"),
             _nested_wf("wf_a", "wf_b", sub_node="sub_b"),
         )
-        with pytest.raises(NestedWorkflowError, match="wf_a -> wf_b -> wf_c -> wf_d"):
-            registry.execute_workflow("wf_a", {"input": "x"})
+        result = registry.execute_workflow("wf_a", {"input": "x"})
+        assert result.status == "failed"
+        assert "wf_a -> wf_b -> wf_c -> wf_d" in (result.error_message or "")
 
     def test_depth_one_forbids_any_nesting(self) -> None:
         """max_nesting_depth=1 leaves no room for an inner workflow at all."""
@@ -158,8 +157,8 @@ class TestDepthLimit:
             _nested_wf("wf_outer", "wf_inner"),
             max_nesting_depth=1,
         )
-        with pytest.raises(NestedWorkflowError):
-            registry.execute_workflow("wf_outer", {"input": "x"})
+        result = registry.execute_workflow("wf_outer", {"input": "x"})
+        assert result.status == "failed"
 
 
 class TestRunStackHygiene:
@@ -175,30 +174,31 @@ class TestRunStackHygiene:
         registry.execute_workflow("wf_outer", {"input": "x"})
         assert _RUN_STACK.get() == ()
 
-    def test_stack_is_reset_after_a_rejected_run(self) -> None:
-        """The guard raises, but the finally still resets — otherwise the next run inherits a phantom stack."""
+    def test_stack_is_reset_after_a_failed_run(self) -> None:
+        """The run fails, but the finally still resets — otherwise the next run inherits a phantom stack."""
         registry = _registry_with(_nested_wf("wf_self", "wf_self"))
-        with pytest.raises(NestedWorkflowError):
-            registry.execute_workflow("wf_self", {"input": "x"})
+        result = registry.execute_workflow("wf_self", {"input": "x"})
+        assert result.status == "failed"
         assert _RUN_STACK.get() == ()
 
-    def test_a_clean_run_succeeds_after_a_rejected_one(self) -> None:
+    def test_a_clean_run_succeeds_after_a_failed_one(self) -> None:
         """End-to-end consequence of the reset: no sticky state between runs."""
         registry = _registry_with(
             _nested_wf("wf_self", "wf_self"),
             _echo_wf("wf_inner", "i1"),
             _nested_wf("wf_outer", "wf_inner"),
         )
-        with pytest.raises(NestedWorkflowError):
-            registry.execute_workflow("wf_self", {"input": "x"})
+        failed = registry.execute_workflow("wf_self", {"input": "x"})
+        assert failed.status == "failed"
         assert "sub_1/i1" in _log_names(registry.execute_workflow("wf_outer", {"input": "x"}))
 
 
 class TestDanglingReference:
     """S18: referential existence is a runtime check, so it reuses the existing exception."""
 
-    def test_unregistered_inner_raises_workflow_not_found(self) -> None:
-        """Saving a dangling reference is allowed; executing it reports the unknown id."""
+    def test_unregistered_inner_returns_failed_result(self) -> None:
+        """Saving a dangling reference is allowed; executing it records the unknown id in error_message."""
         registry = _registry_with(_nested_wf("wf_outer", "wf_missing"))
-        with pytest.raises(WorkflowNotFoundError, match="wf_missing"):
-            registry.execute_workflow("wf_outer", {"input": "x"})
+        result = registry.execute_workflow("wf_outer", {"input": "x"})
+        assert result.status == "failed"
+        assert "wf_missing" in (result.error_message or "")

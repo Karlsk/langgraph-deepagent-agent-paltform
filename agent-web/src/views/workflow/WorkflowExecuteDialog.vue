@@ -50,6 +50,8 @@ const {
 const loading = ref(false)
 const result = ref<WorkflowExecuteResult | null>(null)
 const executeError = ref<string | null>(null)
+const failedLogs = ref<ExecutionLogView[]>([])
+const failedDurationMs = ref<number | undefined>(undefined)
 const traceVisible = ref(false)
 const traceLogs = ref<ExecutionLogView[]>([])
 
@@ -69,6 +71,8 @@ watch(
     if (!visible) return
     result.value = null
     executeError.value = null
+    failedLogs.value = []
+    failedDurationMs.value = undefined
     loading.value = false
     reset()
     void loadSchema()
@@ -77,6 +81,8 @@ watch(
 )
 
 const hasResult = computed(() => result.value !== null)
+const hasFailedTrace = computed(() => failedLogs.value.length > 0)
+const hasTraceableResult = computed(() => hasResult.value || hasFailedTrace.value)
 
 const outputFields = computed(() => {
   if (!result.value) return null
@@ -101,6 +107,8 @@ function formatTime(ms: unknown): string {
 
 async function handleExecute(): Promise<void> {
   executeError.value = null
+  failedLogs.value = []
+  failedDurationMs.value = undefined
   // 结果区只反映最近一次提交：否则校验失败时旧输出会与新错误同屏，被误读为本次结果。
   result.value = null
   const payload = buildPayload()
@@ -114,13 +122,29 @@ async function handleExecute(): Promise<void> {
   } catch (err: unknown) {
     // 请求层已 toast 过一次，这里把摘要留在对话框内便于对照输入排查。
     executeError.value = toExecuteErrorMessage(err)
+    extractFailedLogs(err)
   } finally {
     loading.value = false
   }
 }
 
+function extractFailedLogs(err: unknown): void {
+  if (typeof err !== 'object' || err === null) return
+  const response = (err as { response?: { data?: unknown } }).response
+  if (!response || typeof response.data !== 'object' || response.data === null) return
+  const data = response.data as { data?: { metadata?: { execution_logs?: ExecutionLogView[]; duration_ms?: number } } }
+  const metadata = data.data?.metadata
+  if (!metadata) return
+  if (Array.isArray(metadata.execution_logs) && metadata.execution_logs.length > 0) {
+    failedLogs.value = metadata.execution_logs
+  }
+  if (typeof metadata.duration_ms === 'number') {
+    failedDurationMs.value = metadata.duration_ms
+  }
+}
+
 function handleOpenTrace(): void {
-  traceLogs.value = result.value?.metadata?.execution_logs ?? []
+  traceLogs.value = result.value?.metadata?.execution_logs ?? failedLogs.value
   traceVisible.value = true
 }
 </script>
@@ -200,12 +224,13 @@ function handleOpenTrace(): void {
         </el-button>
       </div>
 
-      <div v-if="hasResult" class="execute-dialog__result">
-        <h4 class="execute-dialog__result-title">执行结果</h4>
+      <div v-if="hasTraceableResult" class="execute-dialog__result">
+        <h4 v-if="hasResult" class="execute-dialog__result-title">执行结果</h4>
+        <h4 v-else class="execute-dialog__result-title execute-dialog__result-title--error">执行失败</h4>
         <div class="execute-dialog__meta">
-          <span>耗时：{{ formatTime(result?.metadata?.duration_ms) }}</span>
+          <span>耗时：{{ formatTime(hasResult ? result?.metadata?.duration_ms : failedDurationMs) }}</span>
         </div>
-        <div class="execute-dialog__output">
+        <div v-if="hasResult" class="execute-dialog__output">
           <span class="execute-dialog__label">输出</span>
           <pre class="execute-dialog__json">{{ formatJson(outputFields) }}</pre>
         </div>
@@ -297,6 +322,10 @@ function handleOpenTrace(): void {
   margin: 0;
   font-size: 15px;
   color: var(--color-text-primary);
+}
+
+.execute-dialog__result-title--error {
+  color: var(--color-danger-600);
 }
 
 .execute-dialog__meta {
