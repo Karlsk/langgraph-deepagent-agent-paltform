@@ -28,6 +28,7 @@ never the code body, H6/S15).
 
 from __future__ import annotations
 
+import ast
 import importlib
 import textwrap
 import time
@@ -41,17 +42,58 @@ from app.workflow.models import ExecutionLog, OperatorLog, PythonNodeError
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import register_node_type
 from app.workflow.sandbox import run_sandboxed
-from app.workflow.utils import convert_state_to_dict, map_output_to_state
+from app.workflow.utils import convert_state_to_dict, map_output_to_state, resolve_dot_path
 
 logger = structlog.get_logger(__name__)
 
 
+def _validate_main_signature(code: str, inputs: dict[str, str]) -> None:
+    """AST-level check: ``inputs`` non-empty requires ``def main(...)`` with matching params.
+
+    Raises ``ValueError`` (caught by Pydantic as a ValidationError) when the
+    code does not define ``main`` or its parameters don't match the declared
+    input variable names.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        msg = f"PythonNodeConfig: code failed to parse: {exc.msg}"
+        raise ValueError(msg) from exc
+    main_fn: ast.FunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            main_fn = node
+            break
+    if main_fn is None:
+        msg = "PythonNodeConfig: 'inputs' requires the code to define 'def main(...)'"
+        raise ValueError(msg)
+    param_names = [arg.arg for arg in main_fn.args.args]
+    expected = set(inputs.keys())
+    actual = set(param_names)
+    if expected != actual:
+        missing = expected - actual
+        extra = actual - expected
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing parameters: {sorted(missing)}")
+        if extra:
+            parts.append(f"unexpected parameters: {sorted(extra)}")
+        msg = f"PythonNodeConfig: main() signature mismatch — {'; '.join(parts)}"
+        raise ValueError(msg)
+
+
 class PythonNodeConfig(BaseModel, extra="forbid"):
-    """Exactly one of ``code`` / ``entry``; ``sandboxed`` applies to ``code`` only (S14 forbid extras)."""
+    """Exactly one of ``code`` / ``entry``; ``sandboxed`` applies to ``code`` only (S14 forbid extras).
+
+    ``inputs`` maps variable names to state dot-paths; when non-empty the code
+    must define ``def main(...)`` whose parameters match the keys exactly.
+    """
 
     code: str | None = None
     entry: str | None = None
     sandboxed: bool = False
+    state_keys: list[str] = []
+    inputs: dict[str, str] = {}
 
     @model_validator(mode="after")
     def _check_exclusivity(self) -> PythonNodeConfig:
@@ -61,6 +103,11 @@ class PythonNodeConfig(BaseModel, extra="forbid"):
         if self.entry is not None and self.sandboxed:
             msg = "PythonNodeConfig: 'entry' cannot be sandboxed; sandboxed=True requires 'code' mode"
             raise ValueError(msg)
+        if self.entry is not None and self.inputs:
+            msg = "PythonNodeConfig: 'inputs' requires 'code' mode, not 'entry'"
+            raise ValueError(msg)
+        if self.inputs and self.code is not None:
+            _validate_main_signature(self.code, self.inputs)
         return self
 
 
@@ -107,22 +154,41 @@ class PythonNode(BaseNode):
                 logger.exception("python_node_execution_failed", node=self.name, error=str(exc))
                 raise
             # 3. R3 出口：双写 + history 增量
-            return map_output_to_state(self.name, output, state_dict)
+            return map_output_to_state(self.name, output, state_dict, state_keys=cfg.state_keys)
 
         return self.wrap_runnable(func)
 
+    def _resolve_inputs(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Resolve each ``inputs`` dot-path against the state snapshot."""
+        return {var: resolve_dot_path(state_dict, path) for var, path in self._node_config.inputs.items()}
+
     def _run_inline_code(self, code: str, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Sandboxed code goes to a child process (S22); otherwise wrap it so ``return`` works."""
+        """Three paths: sandboxed (→ child process), inputs mode (→ def main), legacy (→ wrapped exec)."""
         if self._node_config.sandboxed:
-            return run_sandboxed(code, state_dict)
+            resolved = self._resolve_inputs(state_dict) if self._node_config.inputs else None
+            return run_sandboxed(code, state_dict, inputs=resolved)
+        if self._node_config.inputs:
+            resolved = self._resolve_inputs(state_dict)
+            namespace: dict[str, Any] = {}
+            try:
+                exec(code, namespace)  # noqa: S102 — trusted repository-owned code by design
+            except SyntaxError as exc:
+                msg = f"PythonNode '{self.name}': inline code failed to compile: {exc}"
+                raise PythonNodeError(msg) from exc
+            main_fn = namespace.get("main")
+            if main_fn is None:
+                msg = f"PythonNode '{self.name}': code defines no 'main' function but 'inputs' requires one"
+                raise PythonNodeError(msg)
+            result = main_fn(**resolved)
+            return self._ensure_dict(result, hint="main() must return a dict")
         wrapped = "def __python_node_fn(state):\n" + textwrap.indent(code, "    ")
-        namespace: dict[str, Any] = {}
+        namespace_legacy: dict[str, Any] = {}
         try:
-            exec(wrapped, namespace)  # noqa: S102 — trusted repository-owned code by design
+            exec(wrapped, namespace_legacy)  # noqa: S102 — trusted repository-owned code by design
         except SyntaxError as exc:
             msg = f"PythonNode '{self.name}': inline code failed to compile: {exc}"
             raise PythonNodeError(msg) from exc
-        result = namespace["__python_node_fn"](state_dict)
+        result = namespace_legacy["__python_node_fn"](state_dict)
         return self._ensure_dict(result, hint="inline code must end with a return statement that produces a dict")
 
     def _run_entry(self, entry: str, state_dict: dict[str, Any]) -> dict[str, Any]:

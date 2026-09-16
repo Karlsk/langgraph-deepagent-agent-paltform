@@ -79,6 +79,7 @@ _ALLOWED_MODULES = frozenset(
         "hashlib",
         "collections",
         "functools",
+        "time",
     }
 )
 """Stdlib an ``import`` may name, by *root* module (rule 1).
@@ -130,7 +131,12 @@ def validate_code_ast(code: str) -> None:
         _check_node(node)
 
 
-def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = SandboxLimits()) -> dict[str, Any]:
+def run_sandboxed(
+    code: str,
+    state: dict[str, Any],
+    limits: SandboxLimits = SandboxLimits(),
+    inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """在子进程沙箱中执行 code，返回其 dict 结果。.
 
     执行前复跑 validate_code_ast（纵深防御：调用方可能绕过注册期校验）。
@@ -140,6 +146,8 @@ def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = Sand
         code: The node's inline code body.
         state: Plain-dict snapshot of the workflow state handed to the child.
         limits: Resource caps forwarded to the worker.
+        inputs: Resolved input variables for ``def main(**inputs)`` mode; None
+            falls back to the legacy ``_sandbox_entry(state)`` wrapper.
 
     Returns:
         The dict the sandboxed code produced.
@@ -150,7 +158,7 @@ def run_sandboxed(code: str, state: dict[str, Any], limits: SandboxLimits = Sand
     """
     validate_code_ast(code)
     started = time.perf_counter()
-    completed = _spawn(code, state, limits)
+    completed = _spawn(code, state, limits, inputs)
     duration_ms = (time.perf_counter() - started) * 1000
     document = _read_document(completed, limits)
     _report_limits(document.get("limits"))
@@ -200,15 +208,23 @@ def _check_import(node: ast.Import | ast.ImportFrom) -> None:
             raise _reject("no-import", node.lineno, f"import of {root} is not allowed")
 
 
-def _spawn(code: str, state: dict[str, Any], limits: SandboxLimits) -> subprocess.CompletedProcess[str]:
+def _spawn(
+    code: str,
+    state: dict[str, Any],
+    limits: SandboxLimits,
+    inputs: dict[str, Any] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Launch the isolated worker with exactly one JSON document on stdin.
 
     No ``preexec_fn``: the worker applies its own rlimits (S22). No explicit
     ``stdin=PIPE`` either — ``input=`` already implies it, and passing both makes
     ``subprocess.run`` raise.
     """
+    payload_dict: dict[str, Any] = {"code": code, "state": state, "limits": asdict(limits)}
+    if inputs is not None:
+        payload_dict["inputs"] = inputs
     try:
-        payload = json.dumps({"code": code, "state": state, "limits": asdict(limits)})
+        payload = json.dumps(payload_dict)
     except TypeError as exc:
         msg = f"sandbox state is not JSON-serializable: {exc}"
         raise PythonNodeError(msg) from exc

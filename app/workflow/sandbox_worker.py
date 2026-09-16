@@ -7,7 +7,8 @@ host environment.
 
 Wire protocol (frozen in CONTRACT §6 "S22 细则"):
 
-- stdin: exactly one JSON document ``{"code", "state", "limits"}``
+- stdin: exactly one JSON document ``{"code", "state", "limits", "inputs"}``
+  (``inputs`` is optional; when present the worker calls ``main(**inputs)``)
 - stdout: exactly one JSON document ``{"ok", "output"|"error", "limits"}``
 - exit: ``0`` normal (including ``ok=false``), ``2`` the code failed to
   compile, ``3`` the worker itself broke down
@@ -105,6 +106,7 @@ _ALLOWED_MODULES = frozenset(
         "hashlib",
         "collections",
         "functools",
+        "time",
     }
 )
 """Stdlib an ``import`` may name, by *root* module — a verbatim copy.
@@ -201,10 +203,16 @@ def _emit(document: dict[str, Any]) -> None:
     os.write(1, json.dumps(document).encode("utf-8"))
 
 
-def _execute(code: str, state: dict[str, Any]) -> Any:
-    """Run user code inside a function wrapper so a bare ``return`` works."""
-    wrapped = f"def {_ENTRY_FUNCTION}(state):\n" + textwrap.indent(code, "    ")
+def _execute(code: str, state: dict[str, Any], inputs: dict[str, Any] | None = None) -> Any:
+    """Run user code; with ``inputs`` call ``main(**inputs)``, otherwise wrap so ``return`` works."""
     namespace: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
+    if inputs is not None:
+        exec(code, namespace)  # noqa: S102 — the whole point of this module, gated by AST + builtins
+        main_fn = namespace.get("main")
+        if main_fn is None:
+            raise RuntimeError("sandboxed code defines no 'main' function but 'inputs' requires one")
+        return main_fn(**inputs)
+    wrapped = f"def {_ENTRY_FUNCTION}(state):\n" + textwrap.indent(code, "    ")
     exec(wrapped, namespace)  # noqa: S102 — the whole point of this module, gated by AST + builtins
     return namespace[_ENTRY_FUNCTION](state)
 
@@ -226,7 +234,7 @@ def main() -> int:
     report = _apply_limits(request.get("limits") or {})
     sys.stdout = _Discard()  # type: ignore[assignment]
     try:
-        result = _execute(request.get("code") or "", request.get("state") or {})
+        result = _execute(request.get("code") or "", request.get("state") or {}, request.get("inputs"))
     except SyntaxError as exc:
         return _fail(f"sandboxed code failed to compile: {exc.msg} (line {exc.lineno})", report, _EXIT_SYNTAX)
     except Exception as exc:  # noqa: BLE001 — every user-code failure becomes ok=false

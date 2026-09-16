@@ -73,13 +73,13 @@ class TestInlineCode:
     def test_reads_state_and_returns_dict(self) -> None:
         """Inline code reads the injected state dict and returns a dict."""
         node = _node({"code": 'return {"doubled": state["value"] * 2}'})
-        assert _run(node, {"value": 21})["doubled"] == 42
+        assert _run(node, {"value": 21})["py_result"]["doubled"] == 42
 
     def test_local_imports_work(self) -> None:
         """Function-wrapped code supports local imports."""
         code = "import json\nreturn {'n': len(json.loads(state['payload']))}"
         node = _node({"code": code})
-        assert _run(node, {"payload": "[1, 2, 3]"})["n"] == 3
+        assert _run(node, {"payload": "[1, 2, 3]"})["py_result"]["n"] == 3
 
     def test_non_dict_output_raises(self) -> None:
         """Non-dict return values are rejected."""
@@ -110,10 +110,10 @@ class TestEntry:
     """``entry`` loads a repository function as module:function."""
 
     def test_entry_function_invoked_with_state(self) -> None:
-        """Entry function receives the state dict; output dual-writes."""
+        """Entry function receives the state dict; output goes to {node}_result."""
         node = _node({"entry": "app.workflow.utils:convert_state_to_dict"})
         out = _run(node, {"a": 1})
-        assert out["a"] == 1
+        assert out["py_result"]["a"] == 1
         assert out["py_result"] == {"a": 1}
 
     def test_entry_missing_colon_raises(self) -> None:
@@ -138,12 +138,12 @@ class TestEntry:
 class TestPipelineAndLogging:
     """R3 out-pipeline: dual write + history increment; summary-only logs."""
 
-    def test_dual_write_and_history_increment(self) -> None:
-        """Output dual-writes flat fields plus {node}_result and history entry."""
+    def test_result_write_and_history_increment(self) -> None:
+        """Output writes to {node}_result and history (dual_write off by default)."""
         node = _node({"code": 'return {"flag": "on"}'}, name="py_node")
         out = _run(node, {"history": ["h0"]})
-        assert out["flag"] == "on"
         assert out["py_node_result"] == {"flag": "on"}
+        assert "flag" not in out
         assert len(out["history"]) == 1 and out["history"][0].startswith("py_node:")
 
     def test_execution_log_is_summary_only(self) -> None:
@@ -187,35 +187,35 @@ class TestSandboxedRouting:
         assert calls[0][0] == 'return {"upper": state["input"].upper()}'
         assert calls[0][1] == {"input": "abc"}
         assert isinstance(calls[0][1], dict)
-        assert out["upper"] == "ABC"
+        assert out["py_result"]["upper"] == "ABC"
 
-    def test_sandboxed_output_still_dual_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Sandbox results go through the same R3 out-pipeline as the in-process path."""
+    def test_sandboxed_output_writes_result_and_history(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Sandbox results go through the same out-pipeline as the in-process path."""
         self._stub(monkeypatch, {"flag": "on"})
         node = _node({"code": "return {'flag': 'on'}", "sandboxed": True}, name="py_node")
         out = _run(node, {"history": []})
-        assert out["flag"] == "on"
         assert out["py_node_result"] == {"flag": "on"}
+        assert "flag" not in out
         assert len(out["history"]) == 1
 
     def test_unsandboxed_code_never_touches_the_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Regression protection: the trusted in-process exec path is byte-for-byte unchanged."""
         calls = self._stub(monkeypatch, {"should": "not be used"})
         node = _node({"code": 'return {"doubled": state["value"] * 2}'})
-        assert _run(node, {"value": 21})["doubled"] == 42
+        assert _run(node, {"value": 21})["py_result"]["doubled"] == 42
         assert calls == []
 
     def test_entry_mode_never_touches_the_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The entry path is unaffected by the sandbox branch (§2.3)."""
         calls = self._stub(monkeypatch, {"should": "not be used"})
         node = _node({"entry": "app.workflow.utils:convert_state_to_dict"})
-        assert _run(node, {"a": 1})["a"] == 1
+        assert _run(node, {"a": 1})["py_result"]["a"] == 1
         assert calls == []
 
     def test_sandbox_failure_is_recorded_and_propagated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A sandbox error is logged then re-raised (H2/R6, no dead except)."""
 
-        def exploding(code: str, state: dict[str, Any]) -> dict[str, Any]:
+        def exploding(code: str, state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise PythonNodeError("sandboxed code timed out after 10.0s")
 
         monkeypatch.setattr("app.workflow.nodes.python_node.run_sandboxed", exploding)
@@ -233,6 +233,75 @@ class TestSandboxedRouting:
         log = node.get_execution_history()[0]
         assert log.input_data == {"mode": "code", "code_chars": len(secret_code), "sandboxed": True}
         assert secret_code not in str(log.input_data)
+
+
+class TestInputsMode:
+    """Dify-style ``inputs`` mapping: var_name → state dot-path, code defines ``def main(...)``."""
+
+    def test_inputs_inline_happy_path(self) -> None:
+        """Inputs resolves dot-paths and calls main(**resolved)."""
+        code = "def main(token_resp):\n    return {'access_token': token_resp.get('token', '')}"
+        node = _node({"code": code, "inputs": {"token_resp": "get_token_result.response"}, "sandboxed": False})
+        state = {"get_token_result": {"response": {"token": "abc123"}}}
+        out = _run(node, state)
+        assert out["py_result"]["access_token"] == "abc123"  # noqa: S105
+
+    def test_inputs_sandboxed_forwards_inputs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """sandboxed=True forwards resolved inputs to run_sandboxed."""
+        calls: list[tuple[Any, ...]] = []
+
+        def fake_run_sandboxed(code: str, state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append((code, state, kwargs.get("inputs")))
+            return {"doubled": 42}
+
+        monkeypatch.setattr("app.workflow.nodes.python_node.run_sandboxed", fake_run_sandboxed)
+        code = "def main(value):\n    return {'doubled': value * 2}"
+        node = _node({"code": code, "inputs": {"value": "data.count"}, "sandboxed": True})
+        out = _run(node, {"data": {"count": 21}})
+        assert out["py_result"]["doubled"] == 42
+        assert len(calls) == 1
+        assert calls[0][2] == {"value": 21}
+
+    def test_inputs_without_main_raises(self) -> None:
+        """Inputs non-empty but code has no def main → ValidationError at config time."""
+        with pytest.raises(ValidationError, match="def main"):
+            PythonNodeConfig(
+                code="return {'x': 1}",
+                inputs={"x": "some.path"},
+            )
+
+    def test_inputs_param_mismatch_raises(self) -> None:
+        """Inputs keys don't match main() params → ValidationError."""
+        code = "def main(alpha, beta):\n    return {}"
+        with pytest.raises(ValidationError, match="signature mismatch"):
+            PythonNodeConfig(
+                code=code,
+                inputs={"alpha": "a.path", "gamma": "b.path"},
+            )
+
+    def test_empty_inputs_preserves_legacy(self) -> None:
+        """inputs={} (default) keeps the legacy state.get() path working."""
+        node = _node({"code": 'return {"doubled": state["value"] * 2}'})
+        assert _run(node, {"value": 21})["py_result"]["doubled"] == 42
+
+    def test_inputs_with_entry_rejected(self) -> None:
+        """Inputs + entry is rejected (inputs requires code mode)."""
+        with pytest.raises(ValidationError, match="inputs.*requires.*code"):
+            PythonNodeConfig(entry="app.workflow.utils:convert_state_to_dict", inputs={"x": "y.z"})
+
+    def test_dot_path_miss_resolves_to_none(self) -> None:
+        """A non-existent dot-path resolves to None (not an error)."""
+        code = "def main(maybe):\n    return {'got': maybe}"
+        node = _node({"code": code, "inputs": {"maybe": "no.such.path"}, "sandboxed": False})
+        out = _run(node, {"other": "data"})
+        assert out["py_result"]["got"] is None
+
+    def test_inputs_multiple_params(self) -> None:
+        """Multiple inputs resolve independently and pass as keyword args."""
+        code = "def main(a, b):\n    return {'sum': a + b}"
+        node = _node({"code": code, "inputs": {"a": "x.val", "b": "y.val"}, "sandboxed": False})
+        out = _run(node, {"x": {"val": 10}, "y": {"val": 32}})
+        assert out["py_result"]["sum"] == 42
 
 
 class TestFactoryPluginPath:
