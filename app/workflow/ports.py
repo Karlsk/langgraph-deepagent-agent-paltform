@@ -48,3 +48,15 @@ ChatModelFactory = Callable[[str, dict[str, Any]], Any]
 # inner RunResult, so the node cannot derive them itself; they ride back purely
 # to build the S24 log summary and must never enter the outer state.
 WorkflowRunner = Callable[[str, dict[str, Any], str], dict[str, Any]]
+
+# (tool_names, mcp_server_names) -> list of resolved BaseTool instances.
+#
+# The composition root (app/main.py) builds this callable, closing over the DB
+# session factory and the builtin tool list. The workflow engine never imports
+# app.services.* or app.core.* — tool resolution crosses the boundary as an
+# opaque callable, same pattern as ChatModelFactory.
+#
+# ``tool_names``: fine-grained whitelist (e.g. ["search", "browser-use__click"]).
+# ``mcp_server_names``: server-level association (e.g. ["browser-use"]).
+# Either or both may be None; the resolver unions the results.
+ToolResolver = Callable[[list[str] | None, list[str] | None], list[Any]]

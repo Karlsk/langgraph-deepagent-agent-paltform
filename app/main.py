@@ -1,5 +1,6 @@
 """This file contains the main application entry point."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -39,11 +40,13 @@ from app.core.middleware import (
 )
 from app.core.observability import langfuse_init
 from app.services.agents.bootstrap import ensure_all_agent_workspaces, ensure_default_agent_app
-from app.services.agents.mcp_manager import get_mcp_tools, shutdown_mcp_clients
+from app.services.agents.mcp_manager import ToolCatalogEntry, build_tool_catalog, get_mcp_tools, shutdown_mcp_clients
+from app.core.langgraph.tools import tools as builtin_tools
 from app.services.database import database_service
 from app.services.llm.provider_service import resolve_chat_model
 from app.services.memory import memory_service
 from app.workflow.cli import DEFAULT_CONFIG_DIR, build_registry
+from app.workflow.store import backfill_workflows_from_disk
 
 # Load environment variables
 load_dotenv()
@@ -87,6 +90,10 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.exception("mcp_tools_pre_warm_failed_degraded", error=str(e))
             await ensure_all_agent_workspaces(db_session)
+            try:
+                backfill_workflows_from_disk(db_session)
+            except Exception as e:
+                logger.exception("workflow_backfill_failed", error=str(e))
     except Exception as e:
         logger.exception("agent_workspace_bootstrap_failed", error=str(e))
 
@@ -131,12 +138,62 @@ app.add_middleware(CorrelationIdMiddleware)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
 
+def _build_tool_resolver():
+    """Build a sync tool_resolver callable for the workflow engine.
+
+    Returns a callable ``(tool_names, mcp_server_names) -> list[BaseTool]`` that
+    opens a short-lived DB session, loads builtin + MCP tools, and filters by
+    the requested names/servers. Uses ``asyncio.run`` internally because MCP
+    tool loading is async while the resolver is called from a sync context.
+    """
+
+    def _resolve(tool_names: list[str] | None, mcp_server_names: list[str] | None) -> list:
+        with Session(database_service.engine) as session:
+            catalog = asyncio.run(build_tool_catalog(session))
+        tool_index: dict[str, ToolCatalogEntry] = {}
+        server_tools: dict[str, list[ToolCatalogEntry]] = {}
+        for entry in catalog:
+            tool_index[entry["name"]] = entry
+            server = entry.get("server")
+            if server:
+                server_tools.setdefault(server, []).append(entry)
+
+        resolved: dict[str, ToolCatalogEntry] = {}
+        if tool_names:
+            for name in tool_names:
+                if name in tool_index:
+                    resolved[name] = tool_index[name]
+        if mcp_server_names:
+            for server_name in mcp_server_names:
+                for entry in server_tools.get(server_name, []):
+                    resolved[entry["name"]] = entry
+
+        if not resolved:
+            return []
+
+        resolved_names = set(resolved.keys())
+        with Session(database_service.engine) as session:
+            mcp_tools = asyncio.run(get_mcp_tools(session))
+        builtin_by_name = {t.name: t for t in builtin_tools}
+        mcp_by_name = {t.name: t for t in mcp_tools}
+        result = []
+        for name in resolved_names:
+            tool = builtin_by_name.get(name) or mcp_by_name.get(name)
+            if tool is not None:
+                result.append(tool)
+        return result
+
+    return _resolve
+
+
 # Inject the workflow registry on app.state (spec-09 TC1, H4/G7: engine keeps no module-level cache).
-# The chat model factory is injected here — and only here — so the engine can resolve
-# provider_ref credentials without importing any host module (CONTRACT §3 red line 4, S20).
+# The chat model factory and tool resolver are injected here — and only here — so the engine
+# can resolve provider_ref credentials and tool names without importing any host module
+# (CONTRACT §3 red line 4, S20).
 app.state.workflow_registry = build_registry(
     DEFAULT_CONFIG_DIR,
     chat_model_factory=resolve_chat_model,
+    tool_resolver=_build_tool_resolver(),
 )
 logger.info("workflow_registry_built", directory=str(DEFAULT_CONFIG_DIR))
 

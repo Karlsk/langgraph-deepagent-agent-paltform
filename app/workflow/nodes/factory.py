@@ -18,10 +18,11 @@ Dependency red-line 2: never import registry / graph_builder here.
 from __future__ import annotations
 
 import inspect
+from typing import Any
 
 from app.workflow.models import NodeDefinition, OperatorLog
 from app.workflow.nodes.base import BaseNode
-from app.workflow.ports import ChatModelFactory, WorkflowRunner
+from app.workflow.ports import ChatModelFactory, ToolResolver, WorkflowRunner
 
 _NODE_REGISTRY: dict[str, type[BaseNode]] = {}
 
@@ -57,12 +58,13 @@ def create_node(
     operator_log: OperatorLog | None = None,
     chat_model_factory: ChatModelFactory | None = None,
     workflow_runner: WorkflowRunner | None = None,
+    tool_resolver: ToolResolver | None = None,
 ) -> BaseNode:
     """内置优先（恰好 2 分支）→ 插件注册表兜底 → 未知 ValueError（R4，方案 A）.
 
     ``chat_model_factory`` 仅透传给 llm 分支（S20）；``workflow_runner`` 按签名探测
-    透传给声明了它的插件（S23/S24）。两者都是不透明 callable 而非注册表，
-    故不违反 H5「factory 无 workflow_registry 参数」。
+    透传给声明了它的插件（S23/S24）。``tool_resolver`` 按签名探测透传给声明了它的
+    插件（react 节点）。三者都是不透明 callable，故不违反 H5。
     """
     op_log = operator_log or OperatorLog(node_name=definition.name, input_schema={}, output_schema={})
     # 1. 内置兜底恰好 2 个分支（R4：禁 elif），专用构造器签名
@@ -78,9 +80,13 @@ def create_node(
     # 2. 插件注册表（generic BaseNode interface）+ 可选注入参数按签名探测
     if definition.type in _NODE_REGISTRY:
         node_class = _NODE_REGISTRY[definition.type]
-        injected: dict[str, WorkflowRunner | None] = (
-            {"workflow_runner": workflow_runner} if _accepts_kwarg(node_class, "workflow_runner") else {}
-        )
+        injected: dict[str, Any] = {}
+        if _accepts_kwarg(node_class, "workflow_runner"):
+            injected["workflow_runner"] = workflow_runner
+        if _accepts_kwarg(node_class, "tool_resolver"):
+            injected["tool_resolver"] = tool_resolver
+        if _accepts_kwarg(node_class, "chat_model_factory"):
+            injected["chat_model_factory"] = chat_model_factory
         return node_class(
             name=definition.name,
             node_type=definition.type,
@@ -104,4 +110,5 @@ def create_node(
 import app.workflow.nodes.http_node as _http_node  # noqa: E402
 import app.workflow.nodes.llm_node as _llm_node  # noqa: E402
 import app.workflow.nodes.python_node  # noqa: E402, F401 — 触发 "python" 插件类型自注册（K5）
+import app.workflow.nodes.react_node  # noqa: E402, F401 — 触发 "react" 插件类型自注册（K5）
 import app.workflow.nodes.subworkflow_node  # noqa: E402, F401 — 触发 "subworkflow" 插件类型自注册（K5，S23/S24）

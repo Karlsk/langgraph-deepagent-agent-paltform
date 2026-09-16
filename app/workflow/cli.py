@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 from app.workflow.logging_conf import redact, redact_processor, setup_logging
 from app.workflow.models import WorkflowEngineError
-from app.workflow.ports import ChatModelFactory
+from app.workflow.ports import ChatModelFactory, ToolResolver
 from app.workflow.registry import WorkflowRegistry, load_definitions_from_dir
 
 logger = structlog.get_logger(__name__)
@@ -55,15 +55,18 @@ def build_registry(
     *,
     user_dir: str | Path | None = None,
     chat_model_factory: ChatModelFactory | None = None,
+    tool_resolver: ToolResolver | None = None,
 ) -> WorkflowRegistry:
     """Load definitions from ``directory`` (examples) and optionally ``user_dir``.
 
     ``chat_model_factory`` is forwarded to the registry for ``provider_ref``
     resolution (S20); the CLI leaves it ``None``, so such nodes keep the env path.
+    ``tool_resolver`` is forwarded for react node tool resolution; the CLI leaves
+    it ``None``, so react nodes cannot resolve tools without host wiring.
     """
     from app.workflow.store import user_workflow_dir as _default_user_dir
 
-    registry = WorkflowRegistry(chat_model_factory=chat_model_factory)
+    registry = WorkflowRegistry(chat_model_factory=chat_model_factory, tool_resolver=tool_resolver)
     for definition in load_definitions_from_dir(directory):
         registry.register_workflow(definition)
     resolved_user_dir = Path(user_dir) if user_dir is not None else _default_user_dir()

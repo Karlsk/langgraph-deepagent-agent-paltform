@@ -19,7 +19,7 @@ from langgraph.graph import END, StateGraph
 from app.workflow.models import ConditionNotMatchedError, EdgeDefinition, WorkflowDefinition
 from app.workflow.nodes.base import BaseNode
 from app.workflow.nodes.factory import create_node
-from app.workflow.ports import ChatModelFactory, WorkflowRunner
+from app.workflow.ports import ChatModelFactory, ToolResolver, WorkflowRunner
 from app.workflow.state import StateModelFactory
 from app.workflow.utils import convert_state_to_dict, resolve_dot_path
 
@@ -42,6 +42,7 @@ class GraphBuilder:
         no_match_policy: Literal["raise", "default"] = "raise",
         chat_model_factory: ChatModelFactory | None = None,
         workflow_runner: WorkflowRunner | None = None,
+        tool_resolver: ToolResolver | None = None,
     ) -> None:
         """Store the no-match routing policy and the injected callables; no registry parameter (H5).
 
@@ -52,6 +53,7 @@ class GraphBuilder:
         self.no_match_policy = no_match_policy
         self._chat_model_factory = chat_model_factory
         self._workflow_runner = workflow_runner
+        self._tool_resolver = tool_resolver
 
     def build_graph(
         self,
@@ -117,6 +119,7 @@ class GraphBuilder:
                     operator_log=definition.operator_logs.get(node_def.name),
                     chat_model_factory=self._chat_model_factory,
                     workflow_runner=self._workflow_runner,
+                    tool_resolver=self._tool_resolver,
                 )
                 graph.add_node(node_def.name, node.build_runnable())
             except Exception:

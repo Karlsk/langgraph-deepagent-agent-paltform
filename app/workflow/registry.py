@@ -41,7 +41,7 @@ from app.workflow.nodes.base import (  # noqa: SLF001 — token reset per S11
     get_run_collector,
     set_run_collector,
 )
-from app.workflow.ports import ChatModelFactory
+from app.workflow.ports import ChatModelFactory, ToolResolver
 
 logger = structlog.get_logger(__name__)
 
@@ -135,6 +135,7 @@ class WorkflowRegistry:
         *,
         no_match_policy: Literal["raise", "default"] = "raise",
         chat_model_factory: ChatModelFactory | None = None,
+        tool_resolver: ToolResolver | None = None,
         max_nesting_depth: int = 3,
     ) -> None:
         """Create an empty registry with the given condition-router no-match policy.
@@ -158,6 +159,7 @@ class WorkflowRegistry:
             no_match_policy=no_match_policy,
             chat_model_factory=chat_model_factory,
             workflow_runner=self._run_nested,
+            tool_resolver=tool_resolver,
         )
 
     # -- registration ---------------------------------------------------------

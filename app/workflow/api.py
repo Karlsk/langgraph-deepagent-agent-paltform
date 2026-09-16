@@ -178,7 +178,7 @@ def _persist_workflow_run(
         db.rollback()
 
 
-ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http", "python", "subworkflow"})
+ALLOWED_NODE_TYPES: frozenset[str] = frozenset({"llm", "http", "python", "subworkflow", "react"})
 # `subworkflow` needs no check of its own here (S18 structural validation):
 # SubWorkflowNodeConfig already rejects a missing/blank/non-string workflow_id, and
 # that runs during register_workflow below — inside this same handler, so the 422
@@ -618,6 +618,7 @@ async def save_workflow(
     request: Request,
     payload: dict[str, Any] = Body(...),
     registry: WorkflowRegistry = Depends(get_registry),
+    db: DBSession = Depends(get_db_session),
     _admin: User = Depends(require_workflow_admin),
 ) -> JSONResponse:
     """Full-replace register a workflow definition (spec-16, S13 atomic replacement).
@@ -659,7 +660,7 @@ async def save_workflow(
         )
 
     try:
-        await run_in_threadpool(save_definition_yaml, definition)
+        await run_in_threadpool(save_definition_yaml, definition, session=db)
     except Exception as exc:  # noqa: BLE001 — rollback on any persist failure
         logger.exception("api_save_workflow_persist_failed", workflow_id=workflow_id)
         registry.delete_workflow(workflow_id)
@@ -669,11 +670,11 @@ async def save_workflow(
     return _project_to_host_envelope(ApiResponse(success=True, data=_definition_view(definition)), 200)
 
 
-def _remove_workflow(registry: WorkflowRegistry, workflow_id: str) -> bool:
-    """Orchestrate memory + disk deletion; return True if removed from registry (C6/H7)."""
+def _remove_workflow(registry: WorkflowRegistry, workflow_id: str, *, session: DBSession | None = None) -> bool:
+    """Orchestrate memory + disk + DB deletion; return True if removed from registry (C6/H7)."""
     removed = registry.delete_workflow(workflow_id)
     if removed:
-        delete_definition_yaml(workflow_id)
+        delete_definition_yaml(workflow_id, session=session)
     return removed
 
 
@@ -692,11 +693,12 @@ async def delete_workflow_endpoint(
     workflow_id: str,
     request: Request,
     registry: WorkflowRegistry = Depends(get_registry),
+    db: DBSession = Depends(get_db_session),
     _admin: User = Depends(require_workflow_admin),
 ) -> JSONResponse:
-    """Delete a workflow from registry and disk; 404 if unknown (spec-18)."""
+    """Delete a workflow from registry, disk and DB; 404 if unknown (spec-18)."""
     logger.info("api_workflow_delete_requested", workflow_id=workflow_id)
-    removed = await run_in_threadpool(_remove_workflow, registry, workflow_id)
+    removed = await run_in_threadpool(_remove_workflow, registry, workflow_id, session=db)
     if not removed:
         logger.warning("api_workflow_not_found_for_delete", workflow_id=workflow_id)
         return _project_to_host_envelope(
