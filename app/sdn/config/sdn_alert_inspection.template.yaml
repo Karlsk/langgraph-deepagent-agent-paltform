@@ -10,9 +10,14 @@
 # 凭据约定（定稿决策 5）：
 #   - 本文件为入库模板，凭据为占位符；
 #   - 复制为 sdn_alert_inspection.yaml（已加 .gitignore，不入库）后填入真实值。
-# SSL：SDN 控制器自签证书；引擎 HTTPNode 无 verify 开关（不改引擎），
-#   由入口 app/sdn/__main__.py 在本进程内放宽 verify（仅此进程生效）。
+# SSL：SDN 控制器自签证书；引擎 HTTPNode verify_ssl=False 已默认关闭。
 # recursion_limit：每条告警循环 5 步，入口已 set_recursion_limit(200)。
+#
+# 数据流（dual_write=False + Dify-style inputs 统一模式）：
+#   - 节点输出仅写入 {node_name}_result，不再展开到顶层 state
+#   - Python 节点通过 inputs 声明 dot-path 映射，代码写 def main(**inputs)
+#   - parse_result 手动累积检查结果（读自身上一轮的 accumulated_checks）
+#   - state_keys: [has_next] 直通条件路由字段到 state channel
 #
 # 运行（零传参，凭据取 state_schema.default）：
 #   uv run python -m app.sdn run --workflow sdn_alert_inspection --input '{}'
@@ -40,43 +45,13 @@ state_schema:
     type: str
     default: 'CHANGE_ME_DEVICE_ID'
     description: 'Client device id registered with the controller'
-  # --- 运行期字段 ---
-  access_token:
-    type: str
-    reducer: last
-  remaining_alerts:
-    type: list
-    reducer: last
-    description: 'Alert queue; None until seeded by prepare_check'
+  # --- 条件路由字段（state_keys 直通）---
   has_next:
     type: str
     reducer: last
     description: "Loop marker: 'true' / 'false' (S7 equality condition)"
-  current_device:
-    type: str
-    reducer: last
-  current_interface:
-    type: str
-    reducer: last
-  current_down_time:
-    type: str
-    reducer: last
-  current_command:
-    type: str
-    reducer: last
-    description: 'Rendered JSON body for command_exec'
-  vendor_info:
-    type: dict
-    reducer: last
-  check_result:
-    type: list
-    reducer: add
-    description: 'Per-interface check summaries accumulated across loop rounds'
   messages:
     type: list
-    reducer: last
-  report:
-    type: str
     reducer: last
 
 nodes:
@@ -91,15 +66,18 @@ nodes:
         Accept: application/json
       body_template: '{"username": "{sdn_username}", "password": "{sdn_password}", "device_id": "{sdn_device_id}"}'
 
-  # 2. 解析 access_token（通用 python 节点）
+  # 2. 解析 access_token（Dify-style inputs + def main）
   - name: extract_token
     type: python
     config:
+      inputs:
+        token_response: get_token_result.response
       code: |
-        response = (state.get("get_token_result") or {}).get("response") or {}
-        return {"access_token": response.get("access_token", "")}
+        def main(token_response):
+            return {"access_token": (token_response or {}).get("access_token", "")}
+      sandboxed: true
 
-  # 3. 查询告警列表（内置 HTTPNode，Bearer 从 state 渲染）
+  # 3. 查询告警列表（内置 HTTPNode，Bearer 从 dot-path 渲染）
   - name: get_alerts
     type: http
     config:
@@ -108,31 +86,39 @@ nodes:
       headers:
         Content-Type: application/json
         Accept: 'application/json, text/plain, */*'
-        Authorization: 'Bearer {access_token}'
+        Authorization: 'Bearer {extract_token_result.access_token}'
       body_template: '{"interval": "1h", "namespace": "device", "category": "PE端口Down", "autoRecovery": 1, "pageNum": 1, "pageSize": 10}'
 
   # 4. 循环准备：首轮播种告警队列，随后每轮弹出队首写 current_*
   - name: prepare_check
     type: python
     config:
+      inputs:
+        prev_remaining: parse_result_result.remaining_alerts
+        alerts_response: get_alerts_result.response
       code: |
-        alerts = state.get("remaining_alerts")
-        if not alerts:
-            response = (state.get("get_alerts_result") or {}).get("response") or {}
-            alerts = list(response.get("data") or [])
-        current = {"current_device": "", "current_interface": "", "current_down_time": ""}
-        rest = alerts
-        if alerts:
-            first, rest = alerts[0], alerts[1:]
-            current = {
-                "current_device": first.get("source", ""),
-                "current_interface": first.get("component", ""),
-                "current_down_time": first.get("time", ""),
+        def main(prev_remaining, alerts_response):
+            alerts = prev_remaining
+            if not alerts:
+                alerts = list((alerts_response or {}).get("data") or [])
+            current_device = ""
+            current_interface = ""
+            current_down_time = ""
+            rest = alerts
+            if alerts:
+                first, rest = alerts[0], alerts[1:]
+                current_device = first.get("source", "")
+                current_interface = first.get("component", "")
+                current_down_time = first.get("time", "")
+            return {
+                "remaining_alerts": rest,
+                "current_device": current_device,
+                "current_interface": current_interface,
+                "current_down_time": current_down_time,
             }
-        return {"remaining_alerts": rest, **current}
+      sandboxed: true
 
-  # 5. 查询设备厂商信息（内置 HTTPNode；response_path 不支持 list 下标，
-  #    整体响应交给 pick_vendor 解析 content[0]）
+  # 5. 查询设备厂商信息（内置 HTTPNode）
   - name: pe_info
     type: http
     config:
@@ -140,26 +126,31 @@ nodes:
       method: POST
       headers:
         Content-Type: application/json
-        Authorization: 'Bearer {access_token}'
-      body_template: '{"name": "{current_device}"}'
+        Authorization: 'Bearer {extract_token_result.access_token}'
+      body_template: '{"name": "{prepare_check_result.current_device}"}'
 
   # 6. 解析厂商 + 按 VENDOR_COMMAND_MAP 组装命令 JSON
   - name: pick_vendor
     type: python
     config:
+      inputs:
+        pe_response: pe_info_result.response
+        current_device: prepare_check_result.current_device
       code: |
         import json
-        VENDOR_COMMAND_MAP = {"H3C": "dis ip in br", "Huawei": "dis ip in br"}
-        DEFAULT_COMMAND = "dis ip in br"
-        response = (state.get("pe_info_result") or {}).get("response") or {}
-        content = response.get("content") or []
-        vendor = content[0].get("vendor-id", "") if content else ""
-        command = VENDOR_COMMAND_MAP.get(vendor, DEFAULT_COMMAND)
-        body = json.dumps(
-            {"device_name": state.get("current_device", ""), "command": command},
-            ensure_ascii=False,
-        )
-        return {"vendor_info": {"vendor_id": vendor}, "current_command": body}
+
+        def main(pe_response, current_device):
+            VENDOR_COMMAND_MAP = {"H3C": "dis ip in br", "Huawei": "dis ip in br"}
+            DEFAULT_COMMAND = "dis ip in br"
+            content = (pe_response or {}).get("content") or []
+            vendor = content[0].get("vendor-id", "") if content else ""
+            command = VENDOR_COMMAND_MAP.get(vendor, DEFAULT_COMMAND)
+            body = json.dumps(
+                {"device_name": current_device or "", "command": command},
+                ensure_ascii=False,
+            )
+            return {"vendor_info": {"vendor_id": vendor}, "current_command": body}
+      sandboxed: true
 
   # 7. 下发命令（内置 HTTPNode，body_template 整包渲染 current_command）
   - name: command_exec
@@ -169,15 +160,24 @@ nodes:
       method: POST
       headers:
         Content-Type: application/json
-        Authorization: 'Bearer {access_token}'
-      body_template: '{current_command}'
+        Authorization: 'Bearer {extract_token_result.access_token}'
+      body_template: '{pick_vendor_result.current_command}'
 
-  # 8. 正则解析接口状态 + 设置循环标记（忠实移植源码 _IFACE_PATTERN 三件套）
+  # 8. 正则解析接口状态 + 设置循环标记（手动累积检查结果）
   - name: parse_result
     type: python
     config:
+      inputs:
+        raw_output: command_exec_result.response.result
+        interface_name: prepare_check_result.current_interface
+        prev_checks: parse_result_result.accumulated_checks
+        vendor: pick_vendor_result.vendor_info.vendor_id
+        current_device: prepare_check_result.current_device
+        current_down_time: prepare_check_result.current_down_time
+        prev_remaining: parse_result_result.remaining_alerts
       code: |
         import re
+
         IFACE_PATTERN = re.compile(
             r"^(\S+)\s+(\*?down|up)\s+(down|up(?:\(s\))?)\s+(\S+)\s+(\S+)\s*(.*)$",
             re.MULTILINE,
@@ -189,7 +189,7 @@ nodes:
 
         def find_iface_status(raw_output, interface_name):
             target = extract_iface_number(interface_name)
-            for match in IFACE_PATTERN.finditer(raw_output):
+            for match in IFACE_PATTERN.finditer(raw_output or ""):
                 iface = match.group(1)
                 if iface == interface_name or extract_iface_number(iface) == target:
                     physical, protocol = match.group(2), match.group(3)
@@ -203,34 +203,38 @@ nodes:
                     return status
             return None
 
-        response = (state.get("command_exec_result") or {}).get("response") or {}
-        raw_output = response.get("result", "")
-        interface_name = state.get("current_interface", "")
-        check = []
-        status = find_iface_status(raw_output, interface_name)
-        if status:
-            vendor = (state.get("vendor_info") or {}).get("vendor_id", "")
-            check.append(
-                f"查看 {state.get('current_device', '')} 的 {interface_name} 接口的状态: {status}, "
-                f"设备厂商: {vendor or '未知'}, 告警down时间: {state.get('current_down_time', '')}"
-            )
-        has_next = "true" if state.get("remaining_alerts") else "false"
-        return {"check_result": check, "has_next": has_next}
+        def main(raw_output, interface_name, prev_checks, vendor, current_device, current_down_time, prev_remaining):
+            check = list(prev_checks or [])
+            status = find_iface_status(raw_output, interface_name or "")
+            if status:
+                check.append(
+                    f"查看 {current_device or ''} 的 {interface_name or ''} 接口的状态: {status}, "
+                    f"设备厂商: {vendor or '未知'}, 告警down时间: {current_down_time or ''}"
+                )
+            has_next = "true" if prev_remaining else "false"
+            return {"accumulated_checks": check, "has_next": has_next}
+      sandboxed: true
+      state_keys:
+        - has_next
 
   # 9. 汇总检查结果为 LLM messages（空则源码兜底文案）
   - name: prep
     type: python
     config:
+      inputs:
+        accumulated: parse_result_result.accumulated_checks
       code: |
-        results = state.get("check_result") or []
-        if results:
-            lines = ["## Interface Alert Inspection Results", ""]
-            for i, summary in enumerate(results, 1):
-                lines.append(f"{i}. {summary}")
-            context = "\n".join(lines)
-        else:
-            context = "No interface inspection results available."
-        return {"messages": [{"role": "user", "content": context}]}
+        def main(accumulated):
+            results = accumulated or []
+            if results:
+                lines = ["## Interface Alert Inspection Results", ""]
+                for i, summary in enumerate(results, 1):
+                    lines.append(f"{i}. {summary}")
+                context = "\n".join(lines)
+            else:
+                context = "No interface inspection results available."
+            return {"messages": [{"role": "user", "content": context}]}
+      sandboxed: true
 
   # 10. LLM 汇总（内置 LLM 节点；key/base_url 走 env：OPENAI_API_KEY / OPENAI_BASE_URL）
   - name: llm_summary
@@ -258,10 +262,13 @@ nodes:
 
         Respond in Chinese. Output only the two markdown sections above, with no extra commentary.
 
-  # 11. 固定报告头 + 故障判定 + 拼 LLM 正文（忠实移植源码 _detect_fault / _build_report_header）
+  # 11. 固定报告头 + 故障判定 + 拼 LLM 正文
   - name: report
     type: python
     config:
+      inputs:
+        accumulated: parse_result_result.accumulated_checks
+        llm_response: llm_summary_result.response
       code: |
         import random
         import re
@@ -280,23 +287,24 @@ nodes:
                     return True
             return False
 
-        check_result = state.get("check_result") or []
-        has_fault = detect_fault(check_result)
-        report_id = f"RP-{random.randint(10000000, 99999999)}"
-        report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        overall = "⚠️ 异常检测 (Fault Detected)" if has_fault else "✅ 正常 (Normal)"
-        header = (
-            "# 网络智能巡检报告\n\n"
-            "| 项目 | 内容 |\n"
-            "|------|------|\n"
-            f"| 报告编号 | {report_id} |\n"
-            f"| 生成时间 | {report_time} |\n"
-            "| 巡检单位 | 智能运维中心 (AIOps Center) |\n"
-            f"| 整体状态 | {overall} |\n\n"
-            f"## 1. 巡检综述\n\n{INSPECTION_SUMMARY}\n"
-        )
-        llm_body = ((state.get("llm_summary_result") or {}).get("response") or "").strip()
-        return {"report": f"{header}\n{llm_body}\n"}
+        def main(accumulated, llm_response):
+            check_result = accumulated or []
+            has_fault = detect_fault(check_result)
+            report_id = f"RP-{random.randint(10000000, 99999999)}"
+            report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            overall = "⚠️ 异常检测 (Fault Detected)" if has_fault else "✅ 正常 (Normal)"
+            header = (
+                "# 网络智能巡检报告\n\n"
+                "| 项目 | 内容 |\n"
+                "|------|------|\n"
+                f"| 报告编号 | {report_id} |\n"
+                f"| 生成时间 | {report_time} |\n"
+                "| 巡检单位 | 智能运维中心 (AIOps Center) |\n"
+                f"| 整体状态 | {overall} |\n\n"
+                f"## 1. 巡检综述\n\n{INSPECTION_SUMMARY}\n"
+            )
+            return {"report": f"{header}\n{(llm_response or '').strip()}\n"}
+      sandboxed: true
 
 edges:
   - source: get_token
@@ -308,10 +316,10 @@ edges:
   # 循环入口分流：有告警进设备检查；零告警短路到 prep（S7 等值/真值条件）
   - source: prepare_check
     target: pe_info
-    condition: 'current_device'
+    condition: 'prepare_check_result.current_device'
   - source: prepare_check
     target: prep
-    condition: "current_device == ''"
+    condition: "prepare_check_result.current_device == ''"
   - source: pe_info
     target: pick_vendor
   - source: pick_vendor
