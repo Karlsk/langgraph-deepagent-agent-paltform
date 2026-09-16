@@ -35,9 +35,10 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
     max_retries: 0,
     retry_base_delay: 1.0,
   },
-  // 只有 code：entry 无法沙箱化、sandboxed 由后端强制，两者都不进提交体（S18 / §5.1）
+  // code + inputs：inputs 声明变量名 → state dot-path 映射，代码用 def main(...) 接收（Dify 风格）
   python: {
     code: '',
+    inputs: {},
   },
   // 被引用工作流的存在性是运行期检查（S18），故 workflow_id 允许先留空、后保存
   subworkflow: {

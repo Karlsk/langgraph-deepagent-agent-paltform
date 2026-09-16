@@ -36,8 +36,8 @@ describe('NodePalette 节点面板', () => {
     expect(types).toEqual(['llm', 'http', 'python', 'subworkflow'])
   })
 
-  it('DEFAULT_CONFIGS.python 只含 code，不含 entry / sandboxed（§5.1）', () => {
-    expect(Object.keys(DEFAULT_CONFIGS.python!)).toEqual(['code'])
+  it('DEFAULT_CONFIGS.python 含 code + inputs，不含 entry / sandboxed（§5.1 + Dify-style inputs）', () => {
+    expect(Object.keys(DEFAULT_CONFIGS.python!).sort()).toEqual(['code', 'inputs'])
     expect(DEFAULT_CONFIGS.python).not.toHaveProperty('entry')
     expect(DEFAULT_CONFIGS.python).not.toHaveProperty('sandboxed')
   })

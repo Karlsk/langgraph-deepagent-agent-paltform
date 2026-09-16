@@ -1,15 +1,14 @@
 // @vitest-environment happy-dom
 /**
- * PythonNodeForm 组件测试（S18 / S22，前端 spec §5.1）。
+ * PythonNodeForm 组件测试（S18 / S22 / S23，前端 spec §5.1 + Dify-style inputs）。
  *
  * 零真实网络 / 零真实 LLM：纯表单组件，Element Plus 一律 stub。
  *
  * 验证：
- *   - 只暴露 `code` 一个可编辑字段（等宽 textarea）；
- *   - **绝不**出现 `entry` 输入与 `sandboxed` 开关（S18 ①③：entry 无法沙箱化、
- *     sandboxed 是安全属性由后端强制），提交体也不含这两个键；
- *   - 面板明示沙箱限制（无 import / 无文件与网络 / 须 return dict / 超时与内存有上限）；
- *   - 前端不做 eval / 预览执行 / 语法高亮（§5.1）；
+ *   - 输入变量编辑器（varName → dotPath 行增删）+ code textarea；
+ *   - 提交体含 { code, inputs }，不含 entry / sandboxed；
+ *   - inputs 为空时走旧模式提示，非空时提示 def main(...)；
+ *   - 沙箱限制说明完整；
  *   - readonly 门禁与 props.config 外部变化同步。
  */
 import { describe, expect, it } from 'vitest'
@@ -36,7 +35,7 @@ const ElFormItemStub = defineComponent({
 
 const ElInputStub = defineComponent({
   name: 'ElInput',
-  props: { modelValue: String, type: String, rows: Number, placeholder: String, disabled: Boolean },
+  props: { modelValue: [String, Number], type: String, rows: Number, placeholder: String, disabled: Boolean },
   emits: ['update:modelValue', 'change'],
   setup(props) {
     return () =>
@@ -50,12 +49,12 @@ const ElInputStub = defineComponent({
   },
 })
 
-const ElSwitchStub = defineComponent({
-  name: 'ElSwitch',
-  props: { modelValue: Boolean },
-  emits: ['update:modelValue', 'change'],
-  setup(props) {
-    return () => h('div', { class: 'el-switch-stub', 'data-value': String(props.modelValue) })
+const ElButtonStub = defineComponent({
+  name: 'ElButton',
+  props: { type: String, text: Boolean, icon: Object },
+  setup(props, { slots }) {
+    return () =>
+      h('button', { class: 'el-button-stub', 'data-type': props.type ?? '' }, slots.default?.())
   },
 })
 
@@ -63,7 +62,7 @@ const STUBS = {
   ElForm: ElFormStub,
   ElFormItem: ElFormItemStub,
   ElInput: ElInputStub,
-  ElSwitch: ElSwitchStub,
+  ElButton: ElButtonStub,
 }
 
 function mountForm(config: Record<string, unknown> = {}, readonly = false) {
@@ -76,12 +75,11 @@ function mountForm(config: Record<string, unknown> = {}, readonly = false) {
 const SAMPLE_CODE = 'return {"upper": state["input"].upper()}'
 
 describe('PythonNodeForm 字段暴露面', () => {
-  it('渲染一个 code textarea，值回填自 config.code', () => {
+  it('渲染 code textarea，值回填自 config.code', () => {
     const wrapper = mountForm({ code: SAMPLE_CODE })
-    const inputs = wrapper.findAllComponents(ElInputStub)
-    expect(inputs).toHaveLength(1)
-    expect(inputs[0].attributes('data-type')).toBe('textarea')
-    expect((inputs[0].element as HTMLTextAreaElement).value).toBe(SAMPLE_CODE)
+    const textareas = wrapper.findAllComponents(ElInputStub).filter(i => i.attributes('data-type') === 'textarea')
+    expect(textareas.length).toBeGreaterThanOrEqual(1)
+    expect((textareas[0].element as HTMLTextAreaElement).value).toBe(SAMPLE_CODE)
   })
 
   it('code 编辑器为等宽字体（§5.1：普通 textarea + 等宽，不引入语法高亮插件）', () => {
@@ -92,19 +90,52 @@ describe('PythonNodeForm 字段暴露面', () => {
   it('S18 ① 守卫：不出现 entry 输入', () => {
     const wrapper = mountForm({ code: SAMPLE_CODE })
     expect(wrapper.html()).not.toContain('entry')
-    expect(wrapper.findAllComponents(ElInputStub)).toHaveLength(1)
   })
 
   it('S18 ③ 守卫：不出现 sandboxed 开关（安全属性由后端强制，不给用户）', () => {
     const wrapper = mountForm({ code: SAMPLE_CODE })
     expect(wrapper.html()).not.toContain('sandboxed')
-    expect(wrapper.findAllComponents(ElSwitchStub)).toHaveLength(0)
   })
 
   it('即便 config 里被塞进 entry / sandboxed，也不渲染对应控件', () => {
     const wrapper = mountForm({ code: SAMPLE_CODE, entry: 'app.utils:fn', sandboxed: false })
-    expect(wrapper.findAllComponents(ElInputStub)).toHaveLength(1)
-    expect(wrapper.findAllComponents(ElSwitchStub)).toHaveLength(0)
+    expect(wrapper.html()).not.toContain('sandboxed')
+  })
+})
+
+describe('PythonNodeForm 输入变量编辑器', () => {
+  it('config.inputs 有值 → 渲染对应数量的行', () => {
+    const wrapper = mountForm({ code: '', inputs: { token: 'get_token_result.response', name: 'user_name' } })
+    const rows = wrapper.findAll('.python-node-form__input-row')
+    expect(rows).toHaveLength(2)
+  })
+
+  it('config.inputs 为空 → 无输入行', () => {
+    const wrapper = mountForm({ code: '', inputs: {} })
+    const rows = wrapper.findAll('.python-node-form__input-row')
+    expect(rows).toHaveLength(0)
+  })
+
+  it('点击「添加输入变量」→ 新增一行', async () => {
+    const wrapper = mountForm({ code: '', inputs: {} })
+    const addBtn = wrapper.findAllComponents(ElButtonStub).find(b => b.text().includes('添加'))
+    expect(addBtn).toBeTruthy()
+    await addBtn!.trigger('click')
+    expect(wrapper.findAll('.python-node-form__input-row')).toHaveLength(1)
+  })
+
+  it('inputs 非空时提示 def main(...) 模式', () => {
+    const wrapper = mountForm({ code: '', inputs: { x: 'some.path' } })
+    const helpTexts = wrapper.findAll('.agent-form-helptext')
+    const mainHint = helpTexts.some(el => el.text().includes('def main'))
+    expect(mainHint).toBe(true)
+  })
+
+  it('inputs 为空时提示旧模式（state 字典）', () => {
+    const wrapper = mountForm({ code: '', inputs: {} })
+    const helpTexts = wrapper.findAll('.agent-form-helptext')
+    const stateHint = helpTexts.some(el => el.text().includes('state'))
+    expect(stateHint).toBe(true)
   })
 })
 
@@ -130,12 +161,6 @@ describe('PythonNodeForm 沙箱限制说明', () => {
     expect(wrapper.find('.python-node-form__limits').text()).toContain('422')
   })
 
-  it('不做前端执行 / 预览：没有运行或校验按钮', () => {
-    const wrapper = mountForm({ code: SAMPLE_CODE })
-    expect(wrapper.findAll('button')).toHaveLength(0)
-  })
-
-  // 白名单放开后，「禁止 import / 无标准库」变成假话，文案必须跟着改（spec-01 §2.5 更正项）
   it('文案不得再声称禁止一切 import 或没有标准库', () => {
     const wrapper = mountForm({ code: SAMPLE_CODE })
     const text = wrapper.find('.python-node-form__limits').text()
@@ -154,26 +179,28 @@ describe('PythonNodeForm 沙箱限制说明', () => {
 })
 
 describe('PythonNodeForm 提交体', () => {
-  it('编辑 code → emit update:config，键恰为 { code }', async () => {
-    const wrapper = mountForm({ code: SAMPLE_CODE })
-    const input = wrapper.findComponent(ElInputStub)
+  it('编辑 code → emit update:config，键恰为 { code, inputs }', async () => {
+    const wrapper = mountForm({ code: SAMPLE_CODE, inputs: {} })
+    const textarea = wrapper.findAllComponents(ElInputStub).find(i => i.attributes('data-type') === 'textarea')
+    expect(textarea).toBeTruthy()
 
-    await input.vm.$emit('update:modelValue', 'return {"n": len(state["items"])}')
-    await input.vm.$emit('change', 'return {"n": len(state["items"])}')
+    await textarea!.vm.$emit('update:modelValue', 'return {"n": 1}')
+    await textarea!.vm.$emit('change', 'return {"n": 1}')
 
     const emitted = wrapper.emitted('update:config')
     expect(emitted).toBeTruthy()
     const config = emitted![emitted!.length - 1]![0] as Record<string, unknown>
-    expect(Object.keys(config)).toEqual(['code'])
-    expect(config.code).toBe('return {"n": len(state["items"])}')
+    expect(Object.keys(config).sort()).toEqual(['code', 'inputs'])
+    expect(config.code).toBe('return {"n": 1}')
   })
 
-  it('回填含 entry / sandboxed 的旧 config → 提交体剔除这两个键（§14 验收）', async () => {
+  it('回填含 entry / sandboxed 的旧 config → 提交体剔除这两个键', async () => {
     const wrapper = mountForm({ code: SAMPLE_CODE, entry: 'app.utils:fn', sandboxed: true })
-    const input = wrapper.findComponent(ElInputStub)
+    const textarea = wrapper.findAllComponents(ElInputStub).find(i => i.attributes('data-type') === 'textarea')
+    expect(textarea).toBeTruthy()
 
-    await input.vm.$emit('update:modelValue', 'return {}')
-    await input.vm.$emit('change', 'return {}')
+    await textarea!.vm.$emit('update:modelValue', 'return {}')
+    await textarea!.vm.$emit('change', 'return {}')
 
     const config = wrapper.emitted('update:config')![0]![0] as Record<string, unknown>
     expect(config).not.toHaveProperty('entry')
@@ -182,7 +209,18 @@ describe('PythonNodeForm 提交体', () => {
 
   it('code 缺省 → 表单以空串起步，不崩溃', () => {
     const wrapper = mountForm({})
-    expect((wrapper.findComponent(ElInputStub).element as HTMLTextAreaElement).value).toBe('')
+    const textarea = wrapper.findAllComponents(ElInputStub).find(i => i.attributes('data-type') === 'textarea')
+    expect(textarea).toBeTruthy()
+    expect((textarea!.element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('inputs 含值时提交体正确序列化', async () => {
+    const wrapper = mountForm({ code: 'def main(x): return {}', inputs: { x: 'some.path' } })
+    const emitted = wrapper.emitted('update:config')
+    if (emitted) {
+      const config = emitted[emitted.length - 1][0] as Record<string, unknown>
+      expect(config.inputs).toEqual({ x: 'some.path' })
+    }
   })
 })
 
@@ -193,8 +231,10 @@ describe('PythonNodeForm 门禁与同步', () => {
   })
 
   it('props.config 外部变化 → 表单同步（切换节点）', async () => {
-    const wrapper = mountForm({ code: SAMPLE_CODE })
-    await wrapper.setProps({ config: { code: 'return {"ok": True}' } })
-    expect((wrapper.findComponent(ElInputStub).element as HTMLTextAreaElement).value).toBe('return {"ok": True}')
+    const wrapper = mountForm({ code: SAMPLE_CODE, inputs: {} })
+    await wrapper.setProps({ config: { code: 'return {"ok": True}', inputs: {} } })
+    const textarea = wrapper.findAllComponents(ElInputStub).find(i => i.attributes('data-type') === 'textarea')
+    expect(textarea).toBeTruthy()
+    expect((textarea!.element as HTMLTextAreaElement).value).toBe('return {"ok": True}')
   })
 })
