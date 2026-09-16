@@ -1021,7 +1021,8 @@ def test_delete_workflow_calls_delete_definition_yaml(client: TestClient) -> Non
     ):
         mock_delete.return_value = True
         client.delete("/workflows/echo_demo")
-    mock_delete.assert_called_once_with("echo_demo")
+    mock_delete.assert_called_once()
+    assert mock_delete.call_args.args == ("echo_demo",)
 
 
 def test_delete_workflow_unknown_id_returns_404(client: TestClient) -> None:

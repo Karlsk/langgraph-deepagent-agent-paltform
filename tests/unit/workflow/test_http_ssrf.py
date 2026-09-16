@@ -392,7 +392,7 @@ def client(tmp_path, monkeypatch):
     from unittest.mock import MagicMock
 
     # Mock save_definition_yaml 写入 tmp_path 而非共享的 user 目录，防止测试污染
-    def mock_save_definition(definition):
+    def mock_save_definition(definition, *, session=None):
         import yaml
         path = tmp_path / f"{definition.workflow_id}.yaml"
         with open(path, "w", encoding="utf-8") as f:

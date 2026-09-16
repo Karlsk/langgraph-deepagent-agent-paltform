@@ -107,6 +107,8 @@ class _RunnerAwareNode(FakeNode):
 
     def __init__(self, *args: object, workflow_runner: object = None, **kwargs: object) -> None:
         _RunnerAwareNode.received_runner = workflow_runner
+        kwargs.pop("tool_resolver", None)
+        kwargs.pop("chat_model_factory", None)
         super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType] — test double wiring
 
 
@@ -123,6 +125,8 @@ class _KwargsNode(FakeNode):
         _KwargsNode.seen = dict(kwargs)
         # BaseNode.__init__ has no such parameter, so a real **kwargs plugin must consume it itself
         kwargs.pop("workflow_runner", None)
+        kwargs.pop("tool_resolver", None)
+        kwargs.pop("chat_model_factory", None)
         super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType] — test double wiring
 
 

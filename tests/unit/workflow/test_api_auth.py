@@ -17,7 +17,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session as DBSession
+from sqlmodel import SQLModel, create_engine
 
+from app.api.v1.agent_assets_common import get_db_session
 from app.workflow import api as workflow_api
 from app.workflow.cli import build_registry
 from tests.unit.workflow.test_cli import _ECHO_YAML
@@ -38,11 +42,24 @@ def _make_user(user_id: int, username: str | None) -> MagicMock:
 def client(tmp_path: Path) -> Generator[TestClient, None, None]:
     """Minimal FastAPI app hosting the workflow router with auth dependencies."""
     (tmp_path / "echo_demo.yaml").write_text(_ECHO_YAML, encoding="utf-8")
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def _get_session() -> Generator[DBSession, None, None]:
+        with DBSession(engine) as session:
+            yield session
+
     app = FastAPI()
     app.state.limiter = workflow_api.limiter
     app.state.workflow_registry = build_registry(tmp_path)
     app.state.workflow_directory = tmp_path
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.dependency_overrides[get_db_session] = _get_session
     app.include_router(workflow_api.router)
     with TestClient(app) as test_client:
         yield test_client
