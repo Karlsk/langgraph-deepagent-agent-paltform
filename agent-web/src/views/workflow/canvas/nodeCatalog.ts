@@ -11,6 +11,7 @@ export const PALETTE_ITEMS: PaletteItem[] = [
   { type: 'http', label: 'HTTP 节点', icon: '🌐' },
   { type: 'python', label: 'Python 节点', icon: '🐍' },
   { type: 'subworkflow', label: '子工作流节点', icon: '🧩' },
+  { type: 'react', label: 'React Agent 节点', icon: '🔄' },
 ]
 
 export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
@@ -45,6 +46,14 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, unknown>> = {
     workflow_id: '',
     input_map: {},
     inherit_input: false,
+  },
+  react: {
+    provider_ref: '',
+    tools: [],
+    mcp_servers: [],
+    system_prompt: '',
+    max_iterations: 10,
+    inputs: {},
   },
 }
 

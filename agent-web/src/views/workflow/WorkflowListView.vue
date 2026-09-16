@@ -67,6 +67,10 @@ function handleHistory(row: WorkflowSummary): void {
   historyDialogVisible.value = true
 }
 
+function handleCreate(): void {
+  void router.push({ name: 'workflow-new-design' })
+}
+
 function handleDelete(row: WorkflowSummary): void {
   const confirmAndDelete = useConfirm(
     `确定删除工作流「${row.workflow_id}」吗？此操作不可恢复。`,
@@ -86,6 +90,7 @@ function handleDelete(row: WorkflowSummary): void {
         <h1 class="page-view__title">工作流管理</h1>
         <p class="page-view__desc">查看和管理已注册的声明式工作流。</p>
       </div>
+      <el-button type="primary" @click="handleCreate">新建工作流</el-button>
     </header>
 
     <section class="content-card page-view__body">

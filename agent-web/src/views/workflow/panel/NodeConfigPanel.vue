@@ -6,6 +6,7 @@ import LlmNodeForm from './LlmNodeForm.vue'
 import HttpNodeForm from './HttpNodeForm.vue'
 import PythonNodeForm from './PythonNodeForm.vue'
 import SubWorkflowNodeForm from './SubWorkflowNodeForm.vue'
+import ReactNodeForm from './ReactNodeForm.vue'
 
 interface Props {
   node: Node | null
@@ -102,6 +103,12 @@ function getNodeConfig(): Record<string, unknown> {
           :config="getNodeConfig()"
           :readonly="props.readonly"
           :exclude-workflow-id="props.workflowId"
+          @update:config="onConfigUpdate"
+        />
+        <ReactNodeForm
+          v-else-if="getNodeType() === 'react'"
+          :config="getNodeConfig()"
+          :readonly="props.readonly"
           @update:config="onConfigUpdate"
         />
       </div>

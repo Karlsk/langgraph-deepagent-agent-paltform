@@ -13,7 +13,7 @@ export interface GraphValidationError {
   edgeId?: string
 }
 
-const VALID_NODE_TYPES = new Set<WorkflowNodeType>(['llm', 'http', 'python', 'subworkflow'])
+const VALID_NODE_TYPES = new Set<WorkflowNodeType>(['llm', 'http', 'python', 'subworkflow', 'react'])
 const END_NODE_ID = 'END'
 const GRID_SPACING = 200
 
@@ -112,7 +112,7 @@ export function validateGraph(def: WorkflowDefinitionDTO): GraphValidationError[
     if (!VALID_NODE_TYPES.has(node.type)) {
       errors.push({
         field: 'nodes',
-        message: `Invalid node type "${node.type}". Must be one of: llm, http, python, subworkflow.`,
+        message: `Invalid node type "${node.type}". Must be one of: llm, http, python, subworkflow, react.`,
         nodeId: node.name,
       })
     }

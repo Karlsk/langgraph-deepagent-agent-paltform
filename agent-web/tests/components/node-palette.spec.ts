@@ -25,15 +25,15 @@ function mountPalette(extraProps: Record<string, unknown> = {}) {
 }
 
 describe('NodePalette 节点面板', () => {
-  it('渲染恰好 4 个可拖项（llm / http / python / subworkflow）', () => {
+  it('渲染恰好 5 个可拖项（llm / http / python / subworkflow / react）', () => {
     const wrapper = mountPalette()
     const items = wrapper.findAll('.node-palette__item')
-    expect(items).toHaveLength(4)
+    expect(items).toHaveLength(5)
   })
 
-  it('S18 白名单：palette 项为 llm / http / python / subworkflow', () => {
+  it('S18 白名单：palette 项为 llm / http / python / subworkflow / react', () => {
     const types = PALETTE_ITEMS.map(item => item.type)
-    expect(types).toEqual(['llm', 'http', 'python', 'subworkflow'])
+    expect(types).toEqual(['llm', 'http', 'python', 'subworkflow', 'react'])
   })
 
   it('DEFAULT_CONFIGS.python 含 code + inputs，不含 entry / sandboxed（§5.1 + Dify-style inputs）', () => {
