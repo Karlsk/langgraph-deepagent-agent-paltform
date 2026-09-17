@@ -36,6 +36,8 @@ export interface AgentAppRow {
   name: string
   system_prompt: string
   allowed_tools: string[] | null
+  /** 关联的 MCP server 名称列表（批量挂载这些 server 的全部工具） */
+  mcp_server_names: string[]
   model: string | null
   skill_names: string[]
   subagent_names: string[]
@@ -72,6 +74,8 @@ export interface AgentAppCreatePayload {
   /** 绑定工作流 id，engine='workflow' 时必填 */
   workflow_id?: string | null
   allowed_tools?: string[] | null
+  /** 关联的 MCP server 名称列表；缺省 []（不关联任何 MCP server） */
+  mcp_server_names?: string[]
   model?: string | null
   skill_names?: string[]
   subagent_names?: string[]
@@ -85,6 +89,7 @@ export interface AgentAppCreatePayload {
  * null 语义（后端校验）：
  * - `skill_names` / `subagent_names` 显式传 `null` 会被 422 拒绝
  *   （"must not be null; pass an empty list to clear it"）——清空必须传 `[]`；
+ * - `mcp_server_names` 同 `skill_names` 语义，显式 `null` 被 422 拒绝，清空传 `[]`；
  * - `allowed_tools: null` 合法（重置为引擎默认）；
  * - `workflow_id` 仅 workflow 引擎应用可改绑；
  * - 空 payload（全部省略）会被 422 拒绝（"nothing to update"）。
@@ -94,6 +99,8 @@ export interface AgentAppPatchPayload {
   /** 改绑工作流 id（仅 engine='workflow' 应用有效） */
   workflow_id?: string | null
   allowed_tools?: string[] | null
+  /** 关联的 MCP server 名称列表；显式 `null` 被 422 拒绝，清空传 `[]` */
+  mcp_server_names?: string[]
   model?: string | null
   skill_names?: string[]
   subagent_names?: string[]

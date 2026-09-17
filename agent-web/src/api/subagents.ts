@@ -32,6 +32,8 @@ export interface SubAgentRow {
   system_prompt: string
   /** 允许使用的工具名列表（null 表示继承父 AgentApp）；元素为 builtin 裸名或 `{server}__{tool}` 命名空间名 */
   allowed_tools: string[] | null
+  /** 关联的 MCP server 名称列表（批量挂载这些 server 的全部工具） */
+  mcp_server_names: string[]
   /** `provider/model` 引用；null → 运行时回退到 `default/default` */
   model: string | null
   max_turns: number | null
@@ -55,6 +57,8 @@ export interface SubAgentCreatePayload {
   when_to_use: string
   system_prompt: string
   allowed_tools?: string[] | null
+  /** 关联的 MCP server 名称列表；不传时后端默认 `[]` */
+  mcp_server_names?: string[]
   model?: string | null
   max_turns?: number | null
   /**
@@ -70,6 +74,8 @@ export interface SubAgentPatchPayload {
   when_to_use?: string
   system_prompt?: string
   allowed_tools?: string[] | null
+  /** 关联的 MCP server 名称列表；`null` 视为未提供；`[]` 显式清空 */
+  mcp_server_names?: string[]
   model?: string | null
   max_turns?: number | null
   /**
