@@ -62,6 +62,7 @@ const ROWS: AgentAppRow[] = [
     subagent_names: ['search-helper'],
     interrupt_on: {},
     engine: 'deepagents',
+    workflow_id: null,
     status: 'published',
     published_hash: 'ph-1',
     agent_dir: 'agents/customer-support',
@@ -80,6 +81,7 @@ const ROWS: AgentAppRow[] = [
     subagent_names: [],
     interrupt_on: {},
     engine: 'deepagents',
+    workflow_id: null,
     status: 'draft',
     published_hash: null,
     agent_dir: null,
@@ -98,6 +100,7 @@ const ROWS: AgentAppRow[] = [
     subagent_names: [],
     interrupt_on: {},
     engine: 'deepagents',
+    workflow_id: null,
     status: 'published',
     published_hash: 'ph-3',
     agent_dir: 'agents/data-runner',
@@ -183,6 +186,15 @@ const { subagentsMock } = vi.hoisted(() => ({
 vi.mock('@/api/subagents', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/subagents')>()
   return { ...actual, listSubAgents: subagentsMock.listSubAgents }
+})
+
+/** workflow.ts 的 listWorkflows mock（engine='workflow' 时「绑定工作流」下拉来源） */
+const { workflowMock } = vi.hoisted(() => ({
+  workflowMock: { listWorkflows: vi.fn() },
+}))
+vi.mock('@/api/workflow', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/workflow')>()
+  return { ...actual, listWorkflows: workflowMock.listWorkflows }
 })
 
 const ROWS_KEY = Symbol('agent-table-rows')
@@ -282,8 +294,9 @@ const ElFormStub = defineComponent({
 const ElFormItemStub = defineComponent({
   name: 'ElFormItem',
   props: { label: String, prop: String },
-  setup(_, { slots }) {
-    return () => h('div', { class: 'el-form-item-stub' }, slots.default?.())
+  setup(props, { slots }) {
+    return () =>
+      h('div', { class: 'el-form-item-stub', 'data-prop': props.prop ?? '' }, slots.default?.())
   },
 })
 
@@ -356,6 +369,7 @@ const ElSelectStub = defineComponent({
     multiple: { type: Boolean, default: false },
     placeholder: String,
     loading: { type: Boolean, default: false },
+    disabled: { type: Boolean, default: false },
   },
   emits: ['update:modelValue'],
   setup(props, { slots }) {
@@ -367,7 +381,12 @@ const ElSelectStub = defineComponent({
           : ''
       return h(
         'div',
-        { class: 'el-select-stub', 'data-multiple': String(props.multiple), 'data-value': display },
+        {
+          class: 'el-select-stub',
+          'data-multiple': String(props.multiple),
+          'data-disabled': props.disabled ? 'true' : 'false',
+          'data-value': display,
+        },
         slots.default ? slots.default() : undefined,
       )
     }
@@ -491,13 +510,14 @@ beforeEach(() => {
       ({
         id: 99,
         name: payload.name,
-        system_prompt: payload.system_prompt,
+        system_prompt: payload.system_prompt ?? '',
         allowed_tools: payload.allowed_tools ?? null,
         model: payload.model ?? null,
         skill_names: payload.skill_names ?? [],
         subagent_names: payload.subagent_names ?? [],
         interrupt_on: {},
-        engine: 'deepagents',
+        engine: payload.engine ?? 'deepagents',
+        workflow_id: payload.workflow_id ?? null,
         status: 'draft',
         published_hash: null,
         agent_dir: null,
@@ -537,6 +557,10 @@ beforeEach(() => {
   ])
   assetsMock.listSkills.mockResolvedValue(SKILL_ROWS.map((row) => ({ ...row })))
   subagentsMock.listSubAgents.mockResolvedValue(SUBAGENT_ROWS.map((row) => ({ ...row })))
+  workflowMock.listWorkflows.mockResolvedValue([
+    { workflow_id: 'wf-echo', node_count: 1, entry_point: 'start', description: '回声' },
+    { workflow_id: 'wf-support', node_count: 3, entry_point: 'start', description: '客服' },
+  ])
 })
 
 describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布）', () => {
@@ -773,5 +797,137 @@ describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布�
     expect(optionValues).toContain('demo-stdio__add')
     expect(optionValues).toContain('demo-stdio__greet')
     expect(optionValues.join('\n')).not.toContain('demo-stdio__demo-stdio__')
+  })
+})
+
+/** 当前弹窗内所有 el-form-item 的 prop 列表（判断字段显隐） */
+function formItemProps(wrapper: VueWrapper): string[] {
+  return wrapper.findAll('.el-form-item-stub').map((el) => el.attributes('data-prop') ?? '')
+}
+
+describe('AgentList 引擎选择器（chatflow / engine=workflow）', () => {
+  it('创建态默认 deepagents：渲染引擎选择器，不显示绑定工作流字段', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+    await findButton(wrapper, '新建 Agent').trigger('click')
+    await flushPromises()
+
+    const props = formItemProps(wrapper)
+    expect(props).toContain('engine')
+    expect(props).not.toContain('workflow_id')
+    // deepagents 专属字段仍显示
+    expect(props).toContain('system_prompt')
+    expect(props).toContain('skill_names')
+
+    // 创建态引擎选择器可编辑
+    const engineSelect = wrapper.find('.el-form-item-stub[data-prop="engine"] .el-select-stub')
+    expect(engineSelect.attributes('data-disabled')).toBe('false')
+  })
+
+  it('切换到 workflow 引擎：显示绑定工作流下拉，隐藏 deepagents 字段', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+    await findButton(wrapper, '新建 Agent').trigger('click')
+    await flushPromises()
+
+    const formDialog = wrapper.findComponent({ name: 'WebAgentFormDialog' })
+    const form = formDialog.vm.getForm() as Record<string, unknown>
+    form.engine = 'workflow'
+    await flushPromises()
+
+    const props = formItemProps(wrapper)
+    expect(props).toContain('workflow_id')
+    // deepagents 专属字段全部隐藏
+    expect(props).not.toContain('system_prompt')
+    expect(props).not.toContain('allowed_tools')
+    expect(props).not.toContain('model')
+    expect(props).not.toContain('skill_names')
+    expect(props).not.toContain('subagent_names')
+    expect(props).not.toContain('interrupt_on')
+
+    // 绑定工作流下拉选项来自 listWorkflows
+    const wfOptions = wrapper
+      .find('.el-form-item-stub[data-prop="workflow_id"]')
+      .findAll('.el-option-stub')
+      .map((o) => o.attributes('data-value'))
+    expect(wfOptions).toContain('wf-echo')
+    expect(wfOptions).toContain('wf-support')
+  })
+
+  it('创建 workflow 应用：payload 仅含 name/engine/workflow_id，不含 deepagents 字段', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+    await findButton(wrapper, '新建 Agent').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('input[placeholder="小写字母、数字、连字符、下划线"]').setValue('chatflow-app')
+    const formDialog = wrapper.findComponent({ name: 'WebAgentFormDialog' })
+    const form = formDialog.vm.getForm() as Record<string, unknown>
+    form.engine = 'workflow'
+    form.workflow_id = 'wf-echo'
+    await flushPromises()
+    await findButton(wrapper, '确定').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.createAgentApp).toHaveBeenCalledWith({
+      name: 'chatflow-app',
+      engine: 'workflow',
+      workflow_id: 'wf-echo',
+    })
+    const payload = apiMock.createAgentApp.mock.calls[0][0] as Record<string, unknown>
+    expect(payload).not.toHaveProperty('skill_names')
+    expect(payload).not.toHaveProperty('system_prompt')
+    expect(elMessageFn).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success', message: '已保存：chatflow-app' }),
+    )
+  })
+
+  it('编辑 workflow 应用：引擎选择器禁用（engine 创建后不可变）', async () => {
+    apiMock.listAgentAppsPage.mockImplementation(
+      async () =>
+        ({
+          items: [
+            {
+              id: 7,
+              name: 'chatflow-app',
+              system_prompt: '',
+              allowed_tools: null,
+              model: null,
+              skill_names: [],
+              subagent_names: [],
+              interrupt_on: {},
+              engine: 'workflow',
+              workflow_id: 'wf-echo',
+              status: 'published',
+              published_hash: 'ph-7',
+              agent_dir: null,
+              workspace_hash: null,
+              agent_workspace_status: 'pending',
+              version: 2,
+              created_by: 'admin',
+            },
+          ],
+          total: 1,
+          page: 1,
+          pageSize: 10,
+        }) satisfies PageResult<AgentAppRow>,
+    )
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await findRowButton(wrapper, '编辑', 0).trigger('click')
+    await flushPromises()
+
+    const engineSelect = wrapper.find('.el-form-item-stub[data-prop="engine"] .el-select-stub')
+    expect(engineSelect.attributes('data-disabled')).toBe('true')
+    expect(engineSelect.attributes('data-value')).toBe('workflow')
+
+    // 回填绑定工作流字段
+    const props = formItemProps(wrapper)
+    expect(props).toContain('workflow_id')
+    expect(props).not.toContain('system_prompt')
+    const formDialog = wrapper.findComponent({ name: 'WebAgentFormDialog' })
+    const form = formDialog.vm.getForm() as Record<string, unknown>
+    expect(form.workflow_id).toBe('wf-echo')
   })
 })

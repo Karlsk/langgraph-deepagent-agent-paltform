@@ -27,6 +27,9 @@ import type { PageQuery, PageResult } from '@/types'
 /** AgentApp 生命周期状态（后端 status 字段） */
 export type AgentAppStatus = 'draft' | 'published'
 
+/** AgentApp 引擎类型：deepagents（默认，技能型）或 workflow（绑定工作流的 chatflow） */
+export type AgentAppEngine = 'deepagents' | 'workflow'
+
 /** AgentApp 资产行（对应后端 AgentAppRead 全字段） */
 export interface AgentAppRow {
   id: number
@@ -37,7 +40,9 @@ export interface AgentAppRow {
   skill_names: string[]
   subagent_names: string[]
   interrupt_on: Record<string, boolean>
-  engine: string
+  engine: AgentAppEngine
+  /** 绑定工作流 id（仅 engine='workflow' 有意义，其余为 null） */
+  workflow_id: string | null
   status: AgentAppStatus
   published_hash: string | null
   /** 发布时打印的 Agent 层 Workspace 目录 */
@@ -52,13 +57,20 @@ export interface AgentAppRow {
 
 /**
  * AgentApp 创建 payload（POST /apps）。
- * name + system_prompt 必填；可选字段缺省：
+ * deepagents（默认）：name + system_prompt 必填；可选字段缺省：
  * allowed_tools=null（引擎默认）、model=null、skill_names=[]、
  * subagent_names=[]、interrupt_on={}。
+ * workflow：传 engine='workflow' + workflow_id（必填非空，否则后端 422），
+ * deepagents 专属字段（system_prompt/allowed_tools/model/skill_names/
+ * subagent_names/interrupt_on）忽略不发；engine 创建后不可变。
  */
 export interface AgentAppCreatePayload {
   name: string
-  system_prompt: string
+  system_prompt?: string
+  /** 引擎类型，缺省 deepagents；创建后不可变 */
+  engine?: AgentAppEngine
+  /** 绑定工作流 id，engine='workflow' 时必填 */
+  workflow_id?: string | null
   allowed_tools?: string[] | null
   model?: string | null
   skill_names?: string[]
@@ -68,16 +80,19 @@ export interface AgentAppCreatePayload {
 }
 
 /**
- * AgentApp 部分更新 payload（PATCH /apps/{app_id}，name 不可改）。
+ * AgentApp 部分更新 payload（PATCH /apps/{app_id}，name 与 engine 不可改）。
  *
  * null 语义（后端校验）：
  * - `skill_names` / `subagent_names` 显式传 `null` 会被 422 拒绝
  *   （"must not be null; pass an empty list to clear it"）——清空必须传 `[]`；
  * - `allowed_tools: null` 合法（重置为引擎默认）；
+ * - `workflow_id` 仅 workflow 引擎应用可改绑；
  * - 空 payload（全部省略）会被 422 拒绝（"nothing to update"）。
  */
 export interface AgentAppPatchPayload {
   system_prompt?: string
+  /** 改绑工作流 id（仅 engine='workflow' 应用有效） */
+  workflow_id?: string | null
   allowed_tools?: string[] | null
   model?: string | null
   skill_names?: string[]

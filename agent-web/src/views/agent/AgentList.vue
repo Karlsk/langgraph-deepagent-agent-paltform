@@ -31,6 +31,7 @@ import {
   patchAgentApp,
   publishAgentApp,
   type AgentAppCreatePayload,
+  type AgentAppEngine,
   type AgentAppPatchPayload,
   type AgentAppRow,
 } from '@/api/agentapps'
@@ -38,6 +39,7 @@ import { listToolCatalog, type ToolCatalogEntry } from '@/api/mcp'
 import { listAllProviderModels, type ModelConfigRow } from '@/api/provider'
 import { listSkills, type SkillRow } from '@/api/assets'
 import { listSubAgents, type SubAgentRow } from '@/api/subagents'
+import { listWorkflows, type WorkflowSummary } from '@/api/workflow'
 import { useConfirm } from '@/composables/useConfirm'
 import { notifySuccess } from '@/utils/notify'
 import type { PageQuery, PageResult } from '@/types'
@@ -115,6 +117,8 @@ interface NameOption {
 }
 const skillOptions = ref<NameOption[]>([])
 const subagentOptions = ref<NameOption[]>([])
+/** 绑定工作流下拉选项：取自 listWorkflows（engine='workflow' 时使用） */
+const workflowOptions = ref<NameOption[]>([])
 const optionsLoading = ref(false)
 
 /** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 */
@@ -175,7 +179,20 @@ async function loadSubAgentOptions(): Promise<void> {
   }
 }
 
-/** 一次性预加载四个选项；任一失败不影响另一项 */
+/** 拉绑定工作流下拉选项：单次失败降级为空数组 */
+async function loadWorkflowOptions(): Promise<void> {
+  try {
+    const rows = await listWorkflows()
+    workflowOptions.value = rows.map((row: WorkflowSummary) => ({
+      value: row.workflow_id,
+      label: row.description ? `${row.workflow_id}（${row.description}）` : row.workflow_id,
+    }))
+  } catch {
+    workflowOptions.value = []
+  }
+}
+
+/** 一次性预加载五个选项；任一失败不影响另一项 */
 async function loadFormOptions(): Promise<void> {
   optionsLoading.value = true
   try {
@@ -184,6 +201,7 @@ async function loadFormOptions(): Promise<void> {
       loadModelOptions(),
       loadSkillOptions(),
       loadSubAgentOptions(),
+      loadWorkflowOptions(),
     ])
   } finally {
     optionsLoading.value = false
@@ -200,6 +218,10 @@ onMounted(() => {
 
 interface AgentAppFormShape {
   name: string
+  /** 引擎类型：deepagents（技能型）/ workflow（chatflow，绑定工作流）；创建后不可变 */
+  engine: AgentAppEngine
+  /** 绑定工作流 id（仅 engine='workflow' 提交；空字符串 → 未选择） */
+  workflow_id: string
   system_prompt: string
   /** 工具命名空间列表（builtin 裸名 / mcp `{server}__{tool}`）；空数组 → null 引擎默认 */
   allowed_tools: string[]
@@ -215,6 +237,21 @@ interface AgentAppFormShape {
 
 /** WebAgentFormDialog.open() 不传 data 时为 {}，字段 optional */
 type SubmitFormShape = Partial<AgentAppFormShape>
+
+/** 创建态表单初始值（open() 不携带 data，需手动落默认 engine=deepagents） */
+function createFormDefaults(): AgentAppFormShape {
+  return {
+    name: '',
+    engine: 'deepagents',
+    workflow_id: '',
+    system_prompt: '',
+    allowed_tools: [],
+    model: '',
+    skill_names: [],
+    subagent_names: [],
+    interrupt_on: [],
+  }
+}
 
 const rules: FormRules = {
   name: [
@@ -233,6 +270,8 @@ function handleCreate(): void {
   editingId.value = null
   editingPublished.value = false
   dialogRef.value?.open()
+  // open() 不带 data → formModel 为空；落创建态默认值（engine 必须显式为 deepagents）
+  Object.assign(dialogRef.value?.getForm() ?? {}, createFormDefaults())
 }
 
 function handleEdit(row: AgentAppRow): void {
@@ -240,6 +279,8 @@ function handleEdit(row: AgentAppRow): void {
   editingPublished.value = row.status === 'published'
   dialogRef.value?.open({
     name: row.name,
+    engine: row.engine,
+    workflow_id: row.workflow_id ?? '',
     system_prompt: row.system_prompt,
     allowed_tools: row.allowed_tools ? [...row.allowed_tools] : [],
     model: row.model ?? '',
@@ -251,20 +292,32 @@ function handleEdit(row: AgentAppRow): void {
 
 /**
  * 把表单字段转为后端 payload。
- * - allowed_tools：空数组 → null（引擎默认）
- * - model：trim 后空字符串 → null
- * - skill_names / subagent_names：始终数组（空数组 = 不绑定 / 清空）
+ * - engine='workflow'（chatflow）：仅提交 {name, engine, workflow_id}，
+ *   deepagents 专属字段一律不发；patch 仅改绑 workflow_id；
+ * - engine='deepagents'：
+ *   - allowed_tools：空数组 → null（引擎默认）
+ *   - model：trim 后空字符串 → null
+ *   - skill_names / subagent_names：始终数组（空数组 = 不绑定 / 清空）
  */
 function buildPayload(form: SubmitFormShape): {
   create: AgentAppCreatePayload
   patch: AgentAppPatchPayload
 } {
+  const name = (form.name ?? '').trim()
+
+  if (form.engine === 'workflow') {
+    const workflowId = (form.workflow_id ?? '').trim()
+    return {
+      create: { name, engine: 'workflow', workflow_id: workflowId },
+      patch: { workflow_id: workflowId },
+    }
+  }
+
   const allowedTools = Array.isArray(form.allowed_tools) && form.allowed_tools.length > 0
     ? [...form.allowed_tools]
     : null
   const model = (form.model ?? '').trim()
   const modelValue = model.length > 0 ? model : null
-  const name = (form.name ?? '').trim()
   const systemPrompt = form.system_prompt ?? ''
   const skillNames = Array.isArray(form.skill_names) ? [...form.skill_names] : []
   const subagentNames = Array.isArray(form.subagent_names) ? [...form.subagent_names] : []
@@ -299,7 +352,11 @@ async function handleSubmit(data: Record<string, unknown>): Promise<void> {
   const name = (form.name ?? '').trim()
 
   // 必填字段缺失（WebAgentFormDialog.validate 已拦截，这里双保险）— 静默丢弃
-  if (!name || !form.system_prompt) {
+  if (form.engine === 'workflow') {
+    if (!name || !(form.workflow_id ?? '').trim()) {
+      return
+    }
+  } else if (!name || !form.system_prompt) {
     return
   }
 
@@ -307,7 +364,7 @@ async function handleSubmit(data: Record<string, unknown>): Promise<void> {
   try {
     const { create, patch } = buildPayload(form)
     if (editingId.value !== null) {
-      // 编辑：name 不可改；已发布应用编辑后回退 draft，需重新发布
+      // 编辑：name / engine 不可改；已发布应用编辑后回退 draft，需重新发布
       await patchAgentApp(editingId.value, patch)
     } else {
       await createAgentApp(create)
@@ -405,6 +462,14 @@ function bindingsText(row: AgentAppRow): string {
       >
         <template #name="{ row }">
           <span class="agent-name">{{ (row as AgentAppRow).name }}</span>
+          <el-tag
+            v-if="(row as AgentAppRow).engine === 'workflow'"
+            class="agent-engine-tag"
+            type="info"
+            size="small"
+          >
+            工作流
+          </el-tag>
         </template>
         <template #systemPrompt="{ row }">
           <span :title="(row as AgentAppRow).system_prompt">
@@ -464,7 +529,47 @@ function bindingsText(row: AgentAppRow): string {
             :disabled="mode === 'edit'"
           />
         </el-form-item>
-        <el-form-item label="系统提示" prop="system_prompt">
+        <el-form-item label="引擎类型" prop="engine">
+          <el-select
+            v-model="form.engine"
+            :disabled="mode === 'edit'"
+            placeholder="选择应用引擎"
+            style="width: 100%"
+          >
+            <el-option label="Agent（deepagents）" value="deepagents" />
+            <el-option label="工作流（chatflow）" value="workflow" />
+          </el-select>
+          <div class="agent-form-helptext">
+            引擎创建后不可变。工作流引擎把已注册工作流封装为可对话应用。
+          </div>
+        </el-form-item>
+        <el-form-item
+          v-if="form.engine === 'workflow'"
+          label="绑定工作流"
+          prop="workflow_id"
+        >
+          <el-select
+            v-model="form.workflow_id"
+            filterable
+            clearable
+            :loading="optionsLoading"
+            no-data-text="暂无已注册工作流（请先在 工作流管理 页创建并发布）"
+            placeholder="选择要绑定的工作流"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in workflowOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item
+          v-if="form.engine !== 'workflow'"
+          label="系统提示"
+          prop="system_prompt"
+        >
           <el-input
             v-model="form.system_prompt"
             type="textarea"
@@ -472,7 +577,7 @@ function bindingsText(row: AgentAppRow): string {
             placeholder="Agent 的角色设定与行为约束"
           />
         </el-form-item>
-        <el-form-item label="允许的工具" prop="allowed_tools">
+        <el-form-item v-if="form.engine !== 'workflow'" label="允许的工具" prop="allowed_tools">
           <el-select
             v-model="form.allowed_tools"
             multiple
@@ -499,7 +604,7 @@ function bindingsText(row: AgentAppRow): string {
             </el-option-group>
           </el-select>
         </el-form-item>
-        <el-form-item label="模型" prop="model">
+        <el-form-item v-if="form.engine !== 'workflow'" label="模型" prop="model">
           <el-select
             v-model="form.model"
             filterable
@@ -520,7 +625,7 @@ function bindingsText(row: AgentAppRow): string {
             </el-option>
           </el-select>
         </el-form-item>
-        <el-form-item label="关联技能" prop="skill_names">
+        <el-form-item v-if="form.engine !== 'workflow'" label="关联技能" prop="skill_names">
           <el-select
             v-model="form.skill_names"
             multiple
@@ -541,7 +646,7 @@ function bindingsText(row: AgentAppRow): string {
             />
           </el-select>
         </el-form-item>
-        <el-form-item label="关联子代理" prop="subagent_names">
+        <el-form-item v-if="form.engine !== 'workflow'" label="关联子代理" prop="subagent_names">
           <el-select
             v-model="form.subagent_names"
             multiple
@@ -562,7 +667,7 @@ function bindingsText(row: AgentAppRow): string {
             />
           </el-select>
         </el-form-item>
-        <el-form-item label="审批工具" prop="interrupt_on">
+        <el-form-item v-if="form.engine !== 'workflow'" label="审批工具" prop="interrupt_on">
           <el-select
             v-model="form.interrupt_on"
             multiple
@@ -601,6 +706,9 @@ function bindingsText(row: AgentAppRow): string {
 .agent-name {
   font-weight: 600;
   color: var(--color-text-primary);
+}
+.agent-engine-tag {
+  margin-left: 6px;
 }
 .agent-model {
   font-family: var(--app-font-display);
