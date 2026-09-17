@@ -139,8 +139,11 @@ def get_workflow_registry() -> WorkflowRegistry:  # None → RuntimeError
   - `__init__(*, app_cfg, graph, checkpointer, resolved_model_name)`
   - `_get_state` → `graph.aget_state(config)`
   - `_run` → `graph.ainvoke(graph_input, config)`
-  - `_stream` → `graph.astream(graph_input, config, stream_mode="messages")`，
-    仅 yield coordinator AIMessage 文本（无 subagent 计时逻辑）。
+  - `_stream` → `graph.astream(graph_input, config, stream_mode="updates")`，
+    取 chatflow 节点返回的 `AIMessage` 一次性 yield 为单个 coordinator chunk
+    （D4 单 chunk）。**订正**：原写 `stream_mode="messages"` 与 D4 自相矛盾——
+    `execute_workflow` 同步跑在 threadpool 内，内层 workflow 的 LLM token 不会
+    进入包装图的 `"messages"` 流；只有 `"updates"` 能拿到节点返回的最终 AIMessage。
   - `_history` → `state.values["messages"]`
   - `_clear` → checkpointer 删除线程（无 checkpointer → RuntimeError，同 DeepAgents）
   - **不**覆写 `_build_resume_value`（无 interrupt，基类默认即可）。
