@@ -72,6 +72,7 @@ from app.models.agent_assets import (
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.schemas import Message
 from app.services.agents import assembly, context_store
+from app.services.agents.chatflow_graph import build_chatflow_graph
 from app.services.agents.mcp_manager import load_mcp_servers
 from app.services.llm.llm_store import compute_model_config_hash, parse_model_ref
 from app.services.memory import memory_service
@@ -930,46 +931,94 @@ class DeepAgentsAppRuntime(AgentAppRuntime):
 
 
 class WorkflowAppRuntime(AgentAppRuntime):
-    """Placeholder runtime reserved for the declarative workflow engine."""
+    """Runtime executing an AgentApp backed by the declarative workflow engine.
 
-    def __init__(self, *, app_cfg: AgentApp, resolved_model_name: str | None = None) -> None:
-        """Bind the app config (no engine wiring yet).
+    A thin wrapper graph (``chatflow_graph.build_chatflow_graph``) holds the
+    ``messages`` channel + checkpointer and calls the bound workflow as a black
+    box, so this runtime mirrors ``DeepAgentsAppRuntime`` and inherits every
+    base-class cross-cutting semantic (memory, L2, metrics, compression). The
+    workflow engine has no interrupt (D6), so ``_build_resume_value`` is left
+    at its default and never exercised.
+    """
+
+    def __init__(
+        self,
+        *,
+        app_cfg: AgentApp,
+        graph: CompiledStateGraph,
+        checkpointer: BaseCheckpointSaver | None,
+        resolved_model_name: str | None = None,
+    ) -> None:
+        """Bind the compiled wrapper graph and its checkpointer to the app config.
 
         Args:
             app_cfg: The AgentApp row of engine="workflow".
+            graph: Compiled chatflow wrapper graph from ``build_chatflow_graph``.
+            checkpointer: Checkpointer attached to the wrapper graph (may be None).
             resolved_model_name: Real upstream model name of the resolved
                 app-level model config (metrics label source; may be None).
         """
         self.app_cfg = app_cfg
+        self._graph = graph
+        self._checkpointer = checkpointer
         self.resolved_model_name = resolved_model_name
         self.app_id = app_cfg.id
         self._compression_seen: dict[str, tuple] = {}
 
     @override
     async def _get_state(self, config: RunnableConfig) -> StateSnapshot:
-        """Reserved — always raises."""
-        raise NotImplementedError("workflow engine runtime reserved")
+        """Return the checkpoint snapshot of the wrapper graph."""
+        return await self._graph.aget_state(config)
 
     @override
     async def _run(self, graph_input: Any, config: RunnableConfig) -> dict[str, Any]:
-        """Reserved — always raises."""
-        raise NotImplementedError("workflow engine runtime reserved")
+        """Invoke the wrapper graph once (one workflow turn)."""
+        return cast(dict[str, Any], await self._graph.ainvoke(graph_input, config=config))
 
     @override
-    def _stream(self, graph_input: Any, config: RunnableConfig) -> AsyncGenerator[StreamChunk, None]:
-        """Reserved — always raises."""
-        raise NotImplementedError("workflow engine runtime reserved")
-        yield  # pragma: no cover — makes the function an async generator
+    async def _stream(self, graph_input: Any, config: RunnableConfig) -> AsyncGenerator[StreamChunk, None]:
+        """Yield the single coordinator reply chunk for one workflow turn (D4).
+
+        ``execute_workflow`` is synchronous and runs in its own threadpool /
+        callback context, so the inner workflow's LLM tokens never reach this
+        wrapper's ``"messages"`` stream. We therefore stream ``"updates"`` and
+        surface the chatflow node's returned ``AIMessage`` as one coordinator
+        chunk — the MVP single-chunk contract.
+        """
+        async for update in self._graph.astream(graph_input, config, stream_mode="updates"):
+            if not isinstance(update, dict):
+                continue
+            for node_output in update.values():
+                messages = node_output.get("messages") if isinstance(node_output, dict) else None
+                if not isinstance(messages, list):
+                    continue
+                for message in messages:
+                    if not isinstance(message, AIMessage):
+                        continue
+                    text = extract_text_content(message.content)
+                    if text:
+                        yield StreamChunk(content=text, source="coordinator")
 
     @override
     async def _history(self, config: RunnableConfig) -> list[BaseMessage]:
-        """Reserved — always raises."""
-        raise NotImplementedError("workflow engine runtime reserved")
+        """Read the raw messages stored in the wrapper thread checkpoint."""
+        state = await self._get_state(config)
+        if not state.values:
+            return []
+        return cast(list[BaseMessage], state.values.get("messages", []))
 
     @override
     async def _clear(self, session_id: str) -> None:
-        """Reserved — always raises."""
-        raise NotImplementedError("workflow engine runtime reserved")
+        """Delete the wrapper thread via the checkpointer.
+
+        Raises:
+            RuntimeError: When no checkpointer is attached — silently
+                pretending success would lie about the deletion.
+        """
+        if self._checkpointer is None:
+            logger.warning("clear_history_skipped_no_checkpointer", session_id=session_id)
+            raise RuntimeError("cannot clear chat history: no checkpointer attached")
+        await self._checkpointer.adelete_thread(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1271,7 +1320,15 @@ async def get_runtime(session: Session, app_id: int, *, user_id: int) -> AgentAp
             resolved_model_name=resolved_model_name,
         )
     elif app_cfg.engine == "workflow":
-        runtime_obj = WorkflowAppRuntime(app_cfg=app_cfg, resolved_model_name=resolved_model_name)
+        if not app_cfg.workflow_id:
+            raise ValueError(f"agent app {app_cfg.name!r} has engine='workflow' but no workflow_id")
+        graph = build_chatflow_graph(app_cfg.workflow_id, checkpointer)
+        runtime_obj = WorkflowAppRuntime(
+            app_cfg=app_cfg,
+            graph=graph,
+            checkpointer=checkpointer,
+            resolved_model_name=resolved_model_name,
+        )
     else:
         raise ValueError(f"unknown engine {app_cfg.engine!r} for agent app {app_cfg.name!r}")
 

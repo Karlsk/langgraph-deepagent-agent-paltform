@@ -540,13 +540,22 @@ def test_get_runtime_fingerprint_change_builds_new_instance(monkeypatch: pytest.
     assert first is not second
 
 
-def test_get_runtime_workflow_engine_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Workflow apps resolve to the placeholder runtime that always raises."""
-    _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[]), _make_app(engine="workflow"))
+def test_get_runtime_workflow_engine_builds_wrapper_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Workflow apps resolve to a real WorkflowAppRuntime over a wrapper graph."""
+    _patch_get_runtime_seams(
+        monkeypatch, ScriptedChatModel(responses=[]), _make_app(engine="workflow", workflow_id="wf-1")
+    )
     rt = asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
     assert isinstance(rt, runtime.WorkflowAppRuntime)
-    with pytest.raises(NotImplementedError, match="workflow engine runtime reserved"):
-        asyncio.run(rt.get_chat_history("s"))
+    # No longer a placeholder: history reads the (empty) wrapper thread.
+    assert asyncio.run(rt.get_chat_history("s")) == []
+
+
+def test_get_runtime_workflow_engine_without_workflow_id_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A workflow app missing its workflow_id binding is rejected."""
+    _patch_get_runtime_seams(monkeypatch, ScriptedChatModel(responses=[]), _make_app(engine="workflow"))
+    with pytest.raises(ValueError, match="no workflow_id"):
+        asyncio.run(runtime.get_runtime(object(), 1, user_id=7))
 
 
 def test_hil_disabled_without_checkpointer_copies_config(monkeypatch: pytest.MonkeyPatch) -> None:
