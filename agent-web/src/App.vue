@@ -15,6 +15,7 @@ import {
   Pointer,
   Setting,
   SetUp,
+  SwitchButton,
   User,
 } from '@element-plus/icons-vue'
 
@@ -46,6 +47,13 @@ async function handleLogout(): Promise<void> {
   logoutAction()
   notifySuccess('已注销')
   await router.replace({ name: 'login' })
+}
+
+/** 用户下拉 command 分发（EP dropdown 惯例：command 机制而非直接 click） */
+function handleUserCommand(command: string): void {
+  if (command === 'logout') {
+    void handleLogout()
+  }
 }
 </script>
 
@@ -151,20 +159,27 @@ async function handleLogout(): Promise<void> {
           >
             <el-icon><Moon /></el-icon>
           </button>
-          <button class="app-header__icon-btn" type="button" aria-label="用户信息">
-            <el-avatar :size="28" class="app-user__avatar">
-              <el-icon><User /></el-icon>
-            </el-avatar>
-          </button>
-          <button
-            v-if="user"
-            class="app-header__icon-btn"
-            aria-label="注销"
-            title="注销"
-            @click="handleLogout"
-          >
-            <span class="app-header__logout-text">注销</span>
-          </button>
+          <el-dropdown class="app-user" trigger="click" @command="handleUserCommand">
+            <button class="app-header__icon-btn" type="button" aria-label="用户信息">
+              <el-avatar :size="28" class="app-user__avatar">
+                <el-icon><User /></el-icon>
+              </el-avatar>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <div class="app-user__meta" :title="user?.email">
+                  <span class="app-user__meta-name">
+                    {{ user ? (user.username ?? user.email) : '未登录' }}
+                  </span>
+                  <span v-if="user" class="app-user__meta-email">{{ user.email }}</span>
+                </div>
+                <el-dropdown-item divided :disabled="!user" command="logout">
+                  <el-icon><SwitchButton /></el-icon>
+                  注销
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </el-header>
 
@@ -385,9 +400,29 @@ async function handleLogout(): Promise<void> {
   background: var(--color-primary-50);
   color: var(--color-primary-500);
 }
-.app-header__logout-text {
+
+/* 下拉内用户信息块：不可点击、hover 不变色，仅展示身份 */
+.app-user__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 180px;
+  padding: 10px 16px 8px;
+  cursor: default;
+}
+
+.app-user__meta-name {
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.app-user__meta-email {
+  color: var(--color-text-tertiary);
   font-size: 12px;
-  color: var(--color-text-secondary);
+  line-height: 1.3;
+  word-break: break-all;
 }
 .app-brand__user {
   color: var(--color-text-on-dark-muted);

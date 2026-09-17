@@ -22,5 +22,5 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["tests/**/*.ts", "src/api/**/*.ts", "src/router/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts", "src/composables/**/*.ts", "src/components/**/*.vue", "src/views/**/*.ts", "src/views/**/*.vue"]
+  "include": ["tests/**/*.ts", "src/*.vue", "src/api/**/*.ts", "src/router/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts", "src/composables/**/*.ts", "src/components/**/*.vue", "src/views/**/*.ts", "src/views/**/*.vue"]
 }
