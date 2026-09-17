@@ -123,6 +123,7 @@ class AgentApp(BaseModel, table=True):
     interrupt_on: dict = Field(default_factory=dict, sa_column=Column(JSON))
     context_size: Optional[int] = Field(default=None)
     engine: str = Field(default="deepagents")
+    workflow_id: Optional[str] = Field(default=None, max_length=64)
     status: str = Field(default="draft")
     published_hash: Optional[str] = Field(default=None)
     version: int = Field(default=1)

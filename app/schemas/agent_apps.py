@@ -400,7 +400,7 @@ class AgentAppCreate(BaseModel):
     """
 
     name: str = _name_field("Globally unique application name")  # pyright: ignore[reportAssignmentType]
-    system_prompt: str = Field(..., description="System prompt of the assembled agent")
+    system_prompt: str = Field(default="", description="System prompt of the assembled agent")
     allowed_tools: Optional[list[str]] = Field(
         default=None, description="Optional tool whitelist (None = engine default)"
     )
@@ -408,6 +408,23 @@ class AgentAppCreate(BaseModel):
     skill_names: list[str] = Field(default_factory=list, description="Names of skill assets bound to this app")
     subagent_names: list[str] = Field(default_factory=list, description="Names of sub-agent configs bound to this app")
     interrupt_on: dict[str, bool] = Field(default_factory=dict, description="Interrupt configuration for the engine")
+    engine: Literal["deepagents", "workflow"] = Field(
+        default="deepagents", description="Execution engine backend (immutable after creation)"
+    )
+    workflow_id: Optional[str] = Field(
+        default=None, description="Bound workflow id (required when engine='workflow')"
+    )
+
+    @model_validator(mode="after")
+    def _validate_workflow_binding(self) -> Self:
+        """Require a non-blank workflow_id when the engine is 'workflow'.
+
+        A chatflow app is meaningless without a bound workflow; deepagents
+        apps ignore workflow_id entirely.
+        """
+        if self.engine == "workflow" and not (self.workflow_id or "").strip():
+            raise ValueError("workflow_id is required when engine is 'workflow'")
+        return self
 
 
 class AgentAppUpdate(BaseModel):
@@ -431,6 +448,7 @@ class AgentAppUpdate(BaseModel):
     skill_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound skill names")
     subagent_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound sub-agent names")
     interrupt_on: Optional[dict[str, bool]] = Field(default=None, description="Replacement interrupt configuration")
+    workflow_id: Optional[str] = Field(default=None, description="Rebind the workflow id (engine='workflow' apps)")
 
 
 class AgentAppRead(BaseModel):
@@ -464,6 +482,7 @@ class AgentAppRead(BaseModel):
     subagent_names: list[str] = Field(default_factory=list, description="Names of bound sub-agent configs")
     interrupt_on: dict[str, bool] = Field(default_factory=dict, description="Interrupt configuration")
     engine: str = Field(..., description="Execution engine backend")
+    workflow_id: Optional[str] = Field(default=None, description="Bound workflow id (engine='workflow' apps)")
     status: str = Field(..., description="Lifecycle status (draft|published)")
     published_hash: Optional[str] = Field(default=None, description="Hash snapshot of the last published revision")
     agent_dir: Optional[str] = Field(default=None, description="Agent workspace directory stamped at publish time")
