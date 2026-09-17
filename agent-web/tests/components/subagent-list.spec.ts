@@ -63,6 +63,7 @@ const ROWS: SubAgentRow[] = [
     model: null,
     max_turns: 3,
     skill_names: null,
+    mcp_server_names: [],
     content_hash: 'h1',
     version: 1,
     created_by: 'seed',
@@ -76,6 +77,7 @@ const ROWS: SubAgentRow[] = [
     model: 'default/default',
     max_turns: null,
     skill_names: [],
+    mcp_server_names: [],
     content_hash: 'h2',
     version: 2,
     created_by: 'admin',
@@ -89,6 +91,7 @@ const ROWS: SubAgentRow[] = [
     model: 'proxy/m3',
     max_turns: 5,
     skill_names: ['pdf-export', 'csv-clean'],
+    mcp_server_names: [],
     content_hash: 'h3',
     version: 1,
     created_by: 'admin',
@@ -102,6 +105,7 @@ const ROWS: SubAgentRow[] = [
     model: 'default/default',
     max_turns: 2,
     skill_names: ['pdf-export'],
+    mcp_server_names: [],
     content_hash: 'h4',
     version: 3,
     created_by: 'seed',
@@ -115,6 +119,7 @@ const ROWS: SubAgentRow[] = [
     model: null,
     max_turns: null,
     skill_names: null,
+    mcp_server_names: [],
     content_hash: 'h5',
     version: 1,
     created_by: 'seed',
@@ -154,11 +159,11 @@ vi.mock('@/api/subagents', () => apiMock)
  * 验证 SubAgentList 表单能按 source 分组渲染下拉选项。
  */
 const { mcpMock } = vi.hoisted(() => ({
-  mcpMock: { listToolCatalog: vi.fn() },
+  mcpMock: { listToolCatalog: vi.fn(), listMcpServers: vi.fn() },
 }))
 vi.mock('@/api/mcp', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/mcp')>()
-  return { ...actual, listToolCatalog: mcpMock.listToolCatalog }
+  return { ...actual, listToolCatalog: mcpMock.listToolCatalog, listMcpServers: mcpMock.listMcpServers }
 })
 
 /**
@@ -555,7 +560,7 @@ beforeEach(() => {
   apiMock.listSubAgentsPage.mockImplementation(
     async () =>
       ({
-        items: ROWS.map((row) => ({ ...row, allowed_tools: row.allowed_tools ? [...row.allowed_tools] : row.allowed_tools })),
+        items: ROWS.map((row) => ({ ...row, allowed_tools: row.allowed_tools ? [...row.allowed_tools] : row.allowed_tools, mcp_server_names: [...row.mcp_server_names] })),
         total: ROWS.length,
         page: 1,
         pageSize: 10,
@@ -572,6 +577,7 @@ beforeEach(() => {
         model: payload.model ?? null,
         max_turns: payload.max_turns ?? null,
         skill_names: payload.skill_names ?? null,
+        mcp_server_names: payload.mcp_server_names ?? [],
         content_hash: 'new-hash',
         version: 1,
         created_by: 'user',
@@ -590,6 +596,7 @@ beforeEach(() => {
           model: null,
           max_turns: null,
           skill_names: null,
+          mcp_server_names: [],
           content_hash: '',
           version: 0,
           created_by: null,
@@ -626,6 +633,10 @@ beforeEach(() => {
     { name: 'echo', source: 'builtin', server: null },
     { name: 'demo-stdio__add', source: 'mcp', server: 'demo-stdio' },
     { name: 'demo-stdio__greet', source: 'mcp', server: 'demo-stdio' },
+  ])
+  mcpMock.listMcpServers.mockResolvedValue([
+    { name: 'demo-stdio', transport: 'stdio', command: 'python', args: ['server.py'], env: {}, url: null, headers: {}, enabled: true, description: 'demo', content_hash: 'mcph1', created_by: 'seed' },
+    { name: 'disabled-srv', transport: 'sse', command: null, args: [], env: {}, url: 'http://x', headers: {}, enabled: false, description: 'off', content_hash: 'mcph2', created_by: 'seed' },
   ])
   // 模型聚合默认返回 3 条（覆盖 el-select filterable 路径 + 跨 provider）
   providerMock.listAllProviderModels.mockResolvedValue([
@@ -717,6 +728,7 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
       model: 'proxy/m3',
       max_turns: null,
       skill_names: null,
+      mcp_server_names: [],
     } satisfies SubAgentCreatePayload)
     expect(elMessageFn).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'success', message: '已保存：new-lab' }),

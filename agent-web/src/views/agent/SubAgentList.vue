@@ -27,7 +27,7 @@ import {
   type SubAgentPatchPayload,
   type SubAgentRow,
 } from '@/api/subagents'
-import { listToolCatalog, type ToolCatalogEntry } from '@/api/mcp'
+import { listMcpServers, listToolCatalog, type McpServerRow, type ToolCatalogEntry } from '@/api/mcp'
 import { listAllProviderModels, type ModelConfigRow } from '@/api/provider'
 import { listSkills, type SkillRow } from '@/api/assets'
 import { useConfirm } from '@/composables/useConfirm'
@@ -113,6 +113,12 @@ interface SkillOption {
   label: string
 }
 const skillOptions = ref<SkillOption[]>([])
+/** MCP 服务下拉选项：取自 listMcpServers，仅保留 enabled 的 server */
+interface McpServerOption {
+  value: string
+  label: string
+}
+const mcpServerOptions = ref<McpServerOption[]>([])
 const optionsLoading = ref(false)
 
 /** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 */
@@ -163,11 +169,28 @@ async function loadSkillOptions(): Promise<void> {
   }
 }
 
-/** 一次性预加载三个选项；任一失败不影响另一项 */
+/** 拉 MCP 服务下拉选项：仅保留 enabled 的 server，单次失败降级为空数组 */
+async function loadMcpServerOptions(): Promise<void> {
+  try {
+    const rows = await listMcpServers()
+    mcpServerOptions.value = rows
+      .filter((r: McpServerRow) => r.enabled)
+      .map((r: McpServerRow) => ({ value: r.name, label: r.name }))
+  } catch {
+    mcpServerOptions.value = []
+  }
+}
+
+/** 一次性预加载所有选项；任一失败不影响另一项 */
 async function loadFormOptions(): Promise<void> {
   optionsLoading.value = true
   try {
-    await Promise.all([loadToolCatalogOptions(), loadModelOptions(), loadSkillOptions()])
+    await Promise.all([
+      loadToolCatalogOptions(),
+      loadModelOptions(),
+      loadSkillOptions(),
+      loadMcpServerOptions(),
+    ])
   } finally {
     optionsLoading.value = false
   }
@@ -188,6 +211,8 @@ interface SubAgentFormShape {
   system_prompt: string
   /** 工具命名空间列表（builtin 裸名 / mcp `{server}__{tool}`）；空数组 → null 继承父 AgentApp */
   allowed_tools: string[]
+  /** 关联的 MCP 服务名列表；空数组 → 不关联任何 MCP 服务 */
+  mcp_server_names: string[]
   /** `provider/model` 引用；空字符串 → null → 运行时回退 default/default */
   model: string
   max_turns: number | null
@@ -230,6 +255,7 @@ function handleEdit(row: SubAgentRow): void {
     when_to_use: row.when_to_use,
     system_prompt: row.system_prompt,
     allowed_tools: row.allowed_tools ? [...row.allowed_tools] : [],
+    mcp_server_names: row.mcp_server_names ? [...row.mcp_server_names] : [],
     model: row.model ?? '',
     max_turns: row.max_turns,
     skill_names: row.skill_names ? [...row.skill_names] : [],
@@ -249,6 +275,7 @@ function buildPayload(form: SubmitFormShape): {
   const allowedTools = Array.isArray(form.allowed_tools) && form.allowed_tools.length > 0
     ? [...form.allowed_tools]
     : null
+  const mcpServerNames = Array.isArray(form.mcp_server_names) ? [...form.mcp_server_names] : []
   const model = (form.model ?? '').trim()
   const modelValue = model.length > 0 ? model : null
   const name = (form.name ?? '').trim()
@@ -269,6 +296,7 @@ function buildPayload(form: SubmitFormShape): {
     when_to_use: whenToUse,
     system_prompt: systemPrompt,
     allowed_tools: allowedTools,
+    mcp_server_names: mcpServerNames,
     model: modelValue,
     max_turns: maxTurns,
     skill_names: skillNames,
@@ -278,6 +306,7 @@ function buildPayload(form: SubmitFormShape): {
     when_to_use: whenToUse,
     system_prompt: systemPrompt,
     allowed_tools: allowedTools,
+    mcp_server_names: mcpServerNames,
     model: modelValue,
     max_turns: maxTurns,
     skill_names: skillNames,
@@ -463,6 +492,27 @@ function modelLabel(row: SubAgentRow): string {
                 :value="option.value"
               />
             </el-option-group>
+          </el-select>
+        </el-form-item>
+        <el-form-item label="MCP 服务" prop="mcp_server_names">
+          <el-select
+            v-model="form.mcp_server_names"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            clearable
+            :loading="optionsLoading"
+            no-data-text="暂无可用 MCP 服务（请先在 MCP 管理页启用 server）"
+            placeholder="选择要关联的 MCP 服务"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in mcpServerOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
           </el-select>
         </el-form-item>
         <el-form-item label="模型" prop="model">

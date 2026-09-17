@@ -35,7 +35,7 @@ import {
   type AgentAppPatchPayload,
   type AgentAppRow,
 } from '@/api/agentapps'
-import { listToolCatalog, type ToolCatalogEntry } from '@/api/mcp'
+import { listMcpServers, listToolCatalog, type McpServerRow, type ToolCatalogEntry } from '@/api/mcp'
 import { listAllProviderModels, type ModelConfigRow } from '@/api/provider'
 import { listSkills, type SkillRow } from '@/api/assets'
 import { listSubAgents, type SubAgentRow } from '@/api/subagents'
@@ -119,6 +119,8 @@ const skillOptions = ref<NameOption[]>([])
 const subagentOptions = ref<NameOption[]>([])
 /** 绑定工作流下拉选项：取自 listWorkflows（engine='workflow' 时使用） */
 const workflowOptions = ref<NameOption[]>([])
+/** MCP 服务下拉选项：取自 listMcpServers（仅 enabled 的 server） */
+const mcpServerOptions = ref<NameOption[]>([])
 const optionsLoading = ref(false)
 
 /** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 */
@@ -192,7 +194,19 @@ async function loadWorkflowOptions(): Promise<void> {
   }
 }
 
-/** 一次性预加载五个选项；任一失败不影响另一项 */
+/** 拉 MCP 服务下拉选项：仅 enabled 的 server；单次失败降级为空数组 */
+async function loadMcpServerOptions(): Promise<void> {
+  try {
+    const rows = await listMcpServers()
+    mcpServerOptions.value = rows
+      .filter((r: McpServerRow) => r.enabled)
+      .map((r: McpServerRow) => ({ value: r.name, label: r.name }))
+  } catch {
+    mcpServerOptions.value = []
+  }
+}
+
+/** 一次性预加载选项；任一失败不影响另一项 */
 async function loadFormOptions(): Promise<void> {
   optionsLoading.value = true
   try {
@@ -202,6 +216,7 @@ async function loadFormOptions(): Promise<void> {
       loadSkillOptions(),
       loadSubAgentOptions(),
       loadWorkflowOptions(),
+      loadMcpServerOptions(),
     ])
   } finally {
     optionsLoading.value = false
@@ -225,6 +240,8 @@ interface AgentAppFormShape {
   system_prompt: string
   /** 工具命名空间列表（builtin 裸名 / mcp `{server}__{tool}`）；空数组 → null 引擎默认 */
   allowed_tools: string[]
+  /** 关联的 MCP 服务名称列表；空数组 → 不关联任何 MCP server */
+  mcp_server_names: string[]
   /** `provider/model` 引用；空字符串 → null（引擎默认） */
   model: string
   /** 绑定的 skill 资产名；始终提交数组（空数组 = 不绑定；后端禁显式 null） */
@@ -246,6 +263,7 @@ function createFormDefaults(): AgentAppFormShape {
     workflow_id: '',
     system_prompt: '',
     allowed_tools: [],
+    mcp_server_names: [],
     model: '',
     skill_names: [],
     subagent_names: [],
@@ -283,6 +301,7 @@ function handleEdit(row: AgentAppRow): void {
     workflow_id: row.workflow_id ?? '',
     system_prompt: row.system_prompt,
     allowed_tools: row.allowed_tools ? [...row.allowed_tools] : [],
+    mcp_server_names: [...row.mcp_server_names],
     model: row.model ?? '',
     skill_names: [...row.skill_names],
     subagent_names: [...row.subagent_names],
@@ -316,6 +335,7 @@ function buildPayload(form: SubmitFormShape): {
   const allowedTools = Array.isArray(form.allowed_tools) && form.allowed_tools.length > 0
     ? [...form.allowed_tools]
     : null
+  const mcpServerNames = Array.isArray(form.mcp_server_names) ? [...form.mcp_server_names] : []
   const model = (form.model ?? '').trim()
   const modelValue = model.length > 0 ? model : null
   const systemPrompt = form.system_prompt ?? ''
@@ -331,6 +351,7 @@ function buildPayload(form: SubmitFormShape): {
     name,
     system_prompt: systemPrompt,
     allowed_tools: allowedTools,
+    mcp_server_names: mcpServerNames,
     model: modelValue,
     skill_names: skillNames,
     subagent_names: subagentNames,
@@ -339,6 +360,7 @@ function buildPayload(form: SubmitFormShape): {
   const patch: AgentAppPatchPayload = {
     system_prompt: systemPrompt,
     allowed_tools: allowedTools,
+    mcp_server_names: mcpServerNames,
     model: modelValue,
     skill_names: skillNames,
     subagent_names: subagentNames,
@@ -602,6 +624,27 @@ function bindingsText(row: AgentAppRow): string {
                 :value="option.value"
               />
             </el-option-group>
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="form.engine !== 'workflow'" label="MCP 服务" prop="mcp_server_names">
+          <el-select
+            v-model="form.mcp_server_names"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            clearable
+            :loading="optionsLoading"
+            no-data-text="暂无可用 MCP 服务（请先在 MCP 管理页启用 server）"
+            placeholder="选择要关联的 MCP 服务"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in mcpServerOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
           </el-select>
         </el-form-item>
         <el-form-item v-if="form.engine !== 'workflow'" label="模型" prop="model">

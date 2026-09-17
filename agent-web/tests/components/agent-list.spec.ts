@@ -57,6 +57,7 @@ const ROWS: AgentAppRow[] = [
     name: 'customer-support',
     system_prompt: '你是客服助手。',
     allowed_tools: ['duckduckgo_results_json'],
+    mcp_server_names: [],
     model: 'default/default',
     skill_names: ['pdf-export'],
     subagent_names: ['search-helper'],
@@ -76,6 +77,7 @@ const ROWS: AgentAppRow[] = [
     name: 'code-helper',
     system_prompt: '你是代码助手。',
     allowed_tools: null,
+    mcp_server_names: [],
     model: null,
     skill_names: [],
     subagent_names: [],
@@ -95,6 +97,7 @@ const ROWS: AgentAppRow[] = [
     name: 'data-runner',
     system_prompt: '你负责数据处理。',
     allowed_tools: ['demo-stdio__add'],
+    mcp_server_names: [],
     model: 'proxy/m3',
     skill_names: ['pdf-export', 'csv-clean'],
     subagent_names: [],
@@ -128,6 +131,7 @@ const SUBAGENT_ROWS: SubAgentRow[] = [
     model: null,
     max_turns: null,
     skill_names: null,
+    mcp_server_names: [],
     content_hash: 'sh',
     version: 1,
     created_by: 'seed',
@@ -154,11 +158,11 @@ vi.mock('@/api/agentapps', () => apiMock)
 
 /** mcp.ts 的 listToolCatalog mock：builtin + mcp 各 2 条（分组渲染路径） */
 const { mcpMock } = vi.hoisted(() => ({
-  mcpMock: { listToolCatalog: vi.fn() },
+  mcpMock: { listToolCatalog: vi.fn(), listMcpServers: vi.fn() },
 }))
 vi.mock('@/api/mcp', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/mcp')>()
-  return { ...actual, listToolCatalog: mcpMock.listToolCatalog }
+  return { ...actual, listToolCatalog: mcpMock.listToolCatalog, listMcpServers: mcpMock.listMcpServers }
 })
 
 /** provider.ts 的 listAllProviderModels mock：固定聚合结果，零真实后端 */
@@ -480,6 +484,7 @@ function rowsCopy(): AgentAppRow[] {
   return ROWS.map((row) => ({
     ...row,
     allowed_tools: row.allowed_tools ? [...row.allowed_tools] : row.allowed_tools,
+    mcp_server_names: [...row.mcp_server_names],
     skill_names: [...row.skill_names],
     subagent_names: [...row.subagent_names],
   }))
@@ -512,6 +517,7 @@ beforeEach(() => {
         name: payload.name,
         system_prompt: payload.system_prompt ?? '',
         allowed_tools: payload.allowed_tools ?? null,
+        mcp_server_names: payload.mcp_server_names ?? [],
         model: payload.model ?? null,
         skill_names: payload.skill_names ?? [],
         subagent_names: payload.subagent_names ?? [],
@@ -550,6 +556,10 @@ beforeEach(() => {
     { name: 'echo', source: 'builtin', server: null },
     { name: 'demo-stdio__add', source: 'mcp', server: 'demo-stdio' },
     { name: 'demo-stdio__greet', source: 'mcp', server: 'demo-stdio' },
+  ])
+  mcpMock.listMcpServers.mockResolvedValue([
+    { name: 'demo-stdio', transport: 'stdio', command: 'python', args: ['server.py'], env: {}, url: null, headers: {}, enabled: true, description: 'demo', content_hash: 'mcph1', created_by: 'seed' },
+    { name: 'disabled-srv', transport: 'sse', command: null, args: [], env: {}, url: 'http://x', headers: {}, enabled: false, description: 'off', content_hash: 'mcph2', created_by: 'seed' },
   ])
   providerMock.listAllProviderModels.mockResolvedValue([
     { id: 1, provider_name: 'default', name: 'default', model_id: 'default', ref: 'default/default', context_size: null, extra_params: {}, enabled: true, created_by: null, created_at: null, updated_at: null },
@@ -615,6 +625,7 @@ describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布�
       name: 'new-app',
       system_prompt: '你是新应用。',
       allowed_tools: ['duckduckgo_results_json', 'demo-stdio__add'],
+      mcp_server_names: [],
       model: 'proxy/m3',
       skill_names: ['pdf-export'],
       subagent_names: ['search-helper'],
@@ -642,6 +653,7 @@ describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布�
       name: 'bare-app',
       system_prompt: '最小配置。',
       allowed_tools: null,
+      mcp_server_names: [],
       model: null,
       skill_names: [],
       subagent_names: [],
@@ -840,6 +852,7 @@ describe('AgentList 引擎选择器（chatflow / engine=workflow）', () => {
     // deepagents 专属字段全部隐藏
     expect(props).not.toContain('system_prompt')
     expect(props).not.toContain('allowed_tools')
+    expect(props).not.toContain('mcp_server_names')
     expect(props).not.toContain('model')
     expect(props).not.toContain('skill_names')
     expect(props).not.toContain('subagent_names')
@@ -877,6 +890,7 @@ describe('AgentList 引擎选择器（chatflow / engine=workflow）', () => {
     const payload = apiMock.createAgentApp.mock.calls[0][0] as Record<string, unknown>
     expect(payload).not.toHaveProperty('skill_names')
     expect(payload).not.toHaveProperty('system_prompt')
+    expect(payload).not.toHaveProperty('mcp_server_names')
     expect(elMessageFn).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'success', message: '已保存：chatflow-app' }),
     )
@@ -892,6 +906,7 @@ describe('AgentList 引擎选择器（chatflow / engine=workflow）', () => {
               name: 'chatflow-app',
               system_prompt: '',
               allowed_tools: null,
+              mcp_server_names: [],
               model: null,
               skill_names: [],
               subagent_names: [],
