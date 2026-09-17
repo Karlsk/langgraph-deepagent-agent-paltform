@@ -544,6 +544,63 @@ async def test_chat_stream_error_frame_then_done(
 
 
 @_sync
+async def test_chat_stream_runtime_init_error_yields_error_frames(
+    db: DBSession, session_row: SessionRow, naming_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Layer 2: get_runtime failure inside the generator yields error+done frames.
+
+    Once the SSE StreamingResponse has committed HTTP 200, exceptions can no
+    longer map to HTTP error codes.  The generator catches them and emits
+    structured error+done frames so the client sees a clean close.
+    """
+
+    async def fake_get_runtime(session: DBSession, app_id: int, *, user_id: int) -> Any:
+        raise ValueError("agent app 'g4-app' is not published (status=draft)")
+
+    monkeypatch.setattr(runtime, "get_runtime", fake_get_runtime)
+
+    frames = _collect(
+        [
+            frame
+            async for frame in chat_service.chat_stream(
+                db, session_row, [Message(role="user", content="hi")], user_id=7, username="u7"
+            )
+        ]
+    )
+
+    payloads = _frames_payloads(frames)
+    assert [p["type"] for p in payloads] == ["error", "done"]
+    assert "not published" in payloads[0]["message"]
+    assert payloads[1]["message_count"] == 0
+    assert payloads[1]["interrupted"] is False
+
+
+@_sync
+async def test_chat_stream_no_bound_app_yields_error_frames(
+    db: DBSession, user: User, naming_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Layer 2: session with agent_app_id=None yields error+done frames."""
+    row = SessionRow(id="s-no-app", user_id=user.id, username=user.username, agent_app_id=None, name="")
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    frames = _collect(
+        [
+            frame
+            async for frame in chat_service.chat_stream(
+                db, row, [Message(role="user", content="hi")], user_id=7, username="u7"
+            )
+        ]
+    )
+
+    payloads = _frames_payloads(frames)
+    assert [p["type"] for p in payloads] == ["error", "done"]
+    assert "no bound agent app" in payloads[0]["message"]
+    assert payloads[1]["message_count"] == 0
+
+
+@_sync
 async def test_chat_stream_heartbeat_comment_frames(
     db: DBSession, session_row: SessionRow, naming_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -28,7 +28,7 @@ from app.schemas.chat import (
     MessagesResponse,
     RebuildResult,
 )
-from app.services.agents import chat_service, sessions_service
+from app.services.agents import agent_apps_service, chat_service, sessions_service
 
 router = APIRouter()
 
@@ -80,6 +80,13 @@ async def chat_stream(
     envelope; anti-proxy headers keep intermediaries from buffering.
     """
     target = await _resolve_session_by_header_or_404(db, user, x_session_id)
+    if target.agent_app_id is not None:
+        app_status = await agent_apps_service.get_app_status(db, target.agent_app_id)
+        if app_status != "published":
+            raise HTTPException(
+                status_code=422,
+                detail=f"agent app is not published (status={app_status})",
+            )
     generator = chat_service.chat_stream(db, target, body.messages, user_id=user.id, username=user.username)
     return StreamingResponse(
         generator,

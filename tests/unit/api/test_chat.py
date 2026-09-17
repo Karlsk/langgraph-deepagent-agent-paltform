@@ -277,6 +277,31 @@ def test_post_chat_stream_missing_header_422(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_post_chat_stream_draft_app_422(
+    client: TestClient, db_session: DBSession, db_user: User
+) -> None:
+    """Layer 1: draft app status is caught before the 200 commit → 422 JSON."""
+    draft = AgentApp(name="draft-app", system_prompt="x", status="draft")
+    db_session.add(draft)
+    db_session.commit()
+    db_session.refresh(draft)
+
+    row = SessionRow(
+        id="s-draft", user_id=db_user.id, username=db_user.username, agent_app_id=draft.id, name=""
+    )
+    db_session.add(row)
+    db_session.commit()
+
+    response = client.post(
+        "/chat/stream",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers={"X-Session-Id": row.id},
+    )
+
+    assert response.status_code == 422
+    assert "not published" in response.json()["message"]
+
+
 # ---------------------------------------------------------------------------
 # GET /messages — history envelope (§3.2/§6.1)
 # ---------------------------------------------------------------------------

@@ -335,8 +335,15 @@ async def chat_stream(
     failures emit an ``error`` frame and still emit ``done``.
     """
     if target.agent_app_id is None:
-        raise ChatServiceError("session has no bound agent app")
-    rt = await runtime.get_runtime(db, target.agent_app_id, user_id=user_id)
+        yield _sse_frame(StreamEvent(type="error", message="session has no bound agent app"))
+        yield _sse_frame(StreamEvent(type="done", message_count=0, compressed=False, interrupted=False))
+        return
+    try:
+        rt = await runtime.get_runtime(db, target.agent_app_id, user_id=user_id)
+    except Exception as exc:  # noqa: BLE001 — surfaced as SSE error frame
+        yield _sse_frame(StreamEvent(type="error", message=str(exc)))
+        yield _sse_frame(StreamEvent(type="done", message_count=0, compressed=False, interrupted=False))
+        return
     app_row = db.get(AgentApp, target.agent_app_id) if target.agent_app_id is not None else None
     model_ref = app_row.model if app_row is not None else None
     await session_naming.maybe_name_session(db, target.id, target.name, messages, model_name=model_ref)

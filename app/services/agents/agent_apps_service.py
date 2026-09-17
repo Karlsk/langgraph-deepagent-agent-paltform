@@ -530,3 +530,19 @@ async def ensure_user_workspace_up_to_date(
         workspace_hash=app_cfg.workspace_hash,
     )
     return True
+
+
+async def get_app_status(session: Session, app_id: int) -> str:
+    """Return the agent app's status string (lightweight pre-flight check).
+
+    Used by the SSE route handler to reject draft/archived apps with a proper
+    HTTP error *before* the 200 response is committed.  Only fetches the
+    status column — no workspace validation, no fingerprint computation.
+
+    Raises:
+        AgentAppNotFoundError: If no AgentApp row exists for *app_id*.
+    """
+    app_cfg = session.get(AgentApp, app_id)
+    if app_cfg is None:
+        raise AgentAppNotFoundError(f"agent app id={app_id} not found")
+    return app_cfg.status
