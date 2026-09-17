@@ -40,6 +40,7 @@ def test_subagent_config_defaults() -> None:
     )
     assert config.version == 1
     assert config.allowed_tools is None
+    assert config.mcp_server_names == []
     assert config.model is None
     assert config.max_turns is None
     assert config.created_by is None
@@ -97,6 +98,7 @@ def test_agent_app_defaults() -> None:
     assert app.status == "draft"
     assert app.version == 1
     assert app.allowed_tools is None
+    assert app.mcp_server_names == []
     assert app.model is None
     assert app.skill_names == []
     assert app.subagent_names == []

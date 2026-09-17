@@ -52,7 +52,8 @@ class SubAgentCreate(BaseModel):
         description: Human-readable description shown to the orchestrating agent
         when_to_use: Guidance describing when this sub-agent should be invoked
         system_prompt: System prompt used when the sub-agent runs
-        allowed_tools: Optional tool whitelist (None = inherit from parent agent)
+        allowed_tools: Optional tool whitelist (None = no extra tools beyond builtins and MCP)
+        mcp_server_names: MCP servers whose tools are bulk-included for this sub-agent
         model: Optional LLM model override
         max_turns: Optional turn budget limit
         skill_names: Optional skill whitelist (None = inherit from parent agent)
@@ -63,7 +64,10 @@ class SubAgentCreate(BaseModel):
     when_to_use: str = Field(..., description="Guidance describing when this sub-agent should be invoked")
     system_prompt: str = Field(..., description="System prompt used when the sub-agent runs")
     allowed_tools: Optional[list[str]] = Field(
-        default=None, description="Optional tool whitelist (None = inherit from parent agent)"
+        default=None, description="Optional tool whitelist (None = no extra tools beyond builtins and MCP)"
+    )
+    mcp_server_names: list[str] = Field(
+        default_factory=list, description="MCP servers whose tools are bulk-included for this sub-agent"
     )
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     max_turns: Optional[int] = Field(default=None, ge=1, description="Optional turn budget limit")
@@ -88,7 +92,8 @@ class SubAgentUpdate(BaseModel):
         description: Updated description
         when_to_use: Updated invocation guidance
         system_prompt: Updated system prompt
-        allowed_tools: Updated tool whitelist (None = inherit from parent agent)
+        allowed_tools: Updated tool whitelist (None = no extra tools beyond builtins and MCP)
+        mcp_server_names: Replacement list of associated MCP server names
         model: Updated LLM model override
         max_turns: Updated turn budget limit
         skill_names: Replacement skill whitelist (None = not provided in PATCH body)
@@ -98,7 +103,10 @@ class SubAgentUpdate(BaseModel):
     when_to_use: Optional[str] = Field(default=None, description="Updated invocation guidance")
     system_prompt: Optional[str] = Field(default=None, description="Updated system prompt")
     allowed_tools: Optional[list[str]] = Field(
-        default=None, description="Updated tool whitelist (None = inherit from parent agent)"
+        default=None, description="Updated tool whitelist (None = no extra tools beyond builtins and MCP)"
+    )
+    mcp_server_names: Optional[list[str]] = Field(
+        default=None, description="Replacement list of associated MCP server names"
     )
     model: Optional[str] = Field(default=None, description="Updated LLM model override")
     max_turns: Optional[int] = Field(default=None, ge=1, description="Updated turn budget limit")
@@ -119,7 +127,8 @@ class SubAgentRead(BaseModel):
         description: Human-readable description shown to the orchestrating agent
         when_to_use: Guidance describing when this sub-agent should be invoked
         system_prompt: System prompt used when the sub-agent runs
-        allowed_tools: Optional tool whitelist (None = inherit from parent agent)
+        allowed_tools: Optional tool whitelist (None = no extra tools beyond builtins and MCP)
+        mcp_server_names: MCP servers whose tools are bulk-included for this sub-agent
         model: Optional LLM model override
         max_turns: Optional turn budget limit
         skill_names: Optional skill whitelist (None = inherit parent agent app's skill set)
@@ -133,6 +142,9 @@ class SubAgentRead(BaseModel):
     when_to_use: str = Field(..., description="Guidance describing when this sub-agent should be invoked")
     system_prompt: str = Field(..., description="System prompt used when the sub-agent runs")
     allowed_tools: Optional[list[str]] = Field(default=None, description="Optional tool whitelist")
+    mcp_server_names: list[str] = Field(
+        default_factory=list, description="MCP servers whose tools are bulk-included for this sub-agent"
+    )
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     max_turns: Optional[int] = Field(default=None, description="Optional turn budget limit")
     skill_names: Optional[list[str]] = Field(
@@ -392,7 +404,8 @@ class AgentAppCreate(BaseModel):
     Attributes:
         name: Globally unique application name (immutable after creation)
         system_prompt: System prompt of the assembled agent
-        allowed_tools: Optional tool whitelist (None = engine default)
+        allowed_tools: Optional tool whitelist (None = no extra tools beyond builtins and MCP)
+        mcp_server_names: MCP servers whose tools are bulk-included for this app
         model: Optional LLM model override
         skill_names: Names of skill assets bound to this app
         subagent_names: Names of sub-agent configs bound to this app
@@ -402,7 +415,10 @@ class AgentAppCreate(BaseModel):
     name: str = _name_field("Globally unique application name")  # pyright: ignore[reportAssignmentType]
     system_prompt: str = Field(default="", description="System prompt of the assembled agent")
     allowed_tools: Optional[list[str]] = Field(
-        default=None, description="Optional tool whitelist (None = engine default)"
+        default=None, description="Optional tool whitelist (None = no extra tools beyond builtins and MCP)"
+    )
+    mcp_server_names: list[str] = Field(
+        default_factory=list, description="MCP servers whose tools are bulk-included for this app"
     )
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     skill_names: list[str] = Field(default_factory=list, description="Names of skill assets bound to this app")
@@ -436,6 +452,7 @@ class AgentAppUpdate(BaseModel):
     Attributes:
         system_prompt: Updated system prompt
         allowed_tools: Updated tool whitelist
+        mcp_server_names: Replacement list of associated MCP server names
         model: Updated LLM model override
         skill_names: Replacement list of bound skill names
         subagent_names: Replacement list of bound sub-agent names
@@ -444,6 +461,9 @@ class AgentAppUpdate(BaseModel):
 
     system_prompt: Optional[str] = Field(default=None, description="Updated system prompt")
     allowed_tools: Optional[list[str]] = Field(default=None, description="Updated tool whitelist")
+    mcp_server_names: Optional[list[str]] = Field(
+        default=None, description="Replacement list of associated MCP server names"
+    )
     model: Optional[str] = Field(default=None, description="Updated LLM model override")
     skill_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound skill names")
     subagent_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound sub-agent names")
@@ -458,7 +478,8 @@ class AgentAppRead(BaseModel):
         id: Primary key (referenced by session.agent_app_id without FK constraint)
         name: Globally unique application name
         system_prompt: System prompt of the assembled agent
-        allowed_tools: Optional tool whitelist (None = engine default)
+        allowed_tools: Optional tool whitelist (None = no extra tools beyond builtins and MCP)
+        mcp_server_names: MCP servers whose tools are bulk-included for this app
         model: Optional LLM model override
         skill_names: Names of skill assets bound to this app
         subagent_names: Names of sub-agent configs bound to this app
@@ -477,6 +498,9 @@ class AgentAppRead(BaseModel):
     name: str = Field(..., description="Globally unique application name")
     system_prompt: str = Field(..., description="System prompt of the assembled agent")
     allowed_tools: Optional[list[str]] = Field(default=None, description="Optional tool whitelist")
+    mcp_server_names: list[str] = Field(
+        default_factory=list, description="MCP servers whose tools are bulk-included for this app"
+    )
     model: Optional[str] = Field(default=None, description="Optional LLM model override")
     skill_names: list[str] = Field(default_factory=list, description="Names of bound skill assets")
     subagent_names: list[str] = Field(default_factory=list, description="Names of bound sub-agent configs")

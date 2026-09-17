@@ -24,6 +24,7 @@ class SubAgentConfig(BaseModel, table=True):
         when_to_use: Guidance describing when this sub-agent should be invoked
         system_prompt: System prompt used when the sub-agent runs
         allowed_tools: Optional tool whitelist (None = inherit from parent agent)
+        mcp_server_names: MCP server names whose tools are bulk-included for this sub-agent
         model: Optional LLM model override
         max_turns: Optional turn budget limit
         skill_names: Optional whitelist of SkillAsset names bound to this sub-agent.
@@ -47,6 +48,7 @@ class SubAgentConfig(BaseModel, table=True):
     when_to_use: str
     system_prompt: str
     allowed_tools: Optional[list[str]] = Field(default=None, sa_column=Column(JSON))
+    mcp_server_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     model: Optional[str] = Field(default=None)
     max_turns: Optional[int] = Field(default=None)
     skill_names: Optional[list[str]] = Field(default=None, sa_column=Column(JSON))
@@ -90,7 +92,8 @@ class AgentApp(BaseModel, table=True):
         id: Primary key (referenced by session.agent_app_id without FK constraint)
         name: Globally unique application name
         system_prompt: System prompt of the assembled agent
-        allowed_tools: Optional tool whitelist (None = engine default)
+        allowed_tools: Optional tool whitelist (None = no extra tools beyond builtins and MCP)
+        mcp_server_names: MCP server names whose tools are bulk-included for this agent
         model: Optional LLM model override
         skill_names: Names of SkillAsset entries bound to this app
         subagent_names: Names of SubAgentConfig entries bound to this app
@@ -117,6 +120,7 @@ class AgentApp(BaseModel, table=True):
     name: str = Field(index=True, unique=True)
     system_prompt: str
     allowed_tools: Optional[list[str]] = Field(default=None, sa_column=Column(JSON))
+    mcp_server_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     model: Optional[str] = Field(default=None)
     skill_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     subagent_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
