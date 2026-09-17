@@ -27,8 +27,10 @@ vi.mock('@/utils/authStorage', () => ({
 }))
 
 const refreshUserTokenMock = vi.fn()
+const resetAuthStateMock = vi.fn()
 vi.mock('@/composables/useAuth', () => ({
   refreshUserToken: (...args: unknown[]) => refreshUserTokenMock(...args),
+  resetAuthState: (...args: unknown[]) => resetAuthStateMock(...args),
 }))
 
 type ResponseHandler = (response: unknown) => unknown
@@ -155,6 +157,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   getUserTokenMock.mockReturnValue(null)
   refreshUserTokenMock.mockReset()
+  resetAuthStateMock.mockReset()
   routerMock.currentRoute.value = { name: 'llm', fullPath: '/llm' }
   routerMock.replace.mockReset()
   fakeInstance.get.mockImplementation((url: string, config?: unknown) =>
@@ -369,6 +372,10 @@ describe('401 会话过期处理（Phase 1 G1: refresh interceptor）', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 0))
     expect(refreshUserTokenMock).toHaveBeenCalledTimes(1)
     expect(clearAuthMock).toHaveBeenCalledTimes(1)
+    // 关键不变量：清 storage 的同时必须重置 useAuth 内存态——
+    // 路由守卫 hasUserToken() 读的是响应式 ref，若只清 localStorage，
+    // 守卫仍视为已登录，会把 /login 弹回受保护页造成 401 循环（浏览器实测 bug）。
+    expect(resetAuthStateMock).toHaveBeenCalledTimes(1)
     expect(routerMock.replace).toHaveBeenCalledWith({
       name: 'login',
       query: { redirect: '/llm', reason: 'expired' },
@@ -390,6 +397,7 @@ describe('401 会话过期处理（Phase 1 G1: refresh interceptor）', () => {
     // 关键不变量：refresh 端点自身 401 不触发 refreshUserToken（防递归）
     expect(refreshUserTokenMock).not.toHaveBeenCalled()
     expect(clearAuthMock).toHaveBeenCalledTimes(1)
+    expect(resetAuthStateMock).toHaveBeenCalledTimes(1)
     expect(routerMock.replace).toHaveBeenCalledWith({
       name: 'login',
       query: { redirect: '/llm', reason: 'expired' },

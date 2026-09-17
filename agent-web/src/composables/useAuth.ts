@@ -116,6 +116,17 @@ export async function logout(): Promise<void> {
   userToken.value = null
 }
 
+/**
+ * 仅重置内存响应式认证态（storage 清理由调用方的 clearAuth 负责）。
+ * 401 拦截器清完 localStorage 后必须调用本函数：路由守卫 hasUserToken()
+ * 读的是这里的响应式 ref，若不同步置空，守卫会把 /login 再弹回受保护页，
+ * 造成 401 → 跳 login → 弹回 → 再 401 的死循环。
+ */
+export function resetAuthState(): void {
+  user.value = null
+  userToken.value = null
+}
+
 /** JWT payload 解码（仅取 sub 数字）。失败返回 0，由调用方走兜底。 */
 export function extractUserId(token: string): number {
   const part = token.split('.')[1]

@@ -2,7 +2,7 @@ import axios, { type AxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import type { ApiResponse } from '@/types'
 import { clearAuth, getUserToken } from '@/utils/authStorage'
-import { refreshUserToken } from '@/composables/useAuth'
+import { refreshUserToken, resetAuthState } from '@/composables/useAuth'
 
 /**
  * 统一 axios 实例：后端 API 前缀为 /api/v1（开发态经 Vite 代理转发，无 rewrite）。
@@ -112,6 +112,7 @@ request.interceptors.response.use(
         const requestUrl = originalConfig?.url ?? ''
         if (isRefreshEndpointPath(requestUrl)) {
           clearAuth()
+          resetAuthState()
           void (async (): Promise<void> => {
             const { default: router } = await import('@/router')
             if (router.currentRoute.value.name === 'login') return
@@ -156,6 +157,7 @@ request.interceptors.response.use(
 
         // refresh 失败或已是第二次 401：清空 + 跳 login。
         clearAuth()
+        resetAuthState()
         void (async (): Promise<void> => {
           const { default: router } = await import('@/router')
           if (router.currentRoute.value.name === 'login') {
