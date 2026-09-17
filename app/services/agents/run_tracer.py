@@ -110,6 +110,21 @@ def _normalize_tool_output(output: Any) -> str:
     return _truncate(str(output))
 
 
+def _extract_model_id(serialized: dict[str, Any]) -> str | None:
+    """Extract the real model id from a serialized chat model's kwargs.
+
+    LangChain serializes the chat model constructor kwargs under
+    ``serialized["kwargs"]``; the model identifier lives in ``model``
+    (ChatOpenAI) or ``model_name`` (ChatAnthropic, legacy). Returns None
+    when neither key is present so the caller can fall back to the
+    app-level model name.
+    """
+    kwargs = serialized.get("kwargs", {})
+    if not isinstance(kwargs, dict):
+        return None
+    return kwargs.get("model") or kwargs.get("model_name")
+
+
 def _agent_from_metadata(metadata: dict[str, Any] | None) -> str:
     """Extract the owning agent name from callback metadata (§7.2).
 
@@ -185,8 +200,12 @@ class RunTracer(BaseCallbackHandler):
     ) -> None:
         """Record one LLM request: the full input message list and model id."""
         flattened = [_serialize_message(message) for batch in messages for message in batch]
+        real_model = _extract_model_id(serialized)
         self._pending[run_id] = self._start_event(
-            "llm_call", model=self.model_name, input_messages=flattened, agent=_agent_from_metadata(metadata)
+            "llm_call",
+            model=real_model or self.model_name,
+            input_messages=flattened,
+            agent=_agent_from_metadata(metadata),
         )
 
     @override

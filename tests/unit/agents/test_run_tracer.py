@@ -269,3 +269,37 @@ def test_agent_defaults_to_coordinator_without_metadata() -> None:
         metadata={"lc_agent_name": ""},
     )
     assert [event["agent"] for event in tracer.events] == ["coordinator", "coordinator"]
+
+
+# ---------------------------------------------------------------------------
+# Real model extraction from serialized kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_llm_call_extracts_model_from_serialized_kwargs() -> None:
+    """on_chat_model_start records the real model id from serialized kwargs, not the constructor fallback."""
+    tracer = RunTracer(model_name="app-level-model")
+    tracer.on_chat_model_start(
+        {"name": "ChatOpenAI", "kwargs": {"model": "gpt-4o-mini"}},
+        [[HumanMessage(content="go")]],
+        run_id=_run_id(),
+    )
+    assert tracer.events[0]["model"] == "gpt-4o-mini"
+
+
+def test_llm_call_falls_back_to_model_name_key() -> None:
+    """ChatAnthropic uses model_name instead of model; extraction honours both."""
+    tracer = RunTracer(model_name="app-level-model")
+    tracer.on_chat_model_start(
+        {"name": "ChatAnthropic", "kwargs": {"model_name": "claude-sonnet-4-20250514"}},
+        [[HumanMessage(content="go")]],
+        run_id=_run_id(),
+    )
+    assert tracer.events[0]["model"] == "claude-sonnet-4-20250514"
+
+
+def test_llm_call_falls_back_to_constructor_model_when_extraction_fails() -> None:
+    """When serialized has no kwargs, the constructor model_name is used."""
+    tracer = RunTracer(model_name="app-level-model")
+    tracer.on_chat_model_start({}, [[HumanMessage(content="go")]], run_id=_run_id())
+    assert tracer.events[0]["model"] == "app-level-model"
