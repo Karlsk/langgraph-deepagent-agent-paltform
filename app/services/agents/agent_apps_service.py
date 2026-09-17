@@ -14,6 +14,7 @@ resolution/visibility), ``db_service`` (association CRUD) and the existing
 """
 
 import asyncio
+import hashlib
 import shutil
 
 from sqlmodel import Session, select
@@ -28,10 +29,12 @@ from app.models.agent_assets import (
 )
 from app.models.session import Session as ChatSession
 from app.models.user import User
+from app.models.workflow_definition import WorkflowDefinitionAsset
 from app.schemas.agent_apps import AgentAppUpdate
 from app.services import db_service
 from app.services.agents import agents_service, assembly, runtime, skills_store
 from app.services.agents.mcp_manager import build_tool_catalog
+from app.services.agents.workflow_bridge import get_workflow_registry
 
 # System default AgentApp name (bootstrap-seeded; delete-protected like the
 # default provider/model pair). Mirrors the API-layer constant; the API layer
@@ -117,6 +120,61 @@ async def _validate_publish_prerequisites(
     return subagent_cfgs, skill_hashes
 
 
+def _workflow_published_hash(workflow_id: str, content_hash: str) -> str:
+    """Fingerprint a workflow app publish from the bound workflow's content.
+
+    The deepagents fingerprint folds skill/sub-agent/model/MCP state; a
+    workflow app has none of those, so its publish identity is the bound
+    workflow id plus the workflow definition's content hash — editing and
+    re-saving the workflow therefore invalidates the published fingerprint.
+    """
+    return hashlib.sha256(f"{workflow_id}:{content_hash}".encode("utf-8")).hexdigest()
+
+
+async def _publish_workflow_app(session: Session, *, app_cfg: AgentApp) -> AgentApp:
+    """Publish an engine='workflow' app (D7): registry check, no skills workspace.
+
+    A workflow app carries no skills/sub-agents, so the deepagents Global ->
+    Agent materialization, ``agent_dir`` stamping and ``workspace_hash`` are
+    all skipped. The bound workflow must be registered (existence is a runtime
+    check, S18); the published fingerprint tracks the workflow content hash.
+
+    Raises:
+        AgentAppNotPublishedError: No workflow_id binding, or the bound
+            workflow is not registered in the process-level registry.
+    """
+    workflow_id = (app_cfg.workflow_id or "").strip()
+    if not workflow_id:
+        raise AgentAppNotPublishedError(
+            f"agent app '{app_cfg.name}' has engine='workflow' but no workflow_id binding"
+        )
+    if not get_workflow_registry().has_workflow(workflow_id):
+        raise AgentAppNotPublishedError(f"bound workflow '{workflow_id}' is not registered")
+
+    asset = session.get(WorkflowDefinitionAsset, workflow_id)
+    content_hash = asset.content_hash if asset is not None else ""
+
+    app_cfg.status = "published"
+    app_cfg.published_hash = _workflow_published_hash(workflow_id, content_hash)
+    app_cfg.agent_dir = None
+    app_cfg.workspace_hash = None
+    app_cfg.version += 1
+
+    await db_service._invalidate_user_layer_cache(session, app_cfg=app_cfg)
+
+    session.add(app_cfg)
+    session.commit()
+    session.refresh(app_cfg)
+    logger.info(
+        "agent_app_published",
+        app_id=app_cfg.id,
+        engine="workflow",
+        workflow_id=workflow_id,
+        version=app_cfg.version,
+    )
+    return app_cfg
+
+
 async def publish_agent_app(
     session: Session, *, app_cfg: AgentApp, current_user_id: int
 ) -> AgentApp:
@@ -127,6 +185,10 @@ async def publish_agent_app(
     skeleton ``agent_dir`` stamping, the preserved published fingerprint /
     status / version transition, and user-layer cache invalidation.
 
+    An engine='workflow' app takes a separate branch (D7): it has no skills
+    workspace, so it is published against the bound workflow's registration
+    and content hash instead.
+
     Args:
         session: SQLModel database session.
         app_cfg: The AgentApp row to publish.
@@ -135,6 +197,9 @@ async def publish_agent_app(
     Returns:
         The published AgentApp row.
     """
+    if app_cfg.engine == "workflow":
+        return await _publish_workflow_app(session, app_cfg=app_cfg)
+
     subagent_cfgs, skill_hashes = await _validate_publish_prerequisites(session, app_cfg)
 
     # Global -> Agent copy (hash-compared, idempotent).
@@ -208,6 +273,15 @@ async def associate_user_with_app(
     assoc = await db_service._get_or_create_association(
         session, user_id=user_id, app_id=app_id
     )
+
+    if app_cfg.engine == "workflow":
+        # A workflow app has no skills workspace: the association is recorded
+        # but no (Global + Agent) -> User layer is materialized (D7).
+        assoc.last_synced_workspace_hash = None
+        session.add(assoc)
+        session.commit()
+        logger.info("user_app_associated", user_id=user_id, app_id=app_id, engine="workflow")
+        return
 
     subagent_cfgs = await agents_service.list_subagent_cfgs(
         session, app_id=app_id, skill_names=app_cfg.skill_names or []
@@ -407,6 +481,10 @@ async def ensure_user_workspace_up_to_date(
     app_cfg = session.get(AgentApp, app_id)
     if app_cfg is None:
         logger.warning("lazy_validate_app_not_found", app_id=app_id)
+        return False
+
+    if app_cfg.engine == "workflow":
+        # No skills workspace to keep in sync for a workflow app (D7).
         return False
 
     assoc = await db_service._get_association(session, user_id=user_id, app_id=app_id)

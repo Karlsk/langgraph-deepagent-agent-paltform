@@ -1302,3 +1302,24 @@ def test_ensure_all_single_app_failure_isolated(
     workspace_db.refresh(bad)
     assert good.agent_workspace_status == "active"
     assert bad.agent_workspace_status == "pending"
+
+
+def test_ensure_all_workflow_app_skipped(workspace_db: Session) -> None:
+    """§5.4 (D7): an engine='workflow' app gets no skeleton dir and is not promoted."""
+    app = AgentApp(
+        name="chatflow-app",
+        system_prompt="",
+        engine="workflow",
+        workflow_id="wf-1",
+        status="published",
+        skill_names=[],
+    )
+    workspace_db.add(app)
+    workspace_db.commit()
+    workspace_db.refresh(app)
+
+    asyncio.run(bootstrap.ensure_all_agent_workspaces(workspace_db))
+
+    assert not skills_store._agent_skill_dir(app.id).exists()
+    workspace_db.refresh(app)
+    assert app.agent_workspace_status != "active"

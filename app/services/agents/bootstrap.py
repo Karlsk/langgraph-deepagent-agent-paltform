@@ -269,6 +269,12 @@ async def ensure_all_agent_workspaces(session: Session) -> None:
 
     for app in apps:
         try:
+            if app.engine == "workflow":
+                # Workflow apps have no Agent-layer workspace; skip entirely
+                # (no skeleton dir, no hash, not promoted to active).
+                skipped_count += 1
+                continue
+
             agent_dir = skills_store._agent_skill_dir(app.id)  # noqa: SLF001 — same-package path helper
 
             if app.status == "draft":
