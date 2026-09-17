@@ -42,6 +42,7 @@ from app.core.observability import langfuse_init
 from app.services.agents.bootstrap import ensure_all_agent_workspaces, ensure_default_agent_app
 from app.services.agents.mcp_manager import ToolCatalogEntry, build_tool_catalog, get_mcp_tools, shutdown_mcp_clients
 from app.core.langgraph.tools import tools as builtin_tools
+from app.services.agents.workflow_bridge import set_workflow_registry
 from app.services.database import database_service
 from app.services.llm.provider_service import resolve_chat_model
 from app.services.memory import memory_service
@@ -196,6 +197,11 @@ app.state.workflow_registry = build_registry(
     tool_resolver=_build_tool_resolver(),
 )
 logger.info("workflow_registry_built", directory=str(DEFAULT_CONFIG_DIR))
+
+# Hand the registry to the runtime layer: get_runtime builds a WorkflowAppRuntime
+# outside any request/app scope, so it reads the registry back through this
+# host-level bridge (spec-01 Phase 2; the engine itself keeps no global state).
+set_workflow_registry(app.state.workflow_registry)
 
 
 # Add validation exception handler
