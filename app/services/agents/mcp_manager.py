@@ -74,17 +74,23 @@ def to_spec(server: McpServerConfig) -> MCPServerSpec:
     )
 
 
-async def get_mcp_tools(session: Session) -> list[BaseTool]:
-    """Load tools of every enabled MCP server, degrading per server on failure.
+async def get_mcp_tools(session: Session, *, server_names: Sequence[str] | None = None) -> list[BaseTool]:
+    """Load tools of enabled MCP servers, degrading per server on failure.
 
     Args:
         session: SQLModel database session.
+        server_names: Optional whitelist of server names to load. When
+            ``None`` every enabled server is loaded (backward-compatible).
 
     Returns:
         Flat list of namespaced tools from all successfully loaded servers.
     """
+    servers = load_mcp_servers(session)
+    if server_names is not None:
+        allowed = set(server_names)
+        servers = [s for s in servers if s.name in allowed]
     result: list[BaseTool] = []
-    for server in load_mcp_servers(session):
+    for server in servers:
         tools = await load_server_tools(to_spec(server))
         if tools is not None:
             result.extend(tools)

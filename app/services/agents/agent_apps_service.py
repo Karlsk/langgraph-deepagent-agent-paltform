@@ -359,7 +359,7 @@ async def patch_agent_app(
     if not updates:
         raise ValueError("nothing to update")
 
-    for field in ("skill_names", "subagent_names", "interrupt_on"):
+    for field in ("skill_names", "subagent_names", "interrupt_on", "mcp_server_names"):
         if field in updates and updates[field] is None:
             kind = "dict" if field == "interrupt_on" else "list"
             raise ValueError(

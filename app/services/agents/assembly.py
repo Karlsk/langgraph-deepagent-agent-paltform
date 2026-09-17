@@ -14,7 +14,8 @@ Assembly pipeline (``compile_agent_app``):
    lazy validation in front of ``runtime.get_runtime`` instead.
 2. ``build_tool_catalog`` merges builtin + MCP tools (fail-fast whitelist
    validation happens against this catalog in ``validate_publish``).
-3. ``resolve_tools`` applies the app-level tool whitelist (None = all).
+3. ``resolve_tools`` applies the app-level tool whitelist (None = none;
+   actual tools = builtin + MCP from associated servers + whitelist).
 4. Each ``SubAgentConfig`` becomes a declarative deepagents ``SubAgent`` via
    ``build_subagent_spec`` with explicit inheritance resolution
    (including skill inheritance: ``cfg.skill_names is None`` -> inherit the
@@ -212,17 +213,18 @@ def resolve_tools(allowed_tools: Optional[list[str]], catalog: Mapping[str, Base
     """Resolve a tool whitelist against a name -> tool index.
 
     Args:
-        allowed_tools: Whitelist of tool names; ``None`` means every catalog tool.
+        allowed_tools: Whitelist of tool names; ``None`` means no extra tools.
         catalog: Mapping of tool name to tool instance (builtin + MCP).
 
     Returns:
-        The resolved tool instances (whitelist order preserved).
+        The resolved tool instances (whitelist order preserved), or an empty
+        list when ``allowed_tools`` is ``None``.
 
     Raises:
         ValueError: Listing every name missing from the catalog.
     """
     if allowed_tools is None:
-        return list(catalog.values())
+        return []
 
     unknown = sorted(name for name in allowed_tools if name not in catalog)
     if unknown:
@@ -233,17 +235,24 @@ def resolve_tools(allowed_tools: Optional[list[str]], catalog: Mapping[str, Base
 def build_subagent_spec(
     cfg: SubAgentConfig,
     *,
-    parent_tools: Sequence[BaseTool],
     parent_model: BaseChatModel,
     resolve_model: Callable[[str], BaseChatModel],
     parent_skills: Sequence[str] = (),
     tool_index: Optional[Mapping[str, BaseTool]] = None,
+    mcp_tools_by_server: Optional[Mapping[str, Sequence[BaseTool]]] = None,
 ) -> SubAgent:
     """Convert a SubAgentConfig row into a declarative deepagents SubAgent spec.
 
-    Inheritance is explicit:
+    Tool resolution is independent (no parent inheritance):
 
-    - ``allowed_tools=None`` inherits the parent's resolved tools.
+    - Builtin tools are always included.
+    - ``cfg.mcp_server_names`` selects which MCP servers' tools are
+      bulk-included (looked up in ``mcp_tools_by_server``).
+    - ``cfg.allowed_tools`` is an explicit whitelist resolved against
+      ``tool_index``; ``None`` adds no extra tools.
+
+    Skill/model/max_turns inheritance is unchanged:
+
     - ``model=None`` inherits the parent's model instance (the same object).
     - ``skill_names=None`` inherits the parent's published skill set
       (``parent_skills``, the parent's effective ``["/skills/<name>", ...]``
@@ -262,16 +271,15 @@ def build_subagent_spec(
 
     Args:
         cfg: The persisted sub-agent configuration row.
-        parent_tools: Tools already resolved for the parent agent.
         parent_model: Model instance used by the parent agent.
         resolve_model: Resolver mapping a ``"provider/model"`` reference to a
             chat model instance (supplied by ``compile_agent_app``).
         parent_skills: Effective skill source paths of the parent agent
             (already prefixed with ``"/"``); ``None`` for the standalone
             runner, where inheritance degenerates to ``[]``.
-        tool_index: Optional full name -> tool index used to resolve an
-            explicit ``allowed_tools`` whitelist; defaults to the parent's
-            tool set when omitted.
+        tool_index: Full name -> tool index used to resolve an explicit
+            ``allowed_tools`` whitelist.
+        mcp_tools_by_server: Pre-loaded MCP tools keyed by server name.
 
     Returns:
         A deepagents SubAgent TypedDict ready for ``create_deep_agent``.
@@ -280,13 +288,14 @@ def build_subagent_spec(
         ValueError: When ``allowed_tools`` references unknown tool names or
             the model reference cannot be resolved.
     """
-    if cfg.allowed_tools is None:
-        tools: list[BaseTool] = list(parent_tools)
-    else:
-        index: Mapping[str, BaseTool] = (
-            tool_index if tool_index is not None else {tool.name: tool for tool in parent_tools}
-        )
-        tools = resolve_tools(cfg.allowed_tools, index)
+    server_map: Mapping[str, Sequence[BaseTool]] = mcp_tools_by_server or {}
+
+    tools: list[BaseTool] = list(builtin_tools)
+    for server_name in (cfg.mcp_server_names or []):
+        tools.extend(server_map.get(server_name, []))
+    if cfg.allowed_tools:
+        index: Mapping[str, BaseTool] = tool_index or {tool.name: tool for tool in tools}
+        tools.extend(resolve_tools(cfg.allowed_tools, index))
 
     model: BaseChatModel = resolve_model(cfg.model) if cfg.model else parent_model
 
@@ -315,7 +324,7 @@ def build_subagent_spec(
     logger.debug(
         "subagent_spec_built",
         name=cfg.name,
-        inherited_tools=cfg.allowed_tools is None,
+        mcp_server_count=len(cfg.mcp_server_names or []),
         inherited_model=cfg.model is None,
         max_turns=cfg.max_turns,
         skill_source=skill_source,
@@ -465,22 +474,34 @@ async def compile_agent_app(
         tool_count=len(tool_index),
     )
 
-    tools = resolve_tools(app_cfg.allowed_tools, tool_index)
+    all_server_names: set[str] = set(app_cfg.mcp_server_names or [])
+    for cfg in subagent_cfgs:
+        all_server_names.update(cfg.mcp_server_names or [])
+    mcp_tools_by_server: dict[str, list[BaseTool]] = {}
+    for name in all_server_names:
+        mcp_tools_by_server[name] = await get_mcp_tools(session, server_names=[name])
+
+    tools: list[BaseTool] = list(builtin_tools)
+    for server_name in (app_cfg.mcp_server_names or []):
+        tools.extend(mcp_tools_by_server.get(server_name, []))
+    if app_cfg.allowed_tools:
+        tools.extend(resolve_tools(app_cfg.allowed_tools, tool_index))
+
     model = build_chat_model(*load_model_config(session, app_cfg.model))
 
     def resolve_model(reference: str) -> BaseChatModel:
         """Resolve a subagent model reference against the live DB."""
         return build_chat_model(*load_model_config(session, reference))
 
-    parent_skills: list[str] = [f"/skills/{name}" for name in effective_skill_names]
+    parent_skills: list[str] = [f"/skills/{name}" for name in app_cfg.skill_names]
     subagents = [
         build_subagent_spec(
             cfg,
-            parent_tools=tools,
             parent_model=model,
             tool_index=tool_index,
             resolve_model=resolve_model,
             parent_skills=parent_skills,
+            mcp_tools_by_server=mcp_tools_by_server,
         )
         for cfg in subagent_cfgs
     ]
@@ -540,13 +561,15 @@ def validate_publish(
     catalog: Sequence[Mapping[str, Any]],
     model_catalog: Mapping[str, tuple[Provider, ModelConfig]],
 ) -> None:
-    """Validate tool whitelists and model references before publishing.
+    """Validate tool whitelists, model references, and MCP server bindings before publishing.
 
     Skill/subagent referential integrity is enforced by the caller at the DB
     layer; this function checks that every ``allowed_tools`` entry of the
-    AgentApp and of each subagent exists in the current tool catalog, and
-    that every ``model`` reference (NULL resolves to the default pair)
-    points at an existing, enabled provider/model pair.
+    AgentApp and of each subagent exists in the current tool catalog, that
+    every ``model`` reference (NULL resolves to the default pair) points at
+    an existing, enabled provider/model pair, and that every
+    ``mcp_server_names`` entry references an enabled MCP server present in
+    the catalog.
 
     Args:
         app_cfg: The AgentApp configuration row being published.
@@ -559,7 +582,8 @@ def validate_publish(
 
     Raises:
         ValueError: Listing every owner and unknown tool name, then every
-            invalid model reference (aggregated per category).
+            invalid model reference, then every unknown MCP server name
+            (aggregated per category).
     """
     catalog_names = {entry["name"] for entry in catalog}
     violations: list[str] = []
@@ -595,6 +619,18 @@ def validate_publish(
     if model_violations:
         raise ValueError(f"model references invalid: {', '.join(model_violations)}")
 
+    enabled_servers = {entry["server"] for entry in catalog if entry.get("source") == "mcp" and "server" in entry}
+    server_violations: list[str] = []
+    server_owners: list[tuple[str, list[str]]] = [("agent_app:" + app_cfg.name, app_cfg.mcp_server_names or [])]
+    server_owners.extend((f"subagent:{cfg.name}", cfg.mcp_server_names or []) for cfg in subagent_cfgs)
+
+    for owner, server_names in server_owners:
+        unknown = sorted(name for name in server_names if name not in enabled_servers)
+        server_violations.extend(f"{owner} -> {name}" for name in unknown)
+
+    if server_violations:
+        raise ValueError(f"mcp_server_names reference unknown servers: {', '.join(server_violations)}")
+
     logger.debug("agent_app_publish_tools_validated", app_name=app_cfg.name, owner_count=len(owners))
 
 
@@ -606,6 +642,7 @@ _APP_FIELDS = (
     "name",
     "system_prompt",
     "allowed_tools",
+    "mcp_server_names",
     "model",
     "skill_names",
     "subagent_names",
@@ -619,6 +656,7 @@ _SUBAGENT_FIELDS = (
     "when_to_use",
     "system_prompt",
     "allowed_tools",
+    "mcp_server_names",
     "model",
     "max_turns",
     "skill_names",

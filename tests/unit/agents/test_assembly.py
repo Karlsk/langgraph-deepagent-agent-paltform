@@ -113,7 +113,7 @@ def mock_catalog(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     async def fake_build_tool_catalog(session: Any) -> list[dict[str, Any]]:
         return catalog
 
-    async def fake_get_mcp_tools(session: Any) -> list[BaseTool]:
+    async def fake_get_mcp_tools(session: Any, *, server_names: Any = None) -> list[BaseTool]:
         return []
 
     monkeypatch.setattr(assembly, "build_tool_catalog", fake_build_tool_catalog)
@@ -140,6 +140,7 @@ def _make_app(**overrides: Any) -> AgentApp:
         "name": "demo-app",
         "system_prompt": "You are the demo app.",
         "allowed_tools": None,
+        "mcp_server_names": [],
         "model": None,
         "skill_names": [],
         "subagent_names": [],
@@ -160,6 +161,7 @@ def _make_subagent(**overrides: Any) -> SubAgentConfig:
         "when_to_use": "Use for generic help.",
         "system_prompt": "You are a helper.",
         "allowed_tools": None,
+        "mcp_server_names": [],
         "model": None,
         "max_turns": None,
         "content_hash": "h-helper",
@@ -217,10 +219,10 @@ def _patch_llm_seams(monkeypatch: pytest.MonkeyPatch, models: dict[str, Any]) ->
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_tools_none_returns_full_catalog() -> None:
-    """None whitelist resolves to every catalog tool."""
+def test_resolve_tools_none_returns_empty() -> None:
+    """None whitelist resolves to no extra tools (builtins are auto-included separately)."""
     resolved = assembly.resolve_tools(None, _tool_index())
-    assert {t.name for t in resolved} == {"echo", "upper"}
+    assert resolved == []
 
 
 def test_resolve_tools_filters_by_name() -> None:
@@ -241,9 +243,9 @@ def test_resolve_tools_unknown_names_raise_with_listing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_subagent_spec_blank_fields_inherit_parent() -> None:
-    """Blank allowed_tools/model inherit the parent's tools and model (same object)."""
-    parent_tools = [echo, upper]
+def test_build_subagent_spec_blank_fields_get_builtins_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no mcp_server_names and allowed_tools=None, only builtin tools are mounted."""
+    monkeypatch.setattr(assembly, "builtin_tools", [echo, upper])
     parent_model = _parent_model()
     resolved: list[str] = []
 
@@ -253,7 +255,6 @@ def test_build_subagent_spec_blank_fields_inherit_parent() -> None:
 
     spec = assembly.build_subagent_spec(
         _make_subagent(),
-        parent_tools=parent_tools,
         parent_model=parent_model,
         resolve_model=resolve_model,
     )
@@ -267,20 +268,20 @@ def test_build_subagent_spec_blank_fields_inherit_parent() -> None:
     assert "middleware" not in spec
 
 
-def test_build_subagent_spec_explicit_tools_and_model() -> None:
+def test_build_subagent_spec_explicit_tools_and_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """Explicit tools/model/max_turns resolve via the index, resolver and gate."""
+    monkeypatch.setattr(assembly, "builtin_tools", [echo])
     custom_model = _parent_model("sub model")
 
     cfg = _make_subagent(allowed_tools=["upper"], model="mini", max_turns=3)
     spec = assembly.build_subagent_spec(
         cfg,
-        parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: custom_model,
         tool_index=_tool_index(),
     )
 
-    assert [t.name for t in spec["tools"]] == ["upper"]
+    assert [t.name for t in spec["tools"]] == ["echo", "upper"]
     assert spec["model"] is custom_model
     middleware = spec.get("middleware", [])
     assert len(middleware) == 1
@@ -294,11 +295,63 @@ def test_build_subagent_spec_unknown_tool_raises() -> None:
     with pytest.raises(ValueError, match="ghost"):
         assembly.build_subagent_spec(
             cfg,
-            parent_tools=[echo],
             parent_model=_parent_model(),
             resolve_model=lambda reference: _parent_model(),
             tool_index=_tool_index(),
         )
+
+
+@tool
+def mcp_browse(url: str) -> str:
+    """Browse a URL via MCP."""
+    return f"browsed: {url}"
+
+
+@tool
+def mcp_read_file(path: str) -> str:
+    """Read a file via MCP."""
+    return f"read: {path}"
+
+
+def test_build_subagent_spec_mcp_server_names_gets_independent_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subagent with own mcp_server_names gets only those servers' tools + builtins."""
+    monkeypatch.setattr(assembly, "builtin_tools", [echo])
+    mcp_tools_by_server = {
+        "browser-use": [mcp_browse],
+        "local-fs": [mcp_read_file],
+    }
+
+    cfg = _make_subagent(mcp_server_names=["browser-use"])
+    spec = assembly.build_subagent_spec(
+        cfg,
+        parent_model=_parent_model(),
+        resolve_model=lambda reference: _parent_model(),
+        mcp_tools_by_server=mcp_tools_by_server,
+    )
+
+    assert {t.name for t in spec["tools"]} == {"echo", "mcp_browse"}
+
+
+def test_build_subagent_spec_no_mcp_server_names_gets_no_mcp_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subagent with empty mcp_server_names gets only builtins (no MCP tools)."""
+    monkeypatch.setattr(assembly, "builtin_tools", [echo])
+    mcp_tools_by_server = {
+        "browser-use": [mcp_browse],
+    }
+
+    cfg = _make_subagent(mcp_server_names=[])
+    spec = assembly.build_subagent_spec(
+        cfg,
+        parent_model=_parent_model(),
+        resolve_model=lambda reference: _parent_model(),
+        mcp_tools_by_server=mcp_tools_by_server,
+    )
+
+    assert [t.name for t in spec["tools"]] == ["echo"]
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +363,6 @@ def test_build_subagent_spec_skill_names_none_inherits_parent_skills() -> None:
     """``skill_names=None`` resolves to the parent's published skill set (verbatim)."""
     spec = assembly.build_subagent_spec(
         _make_subagent(skill_names=None),
-        parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
         parent_skills=["/skills/pdf-export", "/skills/csv-clean"],
@@ -322,7 +374,6 @@ def test_build_subagent_spec_skill_names_empty_overrides_to_no_skills() -> None:
     """``skill_names=[]`` explicitly binds no skills (overrides inheritance)."""
     spec = assembly.build_subagent_spec(
         _make_subagent(skill_names=[]),
-        parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
         parent_skills=["/skills/pdf-export", "/skills/csv-clean"],
@@ -334,7 +385,6 @@ def test_build_subagent_spec_skill_names_explicit_whitelist_prefixes_slash() -> 
     """Explicit ``skill_names=[..]`` is materialised as ``["/skills/<name>", ...]``."""
     spec = assembly.build_subagent_spec(
         _make_subagent(skill_names=["pdf-export"]),
-        parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
         parent_skills=["/skills/csv-clean"],
@@ -346,7 +396,6 @@ def test_build_subagent_spec_default_parent_skills_empty_when_omitted() -> None:
     """Omitting ``parent_skills`` defaults to an empty parent set (None -> [])."""
     spec = assembly.build_subagent_spec(
         _make_subagent(skill_names=None),
-        parent_tools=[echo],
         parent_model=_parent_model(),
         resolve_model=lambda reference: _parent_model(),
     )
@@ -474,6 +523,32 @@ def test_validate_publish_rejects_disabled_provider(mock_catalog: list[dict[str,
         assembly.validate_publish(app_cfg, [], mock_catalog, catalog)
 
 
+def test_validate_publish_rejects_unknown_mcp_server_names(mock_catalog: list[dict[str, Any]]) -> None:
+    """mcp_server_names entries not present in the catalog are reported."""
+    catalog_with_mcp = [
+        *mock_catalog,
+        {"name": "browser__navigate", "source": "mcp", "server": "browser-use"},
+    ]
+    app_cfg = _make_app(mcp_server_names=["browser-use", "nonexistent"])
+    sub_cfg = _make_subagent(mcp_server_names=["ghost-server"])
+    with pytest.raises(ValueError, match="mcp_server_names") as exc_info:
+        assembly.validate_publish(app_cfg, [sub_cfg], catalog_with_mcp, _default_model_catalog())
+    assert "nonexistent" in str(exc_info.value)
+    assert "ghost-server" in str(exc_info.value)
+
+
+def test_validate_publish_accepts_known_mcp_server_names(mock_catalog: list[dict[str, Any]]) -> None:
+    """mcp_server_names referencing enabled catalog servers pass validation."""
+    catalog_with_mcp = [
+        *mock_catalog,
+        {"name": "browser__navigate", "source": "mcp", "server": "browser-use"},
+        {"name": "fs__read", "source": "mcp", "server": "local-fs"},
+    ]
+    app_cfg = _make_app(mcp_server_names=["browser-use"])
+    sub_cfg = _make_subagent(mcp_server_names=["local-fs"])
+    assembly.validate_publish(app_cfg, [sub_cfg], catalog_with_mcp, _default_model_catalog())
+
+
 # ---------------------------------------------------------------------------
 # fingerprint
 # ---------------------------------------------------------------------------
@@ -515,9 +590,11 @@ def test_compute_fingerprint_is_subagent_order_insensitive() -> None:
         {"app_cfg": _make_app(allowed_tools=["echo"])},
         {"app_cfg": _make_app(model="gpt-5")},
         {"app_cfg": _make_app(skill_names=["other"])},
+        {"app_cfg": _make_app(mcp_server_names=["browser-use"])},
         {"subagent_cfgs": [_make_subagent(max_turns=4)]},
         {"subagent_cfgs": [_make_subagent(system_prompt="new sub prompt")]},
         {"subagent_cfgs": [_make_subagent(skill_names=["pdf-export"])]},
+        {"subagent_cfgs": [_make_subagent(mcp_server_names=["local-fs"])]},
         {"skill_hashes": {"greet": "hash-b"}},
         {"mcp_fingerprint": "srv:hash-2"},
         {"model_fingerprint": "default/default:hash-2"},
@@ -799,6 +876,30 @@ def test_compile_agent_app_skills_mount_matches_physical_user_layer(
     root = Path(captured["root_dir"])
     assert root == workspace_root / "agents" / "6" / "users" / "9"
     assert root / "skills" / "greet" / "SKILL.md" == skills_store._user_skill_file(6, 9, "greet")  # noqa: SLF001
+
+
+def test_compile_agent_app_parent_skills_exclude_subagent_only_skills(
+    workspace_root: Path, mock_catalog: Any, mock_memory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parent agent must not mount subagent-only skills (prevents bypassing task delegation)."""
+    app_cfg = _make_app(skill_names=["parent-skill"])
+    sub_cfg = _make_subagent(name="helper", skill_names=["sub-only-skill"])
+    captured: dict[str, Any] = {}
+
+    real_create = assembly.create_deep_agent
+
+    def recording_create(**kwargs: Any) -> Any:
+        captured["skills"] = kwargs.get("skills")
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(assembly, "create_deep_agent", recording_create)
+    _patch_llm_seams(monkeypatch, {"default": ScriptedChatModel(responses=[AIMessage(content="ok")])})
+
+    asyncio.run(
+        assembly.compile_agent_app(object(), app_cfg, subagent_cfgs=[sub_cfg], user_id=9, checkpointer=MemorySaver())
+    )
+
+    assert captured["skills"] == ["/skills/parent-skill"]
 
 
 def test_compute_fingerprint_no_workspace_hash() -> None:

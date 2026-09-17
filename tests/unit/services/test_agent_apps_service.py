@@ -271,6 +271,44 @@ def test_patch_transitions_to_draft(
     assert assoc.last_synced_workspace_hash is None
 
 
+def test_patch_rejects_null_mcp_server_names(
+    db: DBSession, data_root: Path, owner: User
+) -> None:
+    """PATCH rejects null mcp_server_names (must use [] to clear)."""
+    app_row = _seed_app(db, name="mcp-patch-app", skill_names=[], status="published")
+
+    with pytest.raises(ValueError, match="mcp_server_names"):
+        asyncio.run(
+            agent_apps_service.patch_agent_app(
+                db,
+                app_cfg=app_row,
+                patch_data=AgentAppUpdate(mcp_server_names=None),
+                current_user_id=owner.id,
+            )
+        )
+
+
+def test_patch_accepts_empty_mcp_server_names(
+    db: DBSession, data_root: Path, owner: User
+) -> None:
+    """PATCH accepts [] for mcp_server_names and clears the field."""
+    app_row = _seed_app(db, name="mcp-clear-app", skill_names=[], status="published")
+    app_row.mcp_server_names = ["browser-use"]
+    db.add(app_row)
+    db.commit()
+
+    result = asyncio.run(
+        agent_apps_service.patch_agent_app(
+            db,
+            app_cfg=app_row,
+            patch_data=AgentAppUpdate(mcp_server_names=[]),
+            current_user_id=owner.id,
+        )
+    )
+
+    assert result.mcp_server_names == []
+
+
 # ---------------------------------------------------------------------------
 # delete cascade (spec §3.4)
 # ---------------------------------------------------------------------------
@@ -441,3 +479,25 @@ def test_ensure_user_workspace_up_to_date_silent_false_when_missing(
         )
     )
     assert missing_assoc is False
+
+
+# ---------------------------------------------------------------------------
+# get_app_status — lightweight pre-flight check
+# ---------------------------------------------------------------------------
+
+
+def test_get_app_status_returns_status(db: DBSession) -> None:
+    """Existing app: returns the status column verbatim."""
+    draft = _seed_app(db, name="draft-app", skill_names=[], status="draft")
+    published = _seed_app(db, name="pub-app", skill_names=[], status="published")
+
+    assert asyncio.run(agent_apps_service.get_app_status(db, draft.id)) == "draft"
+    assert asyncio.run(agent_apps_service.get_app_status(db, published.id)) == "published"
+
+
+def test_get_app_status_missing_raises(db: DBSession) -> None:
+    """Non-existent app id raises AgentAppNotFoundError."""
+    from app.services.agents.agent_apps_service import AgentAppNotFoundError
+
+    with pytest.raises(AgentAppNotFoundError):
+        asyncio.run(agent_apps_service.get_app_status(db, 99999))
