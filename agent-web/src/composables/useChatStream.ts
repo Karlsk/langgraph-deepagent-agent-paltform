@@ -11,12 +11,17 @@
  * - loadHistory 拉取 L2 行经同一 reducer 投影（实时 / 刷新视图同构）并
  *   恢复 pending（§5.3）
  *
+ * SSE 主 + 轮询兜底：SSE 首帧携带 task_init（task_id），前端存入
+ * sessionStorage；SSE 断连后若有 task_id 则自动切轮询模式（1.5s 间隔
+ * 拉取 /chat/updates）；页面刷新后 loadHistory 检查 sessionStorage 恢复
+ * 轮询，实现刷新不丢失正在生成的回复。
+ *
  * 生命周期：不注册 onBeforeUnmount（无组件实例的调用方会告警），由
  * ChatSessionView 在 onUnmounted 中显式调用 stop()。
  */
 import { ref, type Ref } from 'vue'
 
-import { fetchMessages } from '@/api/chat'
+import { fetchMessages, fetchTaskStatus, fetchTaskUpdates } from '@/api/chat'
 import { sseFetch } from '@/utils/sse'
 import type { HistoryItem, InterruptPayload, StreamEvent } from '@/types'
 
@@ -52,6 +57,12 @@ const DECISIONS_PREFIX = '{"decisions"'
 
 /** 网络中断提示语（断线不自动重连，恢复靠用户重发触发 resume，§9.2） */
 const DISCONNECTED_MESSAGE = '连接中断，可重新发送消息恢复'
+
+/** sessionStorage key 前缀：按 session 存储 task_id 供刷新恢复 */
+const STORAGE_PREFIX = 'chat:task:'
+
+/** 轮询间隔（毫秒） */
+const POLL_INTERVAL_MS = 1500
 
 /** 识别 decisions JSON 胶囊；非胶囊或解析失败返回 null（降级普通气泡） */
 function parseDecisionCapsule(content: string): DecisionCapsule | null {
@@ -175,9 +186,28 @@ export function useChatStream(sessionId: Ref<string>) {
   const errorMessage = ref<string | null>(null)
 
   let controller: AbortController | null = null
+  const taskId = ref<string | null>(null)
+  let cursor = 0
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+
+  function storageKey(): string {
+    return STORAGE_PREFIX + sessionId.value
+  }
+
+  function clearTaskId(): void {
+    taskId.value = null
+    cursor = 0
+    try { sessionStorage.removeItem(storageKey()) } catch { /* quota / private mode */ }
+  }
 
   function handleFrame(event: StreamEvent): void {
     switch (event.type) {
+      case 'task_init':
+        if (event.task_id) {
+          taskId.value = event.task_id
+          try { sessionStorage.setItem(storageKey(), event.task_id) } catch { /* ignore */ }
+        }
+        break
       case 'message':
         applyMessage(items.value, event.content ?? '', event.source)
         break
@@ -194,19 +224,46 @@ export function useChatStream(sessionId: Ref<string>) {
         errorMessage.value = event.message ?? '未知错误'
         break
       case 'done':
-        // 本轮结束：未收尾的 run 卡片置为非运行态；streaming 由 runStream 的 finally 收尾
         for (const item of items.value) {
           if (item.kind === 'subagent_run') item.running = false
         }
+        clearTaskId()
         break
     }
   }
 
-  /**
-   * 发起一轮流式回合：先落出方向视图（用户气泡 / 审批胶囊），再同步
-   * 建立 SSE 连接（signal 与 mock call 在首个 await 前就绪）；payload
-   * 即出站 user 消息内容（普通文本 / decisions JSON，§5.2）。
-   */
+  function stopPolling(): void {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
+
+  function startPolling(): void {
+    streaming.value = true
+    errorMessage.value = null
+    pollTimer = setInterval(async () => {
+      if (!taskId.value) { stopPolling(); return }
+      try {
+        const result = await fetchTaskUpdates(sessionId.value, taskId.value, cursor)
+        for (const event of result.events) {
+          handleFrame(event)
+        }
+        cursor = result.next_cursor
+        if (result.status !== 'running') {
+          stopPolling()
+          streaming.value = false
+          clearTaskId()
+        }
+      } catch {
+        stopPolling()
+        streaming.value = false
+        errorMessage.value = DISCONNECTED_MESSAGE
+        clearTaskId()
+      }
+    }, POLL_INTERVAL_MS)
+  }
+
   async function runStream(outgoing: ChatViewItem, payload: string): Promise<void> {
     items.value.push(outgoing)
     pendingInterrupt.value = null
@@ -227,22 +284,27 @@ export function useChatStream(sessionId: Ref<string>) {
           }
         },
         onError: () => {
-          errorMessage.value = DISCONNECTED_MESSAGE
+          if (taskId.value) {
+            startPolling()
+          } else {
+            errorMessage.value = DISCONNECTED_MESSAGE
+            streaming.value = false
+          }
         },
       })
     } catch {
-      // onError 已写入提示；吞掉避免未处理 rejection
+      // onError 已写入提示或启动轮询；吞掉避免未处理 rejection
     } finally {
-      streaming.value = false
+      if (!pollTimer) {
+        streaming.value = false
+      }
     }
   }
 
-  /** 发送用户消息（普通气泡） */
   function send(content: string): Promise<void> {
     return runStream({ kind: 'message', role: 'user', content }, content)
   }
 
-  /** 提交审批决定：decisions JSON 消息通道 resume（§5.2） */
   function submitDecisions(approvals: boolean[]): Promise<void> {
     const approved = approvals.filter(Boolean).length
     const payload = JSON.stringify({
@@ -254,12 +316,13 @@ export function useChatStream(sessionId: Ref<string>) {
     )
   }
 
-  /** 用户点停止 / 组件卸载：abort 当前流（sseFetch 静默收尾） */
   function stop(): void {
     controller?.abort()
+    stopPolling()
+    clearTaskId()
+    streaming.value = false
   }
 
-  /** 拉取 L2 历史并恢复 pending 审批卡片（§5.3）；subagent 行归并为卡片 */
   async function loadHistory(): Promise<void> {
     const data = await fetchMessages(sessionId.value)
     items.value = projectHistoryRows(data.messages)
@@ -267,6 +330,21 @@ export function useChatStream(sessionId: Ref<string>) {
       if (item.kind === 'subagent_run') item.running = false
     }
     pendingInterrupt.value = data.pending_interrupt ?? null
+
+    const savedTaskId = (() => { try { return sessionStorage.getItem(storageKey()) } catch { return null } })()
+    if (savedTaskId) {
+      try {
+        const status = await fetchTaskStatus(sessionId.value, savedTaskId)
+        if (status.status === 'running') {
+          taskId.value = savedTaskId
+          startPolling()
+          return
+        }
+      } catch {
+        // status 查询失败，降级为普通历史视图
+      }
+      try { sessionStorage.removeItem(storageKey()) } catch { /* ignore */ }
+    }
   }
 
   return {

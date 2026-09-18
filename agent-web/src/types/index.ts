@@ -54,7 +54,7 @@ export interface InterruptPayload {
 
 /** SSE 帧模型（对应后端 StreamEvent；单 schema 可选字段，exclude_none 序列化） */
 export interface StreamEvent {
-  type: 'message' | 'tool_call' | 'interrupt' | 'summary' | 'error' | 'done'
+  type: 'message' | 'tool_call' | 'interrupt' | 'summary' | 'error' | 'done' | 'task_init'
   /** message 帧：正文分片；tool_call 帧：工具输出 */
   content?: string
   /** 来源标签：subagent 名 / coordinator / system */
@@ -73,6 +73,22 @@ export interface StreamEvent {
   compressed?: boolean
   /** done 帧：线程是否停在中断态 */
   interrupted?: boolean
+  /** task_init 帧：异步任务标识（轮询兜底用） */
+  task_id?: string
+}
+
+/** 轮询增量事件响应（GET /chat/updates） */
+export interface TaskUpdatesResponse {
+  events: StreamEvent[]
+  status: 'running' | 'done' | 'error'
+  next_cursor: number
+}
+
+/** 轮询任务状态响应（GET /chat/task_status） */
+export interface TaskStatusResponse {
+  status: 'running' | 'done' | 'error'
+  message_count: number
+  interrupted: boolean
 }
 
 /** L2 历史行投影（GET /messages；G3 §4.1.1 行类型） */
