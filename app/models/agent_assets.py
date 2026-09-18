@@ -125,6 +125,8 @@ class AgentApp(BaseModel, table=True):
     skill_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     subagent_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     interrupt_on: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    permission_preset: Optional[str] = Field(default=None, max_length=32)
+    permission_group_id: Optional[int] = Field(default=None, index=True)
     context_size: Optional[int] = Field(default=None)
     engine: str = Field(default="deepagents")
     workflow_id: Optional[str] = Field(default=None, max_length=64)
@@ -211,4 +213,24 @@ class McpServerConfig(BaseModel, table=True):
     enabled: bool = Field(default=True)
     description: str = Field(default="")
     content_hash: str
+    created_by: Optional[str] = Field(default=None)
+
+
+class PermissionGroup(BaseModel, table=True):
+    """Named collection of tools requiring human approval.
+
+    Attributes:
+        id: Primary key
+        name: Globally unique group name
+        tool_names: List of tool names that require approval when invoked
+        description: Human-readable description of the group's purpose
+        created_by: Audit-only creator identifier
+    """
+
+    __tablename__ = "permission_group"  # pyright: ignore[reportAssignmentType]
+
+    id: int = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True, max_length=64)
+    tool_names: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    description: str = Field(default="")
     created_by: Optional[str] = Field(default=None)

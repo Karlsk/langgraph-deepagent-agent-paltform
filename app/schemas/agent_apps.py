@@ -394,6 +394,57 @@ class SkillGenerateResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Permission groups
+# ---------------------------------------------------------------------------
+
+PERMISSION_PRESETS = ("none", "strict", "destructive_only")
+
+
+class PermissionGroupCreate(BaseModel):
+    """Request model for creating a permission group.
+
+    Attributes:
+        name: Globally unique group name
+        tool_names: List of tool names requiring human approval
+        description: Human-readable description of the group's purpose
+    """
+
+    name: str = _name_field("Globally unique permission group name")  # pyright: ignore[reportAssignmentType]
+    tool_names: list[str] = Field(default_factory=list, description="Tool names requiring human approval")
+    description: str = Field(default="", description="Human-readable description of the group's purpose")
+
+
+class PermissionGroupUpdate(BaseModel):
+    """Partial update model for a permission group (PATCH semantics; name is immutable).
+
+    Attributes:
+        tool_names: Replacement list of tool names requiring approval
+        description: Updated description
+    """
+
+    tool_names: Optional[list[str]] = Field(default=None, description="Replacement list of tool names requiring approval")
+    description: Optional[str] = Field(default=None, description="Updated description")
+
+
+class PermissionGroupRead(BaseModel):
+    """Response model for a permission group.
+
+    Attributes:
+        id: Primary key
+        name: Globally unique group name
+        tool_names: List of tool names requiring human approval
+        description: Human-readable description
+        created_by: Audit-only creator identifier
+    """
+
+    id: int = Field(..., description="Primary key")
+    name: str = Field(..., description="Globally unique group name")
+    tool_names: list[str] = Field(default_factory=list, description="Tool names requiring human approval")
+    description: str = Field(default="", description="Human-readable description")
+    created_by: Optional[str] = Field(default=None, description="Audit-only creator identifier")
+
+
+# ---------------------------------------------------------------------------
 # Agent apps
 # ---------------------------------------------------------------------------
 
@@ -424,6 +475,14 @@ class AgentAppCreate(BaseModel):
     skill_names: list[str] = Field(default_factory=list, description="Names of skill assets bound to this app")
     subagent_names: list[str] = Field(default_factory=list, description="Names of sub-agent configs bound to this app")
     interrupt_on: dict[str, bool] = Field(default_factory=dict, description="Interrupt configuration for the engine")
+    permission_preset: Optional[str] = Field(
+        default=None,
+        description="Built-in permission preset (none|strict|destructive_only); higher priority than interrupt_on",
+    )
+    permission_group_id: Optional[int] = Field(
+        default=None,
+        description="Custom permission group id; highest priority, overrides preset and interrupt_on",
+    )
     engine: Literal["deepagents", "workflow"] = Field(
         default="deepagents", description="Execution engine backend (immutable after creation)"
     )
@@ -468,6 +527,14 @@ class AgentAppUpdate(BaseModel):
     skill_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound skill names")
     subagent_names: Optional[list[str]] = Field(default=None, description="Replacement list of bound sub-agent names")
     interrupt_on: Optional[dict[str, bool]] = Field(default=None, description="Replacement interrupt configuration")
+    permission_preset: Optional[str] = Field(
+        default=None,
+        description="Updated built-in permission preset (none|strict|destructive_only)",
+    )
+    permission_group_id: Optional[int] = Field(
+        default=None,
+        description="Updated custom permission group id (null to unbind)",
+    )
     workflow_id: Optional[str] = Field(default=None, description="Rebind the workflow id (engine='workflow' apps)")
 
 
@@ -505,6 +572,8 @@ class AgentAppRead(BaseModel):
     skill_names: list[str] = Field(default_factory=list, description="Names of bound skill assets")
     subagent_names: list[str] = Field(default_factory=list, description="Names of bound sub-agent configs")
     interrupt_on: dict[str, bool] = Field(default_factory=dict, description="Interrupt configuration")
+    permission_preset: Optional[str] = Field(default=None, description="Built-in permission preset (none|strict|destructive_only)")
+    permission_group_id: Optional[int] = Field(default=None, description="Custom permission group id")
     engine: str = Field(..., description="Execution engine backend")
     workflow_id: Optional[str] = Field(default=None, description="Bound workflow id (engine='workflow' apps)")
     status: str = Field(..., description="Lifecycle status (draft|published)")
