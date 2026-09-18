@@ -16,6 +16,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.bundle import router as bundle_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.mcp_servers import router as mcp_servers_router
+from app.api.v1.permission_groups import router as permission_groups_router
 from app.api.v1.providers import router as providers_router
 from app.api.v1.sessions import router as sessions_router
 from app.api.v1.skills import router as skills_router
@@ -31,6 +32,7 @@ api_router.include_router(subagents_router, tags=["SubAgents"])
 api_router.include_router(skills_router, tags=["Skills"])
 api_router.include_router(apps_router, tags=["Agent Apps"])
 api_router.include_router(mcp_servers_router, tags=["MCP Servers"])
+api_router.include_router(permission_groups_router, tags=["Permission Groups"])
 api_router.include_router(providers_router, tags=["Providers"])
 api_router.include_router(sessions_router, tags=["Sessions"])
 api_router.include_router(chat_router, tags=["Chat"])

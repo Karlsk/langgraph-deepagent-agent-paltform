@@ -70,7 +70,7 @@ from app.core.langgraph.tools import tools as builtin_tools
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.metrics import agent_graph_cache_hits_total, agent_graph_compile_duration_seconds
-from app.models.agent_assets import AgentApp, SubAgentConfig
+from app.models.agent_assets import AgentApp, PermissionGroup, SubAgentConfig
 from app.models.provider import DEFAULT_MODEL_REF, ModelConfig, Provider
 from app.services.agents import skills_store
 from app.services.agents.mcp_manager import build_tool_catalog, get_mcp_tools
@@ -426,6 +426,60 @@ def compile_standalone_subagent(
 
 
 # ---------------------------------------------------------------------------
+# Permission resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_interrupt_on(session: Session, app_cfg: AgentApp) -> Optional[dict[str, Any]]:
+    """Resolve the effective interrupt_on configuration from the permission layers.
+
+    Resolution priority:
+    1. permission_group_id (highest): fetch the PermissionGroup and convert its
+       tool_names list to an interrupt_on dict mapping each tool to True.
+    2. permission_preset: apply preset semantics:
+       - "none": empty dict (no approvals required)
+       - "strict": all tools require approval (represented as {"*": True})
+       - "destructive_only": empty dict (placeholder; future: pattern matching)
+    3. interrupt_on (legacy fallback): the app's direct interrupt_on config.
+
+    Args:
+        session: SQLModel database session for fetching PermissionGroup.
+        app_cfg: The AgentApp configuration row.
+
+    Returns:
+        The resolved interrupt_on dict, or None if no permission layer is set.
+    """
+    # Priority: permission_group_id > permission_preset > interrupt_on (legacy)
+    # At most one layer takes effect; the first match short-circuits.
+
+    if app_cfg.permission_group_id is not None:
+        group = session.get(PermissionGroup, app_cfg.permission_group_id)
+        if group is not None:
+            return {tool_name: True for tool_name in group.tool_names}
+        logger.warning(
+            "permission_group_not_found",
+            app_name=app_cfg.name,
+            group_id=app_cfg.permission_group_id,
+        )
+
+    if app_cfg.permission_preset is not None:
+        preset = app_cfg.permission_preset
+        if preset == "none":
+            return {}
+        if preset == "strict":
+            return {"*": True}
+        if preset == "destructive_only":
+            return {}
+        logger.warning(
+            "unknown_permission_preset",
+            app_name=app_cfg.name,
+            preset=preset,
+        )
+
+    return cast(Optional[dict[str, Any]], app_cfg.interrupt_on or None)
+
+
+# ---------------------------------------------------------------------------
 # Compile & publish validation
 # ---------------------------------------------------------------------------
 
@@ -515,7 +569,7 @@ async def compile_agent_app(
     # write. Sourced from the Phase-1 path helper (single source of truth).
     user_root = skills_store._user_dir(app_cfg.id, user_id)  # noqa: SLF001 — same-package path helper
     backend = FilesystemBackend(root_dir=str(user_root))
-    interrupt_on = cast(Optional[dict[str, Any]], app_cfg.interrupt_on or None)
+    interrupt_on = resolve_interrupt_on(session, app_cfg)
 
     # G3 (spec-g3-session §4.2): context compression is on by default. The
     # token trigger prefers the per-app AgentApp.context_size and falls back
