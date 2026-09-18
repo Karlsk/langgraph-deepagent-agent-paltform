@@ -4,7 +4,6 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   ChatDotRound,
   Connection,
-  DataBoard,
   Delete,
   Expand,
   Fold,
@@ -16,6 +15,7 @@ import {
   Setting,
   SetUp,
   SwitchButton,
+  Tools,
   User,
 } from '@element-plus/icons-vue'
 
@@ -119,10 +119,14 @@ function handleUserCommand(command: string): void {
             <template #title>回收站</template>
           </el-menu-item>
         </el-sub-menu>
-        <el-menu-item index="/bundle">
-          <el-icon><DataBoard /></el-icon>
-          <template #title>配置迁移</template>
-        </el-menu-item>
+        <el-sub-menu index="/settings-group">
+          <template #title>
+            <el-icon><Tools /></el-icon>
+            <span>系统设置</span>
+          </template>
+          <el-menu-item index="/settings/permission-groups">权限组管理</el-menu-item>
+          <el-menu-item index="/bundle">配置迁移</el-menu-item>
+        </el-sub-menu>
       </el-menu>
 
       <div class="app-sidebar__footer">

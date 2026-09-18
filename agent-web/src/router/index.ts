@@ -94,6 +94,12 @@ const router = createRouter({
       meta: { title: '配置迁移' },
     },
     {
+      path: '/settings/permission-groups',
+      name: 'permission-groups',
+      component: () => import('@/views/settings/PermissionGroupList.vue'),
+      meta: { title: '权限组管理' },
+    },
+    {
       path: '/workflow',
       name: 'workflow',
       component: () => import('@/views/workflow/WorkflowListView.vue'),
