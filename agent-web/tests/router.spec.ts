@@ -36,6 +36,7 @@ describe('控制台导航路由', () => {
       { name: 'llm-trash', path: '/llm/trash' },
       { name: 'login', path: '/login' },
       { name: 'mcp', path: '/mcp' },
+      { name: 'permission-groups', path: '/settings/permission-groups' },
       { name: 'register', path: '/register' },
       { name: 'skill', path: '/skill' },
       { name: 'subagent', path: '/subagent' },

@@ -62,6 +62,8 @@ const ROWS: AgentAppRow[] = [
     skill_names: ['pdf-export'],
     subagent_names: ['search-helper'],
     interrupt_on: {},
+    permission_preset: null,
+    permission_group_id: null,
     engine: 'deepagents',
     workflow_id: null,
     status: 'published',
@@ -82,6 +84,8 @@ const ROWS: AgentAppRow[] = [
     skill_names: [],
     subagent_names: [],
     interrupt_on: {},
+    permission_preset: null,
+    permission_group_id: null,
     engine: 'deepagents',
     workflow_id: null,
     status: 'draft',
@@ -102,6 +106,8 @@ const ROWS: AgentAppRow[] = [
     skill_names: ['pdf-export', 'csv-clean'],
     subagent_names: [],
     interrupt_on: {},
+    permission_preset: null,
+    permission_group_id: null,
     engine: 'deepagents',
     workflow_id: null,
     status: 'published',
@@ -199,6 +205,15 @@ const { workflowMock } = vi.hoisted(() => ({
 vi.mock('@/api/workflow', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/workflow')>()
   return { ...actual, listWorkflows: workflowMock.listWorkflows }
+})
+
+/** permission-groups.ts 的 listPermissionGroups mock（权限组下拉来源） */
+const { permissionGroupMock } = vi.hoisted(() => ({
+  permissionGroupMock: { listPermissionGroups: vi.fn() },
+}))
+vi.mock('@/api/permission-groups', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/permission-groups')>()
+  return { ...actual, listPermissionGroups: permissionGroupMock.listPermissionGroups }
 })
 
 const ROWS_KEY = Symbol('agent-table-rows')
@@ -522,6 +537,8 @@ beforeEach(() => {
         skill_names: payload.skill_names ?? [],
         subagent_names: payload.subagent_names ?? [],
         interrupt_on: {},
+        permission_preset: payload.permission_preset ?? null,
+        permission_group_id: payload.permission_group_id ?? null,
         engine: payload.engine ?? 'deepagents',
         workflow_id: payload.workflow_id ?? null,
         status: 'draft',
@@ -570,6 +587,9 @@ beforeEach(() => {
   workflowMock.listWorkflows.mockResolvedValue([
     { workflow_id: 'wf-echo', node_count: 1, entry_point: 'start', description: '回声' },
     { workflow_id: 'wf-support', node_count: 3, entry_point: 'start', description: '客服' },
+  ])
+  permissionGroupMock.listPermissionGroups.mockResolvedValue([
+    { id: 1, name: 'admin-tools', tool_names: ['dangerous_tool'], description: '管理员工具组', created_by: 'seed' },
   ])
 })
 
@@ -629,6 +649,9 @@ describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布�
       model: 'proxy/m3',
       skill_names: ['pdf-export'],
       subagent_names: ['search-helper'],
+      interrupt_on: {},
+      permission_preset: null,
+      permission_group_id: null,
     } satisfies AgentAppCreatePayload)
     expect(elMessageFn).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'success', message: '已保存：new-app' }),
@@ -657,6 +680,9 @@ describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布�
       model: null,
       skill_names: [],
       subagent_names: [],
+      interrupt_on: {},
+      permission_preset: null,
+      permission_group_id: null,
     } satisfies AgentAppCreatePayload)
   })
 
@@ -911,6 +937,8 @@ describe('AgentList 引擎选择器（chatflow / engine=workflow）', () => {
               skill_names: [],
               subagent_names: [],
               interrupt_on: {},
+              permission_preset: null,
+              permission_group_id: null,
               engine: 'workflow',
               workflow_id: 'wf-echo',
               status: 'published',
