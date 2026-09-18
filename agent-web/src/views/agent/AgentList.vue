@@ -40,6 +40,7 @@ import { listAllProviderModels, type ModelConfigRow } from '@/api/provider'
 import { listSkills, type SkillRow } from '@/api/assets'
 import { listSubAgents, type SubAgentRow } from '@/api/subagents'
 import { listWorkflows, type WorkflowSummary } from '@/api/workflow'
+import { listPermissionGroups, type PermissionGroupRow } from '@/api/permission-groups'
 import { useConfirm } from '@/composables/useConfirm'
 import { notifySuccess } from '@/utils/notify'
 import type { PageQuery, PageResult } from '@/types'
@@ -122,6 +123,12 @@ const subagentOptions = ref<NameOption[]>([])
 const workflowOptions = ref<NameOption[]>([])
 /** MCP 服务下拉选项：取自 listMcpServers（仅 enabled 的 server） */
 const mcpServerOptions = ref<NameOption[]>([])
+/** 权限组下拉选项：取自 listPermissionGroups（id → name 映射） */
+interface PermissionGroupOption {
+  value: number
+  label: string
+}
+const permissionGroupOptions = ref<PermissionGroupOption[]>([])
 const optionsLoading = ref(false)
 
 /** 把 ToolCatalogEntry 投影为 el-select 友好的分组选项 */
@@ -207,6 +214,19 @@ async function loadMcpServerOptions(): Promise<void> {
   }
 }
 
+/** 拉权限组下拉选项：单次失败降级为空数组 */
+async function loadPermissionGroupOptions(): Promise<void> {
+  try {
+    const rows = await listPermissionGroups()
+    permissionGroupOptions.value = rows.map((row: PermissionGroupRow) => ({
+      value: row.id,
+      label: row.name,
+    }))
+  } catch {
+    permissionGroupOptions.value = []
+  }
+}
+
 /** 一次性预加载选项；任一失败不影响另一项 */
 async function loadFormOptions(): Promise<void> {
   optionsLoading.value = true
@@ -218,6 +238,7 @@ async function loadFormOptions(): Promise<void> {
       loadSubAgentOptions(),
       loadWorkflowOptions(),
       loadMcpServerOptions(),
+      loadPermissionGroupOptions(),
     ])
   } finally {
     optionsLoading.value = false
@@ -251,6 +272,10 @@ interface AgentAppFormShape {
   subagent_names: string[]
   /** 需人工审批的工具名列表（提交时转为 Record<string, boolean>） */
   interrupt_on: string[]
+  /** 权限预设（none/strict/destructive_only）；空字符串 → null */
+  permission_preset: string
+  /** 绑定的权限组 id；0 → null（未选择） */
+  permission_group_id: number
 }
 
 /** WebAgentFormDialog.open() 不传 data 时为 {}，字段 optional */
@@ -269,6 +294,8 @@ function createFormDefaults(): AgentAppFormShape {
     skill_names: [],
     subagent_names: [],
     interrupt_on: [],
+    permission_preset: '',
+    permission_group_id: 0,
   }
 }
 
@@ -307,6 +334,8 @@ function handleEdit(row: AgentAppRow): void {
     skill_names: [...row.skill_names],
     subagent_names: [...row.subagent_names],
     interrupt_on: Object.keys(row.interrupt_on ?? {}),
+    permission_preset: row.permission_preset ?? '',
+    permission_group_id: row.permission_group_id ?? 0,
   } satisfies AgentAppFormShape)
 }
 
@@ -347,6 +376,10 @@ function buildPayload(form: SubmitFormShape): {
     acc[name] = true
     return acc
   }, {} as Record<string, boolean>)
+  const permissionPreset = (form.permission_preset ?? '').trim()
+  const permissionPresetValue = permissionPreset.length > 0 ? permissionPreset : null
+  const permissionGroupId = form.permission_group_id ?? 0
+  const permissionGroupIdValue = permissionGroupId > 0 ? permissionGroupId : null
 
   const create: AgentAppCreatePayload = {
     name,
@@ -357,6 +390,8 @@ function buildPayload(form: SubmitFormShape): {
     skill_names: skillNames,
     subagent_names: subagentNames,
     interrupt_on: interruptOn,
+    permission_preset: permissionPresetValue,
+    permission_group_id: permissionGroupIdValue,
   }
   const patch: AgentAppPatchPayload = {
     system_prompt: systemPrompt,
@@ -366,6 +401,8 @@ function buildPayload(form: SubmitFormShape): {
     skill_names: skillNames,
     subagent_names: subagentNames,
     interrupt_on: interruptOn,
+    permission_preset: permissionPresetValue,
+    permission_group_id: permissionGroupIdValue,
   }
   return { create, patch }
 }
@@ -720,6 +757,42 @@ function mcpServerNamesText(row: AgentAppRow): string {
               :value="option.value"
             />
           </el-select>
+        </el-form-item>
+        <el-form-item v-if="form.engine !== 'workflow'" label="权限预设" prop="permission_preset">
+          <el-select
+            v-model="form.permission_preset"
+            clearable
+            placeholder="留空使用默认策略（全部放行）"
+            style="width: 100%"
+          >
+            <el-option label="none — 全部放行" value="none" />
+            <el-option label="strict — 全部需审批" value="strict" />
+            <el-option label="destructive_only — 仅破坏性操作需审批" value="destructive_only" />
+          </el-select>
+          <div class="agent-form-helptext">
+            全局工具审批策略；若同时绑定了权限组，权限组优先。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="form.engine !== 'workflow'" label="权限组" prop="permission_group_id">
+          <el-select
+            v-model="form.permission_group_id"
+            clearable
+            filterable
+            :loading="optionsLoading"
+            no-data-text="暂无权限组（请先在权限组管理页创建）"
+            placeholder="留空不绑定权限组"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in permissionGroupOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+          <div class="agent-form-helptext">
+            绑定的权限组覆盖上方预设（优先级：权限组 &gt; 预设 &gt; 审批工具列表）。
+          </div>
         </el-form-item>
         <el-form-item v-if="form.engine !== 'workflow'" label="审批工具" prop="interrupt_on">
           <el-select

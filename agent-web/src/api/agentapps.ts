@@ -42,6 +42,10 @@ export interface AgentAppRow {
   skill_names: string[]
   subagent_names: string[]
   interrupt_on: Record<string, boolean>
+  /** 权限预设（none/strict/destructive_only），与 permission_group_id 互斥 */
+  permission_preset: string | null
+  /** 绑定的权限组 id（优先级高于 permission_preset） */
+  permission_group_id: number | null
   engine: AgentAppEngine
   /** 绑定工作流 id（仅 engine='workflow' 有意义，其余为 null） */
   workflow_id: string | null
@@ -81,6 +85,10 @@ export interface AgentAppCreatePayload {
   subagent_names?: string[]
   /** 工具审批开关：key=工具名，value=true 表示该工具需人工审批 */
   interrupt_on?: Record<string, boolean>
+  /** 权限预设（none/strict/destructive_only），与 permission_group_id 互斥 */
+  permission_preset?: string | null
+  /** 绑定的权限组 id（优先级高于 permission_preset） */
+  permission_group_id?: number | null
 }
 
 /**
@@ -106,6 +114,10 @@ export interface AgentAppPatchPayload {
   subagent_names?: string[]
   /** 工具审批开关：key=工具名，value=true 表示该工具需人工审批 */
   interrupt_on?: Record<string, boolean>
+  /** 权限预设（none/strict/destructive_only），与 permission_group_id 互斥 */
+  permission_preset?: string | null
+  /** 绑定的权限组 id（优先级高于 permission_preset） */
+  permission_group_id?: number | null
 }
 
 /** 把 PageQuery 透传为后端查询参数（page/pageSize/keyword） */
