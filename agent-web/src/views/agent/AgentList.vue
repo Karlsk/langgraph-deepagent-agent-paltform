@@ -53,6 +53,7 @@ const columns: TableColumnConfig[] = [
   { label: '状态', prop: 'status', width: 100, slot: 'status' },
   { label: '模型', prop: 'model', width: 180, slot: 'model' },
   { label: '技能与子代理', prop: 'skill_names', width: 140, slot: 'bindings' },
+  { label: 'MCP 服务', prop: 'mcp_server_names', width: 100, slot: 'mcpServerNames' },
   { label: '版本', prop: 'version', width: 80 },
   { label: '操作', prop: 'actions', width: 220, slot: 'actions' },
 ]
@@ -443,6 +444,13 @@ function modelLabel(row: AgentAppRow): string {
 function bindingsText(row: AgentAppRow): string {
   return `${row.skill_names.length} 技能 · ${row.subagent_names.length} 子代理`
 }
+
+function mcpServerNamesText(row: AgentAppRow): string {
+  if (!row.mcp_server_names || row.mcp_server_names.length === 0) {
+    return '—'
+  }
+  return `${row.mcp_server_names.length} 项`
+}
 </script>
 
 <template>
@@ -511,6 +519,9 @@ function bindingsText(row: AgentAppRow): string {
         </template>
         <template #bindings="{ row }">
           <span>{{ bindingsText(row as AgentAppRow) }}</span>
+        </template>
+        <template #mcpServerNames="{ row }">
+          <span>{{ mcpServerNamesText(row as AgentAppRow) }}</span>
         </template>
         <template #actions="{ row }">
           <el-button

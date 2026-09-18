@@ -649,7 +649,7 @@ beforeEach(() => {
 })
 
 describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
-  it('挂载调 listSubAgentsPage 并渲染 5 行 × 7 列结构', async () => {
+  it('挂载调 listSubAgentsPage 并渲染 5 行 × 8 列结构', async () => {
     const wrapper = mountPage()
     await flushPromises()
 
@@ -665,8 +665,8 @@ describe('SubAgentList 子代理管理页（task-dde 前端适配）', () => {
     expect(wrapper.text()).toContain('translator')
     expect(wrapper.text()).toContain('planner')
 
-    // 8 列：名称 / 描述 / 何时使用 / 版本 / 工具数 / 技能 / 模型 / 操作
-    expect(wrapper.findAll('.el-table-column-stub')).toHaveLength(8)
+    // 9 列：名称 / 描述 / 何时使用 / 版本 / 工具数 / 技能 / MCP 服务 / 模型 / 操作
+    expect(wrapper.findAll('.el-table-column-stub')).toHaveLength(9)
   })
 
   it('工具数列：null / 空数组 → 「—」；非空 → 「N 项」', async () => {

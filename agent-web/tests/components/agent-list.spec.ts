@@ -574,7 +574,7 @@ beforeEach(() => {
 })
 
 describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布）', () => {
-  it('挂载调 listAgentAppsPage 并渲染 3 行 × 7 列结构', async () => {
+  it('挂载调 listAgentAppsPage 并渲染 3 行 × 8 列结构', async () => {
     const wrapper = mountPage()
     await flushPromises()
 
@@ -588,8 +588,8 @@ describe('AgentList Agent 管理页（AgentApp agent 引擎类型 CRUD + 发布�
     expect(wrapper.text()).toContain('code-helper')
     expect(wrapper.text()).toContain('data-runner')
 
-    // 7 列：名称 / 系统提示 / 状态 / 模型 / 技能与子代理 / 版本 / 操作
-    expect(wrapper.findAll('.el-table-column-stub')).toHaveLength(7)
+    // 8 列：名称 / 系统提示 / 状态 / 模型 / 技能与子代理 / MCP 服务 / 版本 / 操作
+    expect(wrapper.findAll('.el-table-column-stub')).toHaveLength(8)
 
     // 状态列：2 已发布 + 1 草稿
     expect(wrapper.text()).toContain('已发布')

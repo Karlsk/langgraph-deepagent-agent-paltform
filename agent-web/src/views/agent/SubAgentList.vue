@@ -45,6 +45,7 @@ const columns: TableColumnConfig[] = [
   { label: '版本', prop: 'version', width: 80 },
   { label: '工具数', prop: 'allowed_tools', width: 90, slot: 'toolCount' },
   { label: '技能', prop: 'skill_names', width: 90, slot: 'skillNames' },
+  { label: 'MCP 服务', prop: 'mcp_server_names', width: 100, slot: 'mcpServerNames' },
   { label: '模型', prop: 'model', width: 180, slot: 'model' },
   { label: '操作', prop: 'actions', width: 260, slot: 'actions' },
 ]
@@ -378,6 +379,13 @@ function skillNamesText(row: SubAgentRow): string {
   return `${row.skill_names.length} 项`
 }
 
+function mcpServerNamesText(row: SubAgentRow): string {
+  if (!row.mcp_server_names || row.mcp_server_names.length === 0) {
+    return '—'
+  }
+  return `${row.mcp_server_names.length} 项`
+}
+
 /** 模型展示：null → 「继承父应用」；否则显示 provider/model 引用 */
 function modelLabel(row: SubAgentRow): string {
   return row.model ?? '继承父应用'
@@ -416,6 +424,9 @@ function modelLabel(row: SubAgentRow): string {
         </template>
         <template #skillNames="{ row }">
           <span>{{ skillNamesText(row as SubAgentRow) }}</span>
+        </template>
+        <template #mcpServerNames="{ row }">
+          <span>{{ mcpServerNamesText(row as SubAgentRow) }}</span>
         </template>
         <template #model="{ row }">
           <span class="subagent-model">{{ modelLabel(row as SubAgentRow) }}</span>
