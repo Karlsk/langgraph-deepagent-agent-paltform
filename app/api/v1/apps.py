@@ -153,6 +153,8 @@ async def create_agent_app(
             skill_names=payload.skill_names,
             subagent_names=payload.subagent_names,
             interrupt_on=payload.interrupt_on,
+            permission_preset=payload.permission_preset,
+            permission_group_id=payload.permission_group_id,
             engine=payload.engine,
             workflow_id=payload.workflow_id,
             created_by=user.username or str(user.id),
