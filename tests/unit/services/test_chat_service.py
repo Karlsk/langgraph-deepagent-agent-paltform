@@ -444,12 +444,14 @@ async def test_chat_stream_frame_sequence(
     )
 
     payloads = _frames_payloads(frames)
-    assert [p["type"] for p in payloads] == ["message", "tool_call", "message", "done"]
-    assert payloads[0] == {"type": "message", "content": "部分一", "source": "coordinator"}
-    assert payloads[1] == {"type": "tool_call", "name": "echo", "content": "echo output", "source": "writer"}
-    assert payloads[3]["message_count"] == 2
-    assert payloads[3]["compressed"] is False
-    assert payloads[3]["interrupted"] is False
+    assert [p["type"] for p in payloads] == ["task_init", "message", "tool_call", "message", "done"]
+    assert payloads[0]["type"] == "task_init"
+    assert payloads[0]["task_id"]
+    assert payloads[1] == {"type": "message", "content": "部分一", "source": "coordinator"}
+    assert payloads[2] == {"type": "tool_call", "name": "echo", "content": "echo output", "source": "writer"}
+    assert payloads[4]["message_count"] == 2
+    assert payloads[4]["compressed"] is False
+    assert payloads[4]["interrupted"] is False
 
 
 @_sync
@@ -478,9 +480,9 @@ async def test_chat_stream_interrupt_then_done(
     )
 
     payloads = _frames_payloads(frames)
-    assert [p["type"] for p in payloads] == ["message", "interrupt", "done"]
-    assert payloads[1]["action_requests"] == [{"tool": "write_file", "args": {"path": "a.txt"}}]
-    assert payloads[2]["interrupted"] is True
+    assert [p["type"] for p in payloads] == ["task_init", "message", "interrupt", "done"]
+    assert payloads[2]["action_requests"] == [{"tool": "write_file", "args": {"path": "a.txt"}}]
+    assert payloads[3]["interrupted"] is True
 
 
 @_sync
@@ -508,9 +510,9 @@ async def test_chat_stream_summary_sets_compressed(
     )
 
     payloads = _frames_payloads(frames)
-    assert [p["type"] for p in payloads] == ["message", "summary", "done"]
-    assert payloads[1] == {"type": "summary", "summary_text": "已压缩的摘要"}
-    assert payloads[2]["compressed"] is True
+    assert [p["type"] for p in payloads] == ["task_init", "message", "summary", "done"]
+    assert payloads[2] == {"type": "summary", "summary_text": "已压缩的摘要"}
+    assert payloads[3]["compressed"] is True
 
 
 @_sync
@@ -536,8 +538,8 @@ async def test_chat_stream_error_frame_then_done(
     )
 
     payloads = _frames_payloads(frames)
-    assert [p["type"] for p in payloads] == ["message", "error", "done"]
-    assert payloads[1] == {"type": "error", "message": "stream blew up"}
+    assert [p["type"] for p in payloads] == ["task_init", "message", "error", "done"]
+    assert payloads[2] == {"type": "error", "message": "stream blew up"}
     traces = _chat_traces(db)
     assert len(traces) == 1
     assert traces[0].status == "error"
@@ -621,9 +623,11 @@ async def test_chat_stream_heartbeat_comment_frames(
         )
     ]
 
-    assert frames[0] == ": ping\n\n"
+    assert frames[0].startswith('data: {"type": "task_init"')
+    ping_frames = [f for f in frames if f == ": ping\n\n"]
+    assert len(ping_frames) >= 1
     payload_frames = _frames_payloads(_collect(frames))
-    assert [p["type"] for p in payload_frames] == ["message", "done"]
+    assert [p["type"] for p in payload_frames] == ["task_init", "message", "done"]
 
 
 @_sync

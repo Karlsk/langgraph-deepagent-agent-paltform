@@ -301,6 +301,9 @@ class Settings:
             "skill_generate": ["5 per minute"],
             "rebuild": ["5 per minute"],
             "bundle": ["30 per minute"],
+            "chat_stream_async": ["20 per minute"],
+            "chat_updates": ["60 per minute"],
+            "chat_task_status": ["60 per minute"],
         }
 
         # Update rate limit endpoints from environment variables

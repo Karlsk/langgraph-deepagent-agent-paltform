@@ -42,7 +42,22 @@ class InMemoryCacheService:
             default_ttl: Default time-to-live in seconds for cache entries.
         """
         self._cache: dict[str, tuple[float, str]] = {}
+        self._lists: dict[str, list[str]] = {}
+        self._hashes: dict[str, dict[str, str]] = {}
+        self._key_expiry: dict[str, float] = {}
         self._default_ttl = default_ttl
+
+    def _is_expired(self, key: str) -> bool:
+        expires_at = self._key_expiry.get(key)
+        if expires_at is None:
+            return False
+        if time.monotonic() > expires_at:
+            self._cache.pop(key, None)
+            self._lists.pop(key, None)
+            self._hashes.pop(key, None)
+            self._key_expiry.pop(key, None)
+            return True
+        return False
 
     async def initialize(self) -> None:
         """No-op for in-memory cache."""
@@ -57,6 +72,8 @@ class InMemoryCacheService:
         Returns:
             The cached value, or None if not found or expired.
         """
+        if self._is_expired(key):
+            return None
         entry = self._cache.get(key)
         if entry is None:
             return None
@@ -84,10 +101,44 @@ class InMemoryCacheService:
             key: The cache key.
         """
         self._cache.pop(key, None)
+        self._lists.pop(key, None)
+        self._hashes.pop(key, None)
+        self._key_expiry.pop(key, None)
+
+    async def rpush(self, key: str, value: str) -> None:
+        """Append a value to a list."""
+        self._is_expired(key)
+        self._lists.setdefault(key, []).append(value)
+
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        """Get a range of elements from a list."""
+        if self._is_expired(key):
+            return []
+        lst = self._lists.get(key, [])
+        return lst[start : end + 1 if end >= 0 else None]
+
+    async def hset(self, key: str, mapping: dict[str, str]) -> None:
+        """Set hash fields."""
+        self._is_expired(key)
+        h = self._hashes.setdefault(key, {})
+        h.update(mapping)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        """Get all fields and values in a hash."""
+        if self._is_expired(key):
+            return {}
+        return dict(self._hashes.get(key, {}))
+
+    async def expire(self, key: str, ttl: int) -> None:
+        """Set a TTL on a key."""
+        self._key_expiry[key] = time.monotonic() + ttl
 
     async def close(self) -> None:
         """Clear the in-memory cache."""
         self._cache.clear()
+        self._lists.clear()
+        self._hashes.clear()
+        self._key_expiry.clear()
 
 
 class ValkeyCacheService:
@@ -166,6 +217,53 @@ class ValkeyCacheService:
             await self._client.delete(key)
         except Exception as e:
             logger.warning("cache_delete_failed", key=key, error=str(e))
+
+    async def rpush(self, key: str, value: str) -> None:
+        """Append a value to a list in Valkey."""
+        if not self._client:
+            return
+        try:
+            await self._client.rpush(key, value)
+        except Exception as e:
+            logger.warning("cache_rpush_failed", key=key, error=str(e))
+
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        """Get a range of elements from a list in Valkey."""
+        if not self._client:
+            return []
+        try:
+            return await self._client.lrange(key, start, end)
+        except Exception as e:
+            logger.warning("cache_lrange_failed", key=key, error=str(e))
+            return []
+
+    async def hset(self, key: str, mapping: dict[str, str]) -> None:
+        """Set hash fields in Valkey."""
+        if not self._client:
+            return
+        try:
+            await self._client.hset(key, mapping=mapping)
+        except Exception as e:
+            logger.warning("cache_hset_failed", key=key, error=str(e))
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        """Get all fields and values in a hash from Valkey."""
+        if not self._client:
+            return {}
+        try:
+            return await self._client.hgetall(key)
+        except Exception as e:
+            logger.warning("cache_hgetall_failed", key=key, error=str(e))
+            return {}
+
+    async def expire(self, key: str, ttl: int) -> None:
+        """Set a TTL on a key in Valkey."""
+        if not self._client:
+            return
+        try:
+            await self._client.expire(key, ttl)
+        except Exception as e:
+            logger.warning("cache_expire_failed", key=key, error=str(e))
 
     async def close(self) -> None:
         """Close the Valkey connection."""

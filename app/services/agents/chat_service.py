@@ -18,6 +18,7 @@ import json
 import time
 from collections.abc import AsyncGenerator
 from typing import Any, Optional
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from sqlmodel import Session as DBSession
@@ -38,16 +39,21 @@ from app.schemas.chat import (
     MessagesResponse,
     RebuildResult,
     StreamEvent,
+    TaskStatusResponse,
+    TaskUpdatesResponse,
 )
 from app.services.agents import runtime, session_naming, sessions_service
+from app.services.agents import task_buffer
 from app.services.agents.run_tracer import RunTracer
+from app.services.database import database_service
 
 # SSE heartbeat interval (spec-g4-chat §4.1): comment frames keep proxies
 # from dropping an idle connection during minute-long tool executions.
 _HEARTBEAT_SECONDS = 15.0
 
-# Sentinel telling the stream loop the pump task has ended.
-_STREAM_SENTINEL = object()
+# Strong references to detached pump tasks so they aren't GC'd when the
+# SSE generator exits.  Each task removes itself in its ``finally`` block.
+_detached_tasks: set[asyncio.Task] = set()
 
 
 class ChatServiceError(ValueError):
@@ -318,6 +324,23 @@ def _parse_interrupt_projection(content: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _process_chunk(chunk: Any, *, message_count: int, compressed: bool, interrupted: bool) -> Optional[StreamEvent]:
+    """Convert one runtime chunk into a ``StreamEvent`` (shared by SSE + buffered paths)."""
+    if chunk.type == "tool_call":
+        return StreamEvent(type="tool_call", name=chunk.name, content=chunk.content, source=chunk.source)
+    if chunk.type == "summary":
+        return StreamEvent(type="summary", summary_text=chunk.content)
+    if chunk.type == "interrupt":
+        projection = _parse_interrupt_projection(chunk.content)
+        if projection is not None:
+            return StreamEvent(
+                type="interrupt",
+                action_requests=[ActionRequest(**action) for action in projection["action_requests"]],
+            )
+        return StreamEvent(type="error", message="unprojectable interrupt payload")
+    return StreamEvent(type="message", content=chunk.content, source=chunk.source)
+
+
 async def chat_stream(
     db: DBSession,
     target: Session,
@@ -326,13 +349,18 @@ async def chat_stream(
     user_id: int,
     username: Optional[str],
 ) -> AsyncGenerator[str, None]:
-    """Stream one turn as SSE frames: typed chunks + heartbeat + done (§4.1).
+    """Stream one turn as SSE frames with task_id + Redis buffering (§4.1).
 
-    The runtime chunk stream is pumped through a queue so idle gaps longer
-    than ``_HEARTBEAT_SECONDS`` emit ``: ping`` comment frames without
-    cancelling the underlying generator. An interrupt tail chunk maps to a
-    structured ``interrupt`` frame followed by ``done(interrupted=true)``;
-    failures emit an ``error`` frame and still emit ``done``.
+    The first frame is always ``task_init`` carrying the task id so the
+    frontend can resume via polling after a page refresh.  The runtime
+    chunk stream is pumped through a queue so idle gaps longer than
+    ``_HEARTBEAT_SECONDS`` emit ``: ping`` comment frames without
+    cancelling the underlying generator.
+
+    When the SSE client disconnects mid-stream the pump task is *detached*
+    (not cancelled) so the agent keeps running.  Events continue to be
+    buffered to Redis and the client can recover them via
+    ``GET /chat/updates``.
     """
     if target.agent_app_id is None:
         yield _sse_frame(StreamEvent(type="error", message="session has no bound agent app"))
@@ -354,6 +382,11 @@ async def chat_stream(
     started = time.perf_counter()
     prompt = _last_user_content(messages)
 
+    task_id = uuid4().hex
+    await task_buffer.create_task(task_id, target.id)
+
+    yield _sse_frame(StreamEvent(type="task_init", task_id=task_id))
+
     message_count = 0
     compressed = False
     interrupted = False
@@ -363,6 +396,7 @@ async def chat_stream(
     queue: asyncio.Queue[Any] = asyncio.Queue()
 
     async def _pump() -> None:
+        nonlocal message_count, compressed, interrupted, stream_error
         try:
             async for chunk in rt.astream(
                 messages,
@@ -371,11 +405,71 @@ async def chat_stream(
                 username=username,
                 extra_callbacks=[tracer],
             ):
-                await queue.put(chunk)
-        except Exception as exc:  # noqa: BLE001 — surfaced as the error frame
-            await queue.put(exc)
+                event = _process_chunk(
+                    chunk,
+                    message_count=message_count,
+                    compressed=compressed,
+                    interrupted=interrupted,
+                )
+                if event is not None:
+                    if chunk.type == "message":
+                        message_count += 1
+                        message_parts.append(chunk.content)
+                    elif chunk.type == "summary":
+                        compressed = True
+                    elif chunk.type == "interrupt":
+                        interrupted = True
+                    await queue.put(event)
+                    await task_buffer.push_event(task_id, event.model_dump(exclude_none=True))
+                    if chunk.type == "interrupt":
+                        break
+        except Exception as exc:  # noqa: BLE001
+            stream_error = f"{type(exc).__name__}: {exc}"
+            err_event = StreamEvent(type="error", message=str(exc))
+            await queue.put(err_event)
+            await task_buffer.push_event(task_id, err_event.model_dump(exclude_none=True))
         finally:
-            await queue.put(_STREAM_SENTINEL)
+            done_event = StreamEvent(
+                type="done",
+                message_count=message_count,
+                compressed=compressed,
+                interrupted=interrupted,
+            )
+            await queue.put(done_event)
+            await task_buffer.push_event(task_id, done_event.model_dump(exclude_none=True))
+            await task_buffer.set_task_status(
+                task_id,
+                status="error" if stream_error is not None else "done",
+                message_count=message_count,
+                interrupted=interrupted,
+            )
+            await task_buffer.finalize_task(task_id)
+
+    def _finish_trace(session: DBSession) -> None:
+        _finish_round_trace(
+            session,
+            tracer=tracer,
+            session_id=target.id,
+            name=app_name,
+            model_name=model_name,
+            status="error" if stream_error is not None else "success",
+            prompt=prompt,
+            duration_seconds=time.perf_counter() - started,
+            final_message="".join(message_parts),
+            error=stream_error,
+            created_by=username,
+        )
+
+    def _finish_trace_detached(task: asyncio.Task) -> None:
+        # Request teardown closes ``db`` before a detached pump finishes, so
+        # the trace needs its own session from the global engine.
+        if task.cancelled():
+            return
+        own_db = DBSession(database_service.engine)
+        try:
+            _finish_trace(own_db)
+        finally:
+            own_db.close()
 
     pump_task = asyncio.create_task(_pump())
     try:
@@ -385,63 +479,28 @@ async def chat_stream(
             except asyncio.TimeoutError:
                 yield ": ping\n\n"
                 continue
-            if item is _STREAM_SENTINEL:
-                break
-            if isinstance(item, Exception):
-                stream_error = f"{type(item).__name__}: {item}"
-                yield _sse_frame(StreamEvent(type="error", message=str(item)))
-                break
-            chunk = item
-            if chunk.type == "tool_call":
-                yield _sse_frame(
-                    StreamEvent(type="tool_call", name=chunk.name, content=chunk.content, source=chunk.source)
-                )
-            elif chunk.type == "summary":
-                compressed = True
-                yield _sse_frame(StreamEvent(type="summary", summary_text=chunk.content))
-            elif chunk.type == "interrupt":
-                interrupted = True
-                projection = _parse_interrupt_projection(chunk.content)
-                if projection is not None:
-                    yield _sse_frame(
-                        StreamEvent(
-                            type="interrupt",
-                            action_requests=[ActionRequest(**action) for action in projection["action_requests"]],
-                        )
-                    )
-                else:
-                    yield _sse_frame(StreamEvent(type="error", message="unprojectable interrupt payload"))
-            else:
-                message_count += 1
-                message_parts.append(chunk.content)
-                yield _sse_frame(StreamEvent(type="message", content=chunk.content, source=chunk.source))
-            if interrupted:
-                break
+            if isinstance(item, StreamEvent):
+                yield _sse_frame(item)
+                if item.type == "done":
+                    break
+    except (asyncio.CancelledError, GeneratorExit):
+        # SSE client went away (refresh / navigate / stop): leave the pump
+        # running detached so the agent round completes and its events stay
+        # recoverable via GET /chat/updates; the done-callback persists the
+        # round trace after request teardown.
+        if pump_task.done():
+            if not pump_task.cancelled():
+                _finish_trace(db)
+        else:
+            pump_task.add_done_callback(_finish_trace_detached)
+        raise
     finally:
-        pump_task.cancel()
+        if not pump_task.done():
+            _detached_tasks.add(pump_task)
+            pump_task.add_done_callback(_detached_tasks.discard)
+            logger.info("chat_stream_pump_detached", task_id=task_id, session_id=target.id)
 
-    yield _sse_frame(
-        StreamEvent(
-            type="done",
-            message_count=message_count,
-            compressed=compressed,
-            interrupted=interrupted,
-        )
-    )
-
-    _finish_round_trace(
-        db,
-        tracer=tracer,
-        session_id=target.id,
-        name=app_name,
-        model_name=model_name,
-        status="error" if stream_error is not None else "success",
-        prompt=prompt,
-        duration_seconds=time.perf_counter() - started,
-        final_message="".join(message_parts),
-        error=stream_error,
-        created_by=username,
-    )
+    _finish_trace(db)
 
 
 # ---------------------------------------------------------------------------
@@ -568,3 +627,146 @@ async def get_traces(db: DBSession, target: Session, *, limit: int = 100) -> lis
         )
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# D6: async streaming + polling support
+# ---------------------------------------------------------------------------
+
+
+async def start_background_stream(
+    db: DBSession,
+    target: Session,
+    messages: list[Message],
+    *,
+    user_id: int,
+    username: Optional[str],
+) -> str:
+    """Spawn a background agent task and return its *task_id*.
+
+    The runtime setup happens synchronously (within the request) so
+    validation errors surface as HTTP errors.  The actual agent execution
+    is handed off to a detached task that buffers events to Redis.
+    """
+    if target.agent_app_id is None:
+        raise ChatServiceError("session has no bound agent app")
+    rt = await runtime.get_runtime(db, target.agent_app_id, user_id=user_id)
+    app_row = db.get(AgentApp, target.agent_app_id) if target.agent_app_id is not None else None
+    model_ref = app_row.model if app_row is not None else None
+    await session_naming.maybe_name_session(db, target.id, target.name, messages, model_name=model_ref)
+
+    model_name = rt._model_label()  # noqa: SLF001
+    app_name = _app_name(target, app_row)
+    tracer = RunTracer(model_name=model_name)
+    started = time.perf_counter()
+    prompt = _last_user_content(messages)
+
+    task_id = uuid4().hex
+    await task_buffer.create_task(task_id, target.id)
+
+    async def _run() -> None:
+        message_count = 0
+        compressed = False
+        interrupted = False
+        stream_error: Optional[str] = None
+        message_parts: list[str] = []
+        own_db = DBSession(database_service.engine)
+        try:
+            async for chunk in rt.astream(
+                messages,
+                session_id=target.id,
+                user_id=str(user_id),
+                username=username,
+                extra_callbacks=[tracer],
+            ):
+                event = _process_chunk(
+                    chunk,
+                    message_count=message_count,
+                    compressed=compressed,
+                    interrupted=interrupted,
+                )
+                if event is not None:
+                    if chunk.type == "message":
+                        message_count += 1
+                        message_parts.append(chunk.content)
+                    elif chunk.type == "summary":
+                        compressed = True
+                    elif chunk.type == "interrupt":
+                        interrupted = True
+                    await task_buffer.push_event(task_id, event.model_dump(exclude_none=True))
+                    await task_buffer.set_task_status(
+                        task_id, message_count=message_count, interrupted=interrupted,
+                    )
+                    if chunk.type == "interrupt":
+                        break
+        except Exception as exc:  # noqa: BLE001
+            stream_error = f"{type(exc).__name__}: {exc}"
+            err_event = StreamEvent(type="error", message=str(exc))
+            await task_buffer.push_event(task_id, err_event.model_dump(exclude_none=True))
+        finally:
+            done_event = StreamEvent(
+                type="done",
+                message_count=message_count,
+                compressed=compressed,
+                interrupted=interrupted,
+            )
+            await task_buffer.push_event(task_id, done_event.model_dump(exclude_none=True))
+            await task_buffer.set_task_status(
+                task_id,
+                status="error" if stream_error is not None else "done",
+                message_count=message_count,
+                interrupted=interrupted,
+            )
+            await task_buffer.finalize_task(task_id)
+            _finish_round_trace(
+                own_db,
+                tracer=tracer,
+                session_id=target.id,
+                name=app_name,
+                model_name=model_name,
+                status="error" if stream_error is not None else "success",
+                prompt=prompt,
+                duration_seconds=time.perf_counter() - started,
+                final_message="".join(message_parts),
+                error=stream_error,
+                created_by=username,
+            )
+            own_db.close()
+
+    bg_task = asyncio.create_task(_run())
+    _detached_tasks.add(bg_task)
+    bg_task.add_done_callback(_detached_tasks.discard)
+    return task_id
+
+
+async def get_task_updates(
+    task_id: str,
+    cursor: int,
+    session_id: str,
+) -> TaskUpdatesResponse:
+    """Read incremental events for a polling client."""
+    status = await task_buffer.get_task_status(task_id)
+    if status is None or status["session_id"] != session_id:
+        raise ValueError("task not found")
+    raw_events, next_cursor = await task_buffer.get_events(task_id, cursor)
+    events = [StreamEvent(**e) for e in raw_events]
+    return TaskUpdatesResponse(
+        events=events,
+        status=status["status"],  # pyright: ignore[reportArgumentType]
+        next_cursor=next_cursor,
+    )
+
+
+async def get_task_status(
+    task_id: str,
+    session_id: str,
+) -> TaskStatusResponse:
+    """Lightweight status check for a polling client."""
+    status = await task_buffer.get_task_status(task_id)
+    if status is None or status["session_id"] != session_id:
+        raise ValueError("task not found")
+    return TaskStatusResponse(
+        status=status["status"],  # pyright: ignore[reportArgumentType]
+        message_count=status["message_count"],
+        interrupted=status["interrupted"],
+    )

@@ -127,6 +127,7 @@ class StreamEvent(BaseModel):
     Serialised with ``model_dump(exclude_none=True)`` so each frame kind only
     carries its own payload fields. Frame kinds and payloads:
 
+    * ``task_init``: ``{task_id}``
     * ``message``: ``{content, source}``
     * ``tool_call``: ``{name, content, source}``
     * ``interrupt``: ``{action_requests}``
@@ -135,12 +136,13 @@ class StreamEvent(BaseModel):
     * ``done``: ``{message_count, compressed, interrupted}``
     """
 
-    type: Literal["message", "tool_call", "interrupt", "summary", "error", "done"] = Field(
+    type: Literal["message", "tool_call", "interrupt", "summary", "error", "done", "task_init"] = Field(
         ..., description="Frame kind discriminator"
     )
     content: Optional[str] = Field(default=None, description="Text fragment (message) or tool output (tool_call)")
     source: Optional[str] = Field(default=None, description="Origin tag: subagent name / coordinator / system")
     name: Optional[str] = Field(default=None, description="Tool name (tool_call frames)")
+    task_id: Optional[str] = Field(default=None, description="Async task id (task_init frames)")
     action_requests: Optional[List[ActionRequest]] = Field(
         default=None, description="Projected interrupted actions (interrupt frames)"
     )
@@ -248,3 +250,41 @@ class SessionTitle(BaseModel):
         min_length=1,
         max_length=60,
     )
+
+
+class StreamAsyncResponse(BaseModel):
+    """Response for ``POST /chat/stream_async`` — returns the async task id.
+
+    Attributes:
+        task_id: Opaque task identifier for polling.
+    """
+
+    task_id: str = Field(..., description="Async task identifier for polling")
+
+
+class TaskUpdatesResponse(BaseModel):
+    """Response for ``GET /chat/updates`` — cursor-based incremental events.
+
+    Attributes:
+        events: New SSE events since the last cursor position.
+        status: Current task status (running | done | error).
+        next_cursor: Cursor value for the next poll request.
+    """
+
+    events: List[StreamEvent] = Field(default_factory=list, description="New events since last cursor")
+    status: Literal["running", "done", "error"] = Field(..., description="Current task status")
+    next_cursor: int = Field(..., description="Cursor for the next poll")
+
+
+class TaskStatusResponse(BaseModel):
+    """Response for ``GET /chat/task_status`` — lightweight status check.
+
+    Attributes:
+        status: Current task status.
+        message_count: Number of message frames emitted so far.
+        interrupted: Whether the task is paused on an interrupt.
+    """
+
+    status: Literal["running", "done", "error"] = Field(..., description="Current task status")
+    message_count: int = Field(default=0, description="Message frames emitted")
+    interrupted: bool = Field(default=False, description="Whether paused on an interrupt")
