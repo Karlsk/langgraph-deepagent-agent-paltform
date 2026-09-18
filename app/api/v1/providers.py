@@ -359,6 +359,24 @@ async def create_provider(
             logger.warning("provider_create_conflict", name=payload.name)
             raise HTTPException(status_code=422, detail=f"provider '{payload.name}' already exists")
 
+        # Clear any soft-deleted provider with the same name to free up the unique
+        # name slot (soft-delete preserves the row, blocking reuse)
+        tombstoned = db.exec(
+            select(Provider).where(
+                col(Provider.name) == payload.name,
+                col(Provider.deleted) == True,  # noqa: E712
+            )
+        ).first()
+        if tombstoned is not None:
+            # Cascade hard-delete: remove the provider, its models, and health row
+            counts = hard_delete_provider(db, tombstoned)
+            logger.info(
+                "provider_tombstone_cleared",
+                name=payload.name,
+                model_count=counts["models"],
+                health_cleared=counts["health"],
+            )
+
         provider = Provider(
             name=payload.name,
             type=payload.type,
@@ -938,6 +956,25 @@ async def create_provider_model(
             raise HTTPException(status_code=404, detail=f"provider '{name}' not found")
         if provider.id is None:
             raise HTTPException(status_code=500, detail=f"provider '{name}' row has no primary key")
+
+        # Clear any soft-deleted models with the same name or model_id to free up
+        # the unique constraint slots (soft-delete preserves the row, blocking reuse)
+        tombstoned = db.exec(
+            select(ModelConfig).where(
+                col(ModelConfig.provider_id) == provider.id,
+                col(ModelConfig.deleted) == True,  # noqa: E712
+                (col(ModelConfig.name) == payload.name) | (col(ModelConfig.model_id) == payload.model_id),
+            )
+        ).all()
+        for stale in tombstoned:
+            db.delete(stale)
+        if tombstoned:
+            logger.info(
+                "model_config_tombstone_cleared",
+                provider=name,
+                model=payload.name,
+                cleared_count=len(tombstoned),
+            )
 
         model = ModelConfig(
             provider_id=provider.id,
